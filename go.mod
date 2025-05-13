@@ -1,4 +1,4 @@
-module relyt-loader-go
+module github.com/powerdrillai/relyt-loader-go
 
 go 1.22.0
 
