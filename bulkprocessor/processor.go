@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -15,22 +16,25 @@ import (
 
 // BulkProcessor represents a bulk processor for PostgreSQL
 type BulkProcessor struct {
-	config          Config
-	processId       string // Unique ID for this processor instance
-	pgClient        *PostgreSQLClient
-	s3Client        *S3Client
-	fileManager     *FileManager
-	structType      reflect.Type
-	fields          []FieldInfo
-	importerWg      sync.WaitGroup
-	mutex           sync.RWMutex
-	ctx             context.Context
-	cancel          context.CancelFunc
-	isStarted       bool
-	isFlushing      bool
-	isShutdown      bool
-	importErrorChan chan error
-	fileQueue       chan string // Queue of file IDs to be imported
+	config            Config
+	processId         string // Unique ID for this processor instance
+	pgClient          *PostgreSQLClient
+	s3Client          *S3Client
+	fileManager       *FileManager
+	structType        reflect.Type
+	fields            []FieldInfo
+	importerWg        sync.WaitGroup
+	mutex             sync.RWMutex
+	ctx               context.Context
+	cancel            context.CancelFunc
+	isStarted         bool
+	isFlushing        bool
+	isShutdown        bool
+	importErrorChan   chan error
+	fileQueue         chan string    // Queue of file IDs to be imported
+	batchQueue        chan string    // Queue of batch directories to be imported
+	pendingBatchFiles map[string]int // Map of batch directory to count of pending files
+	pendingBatchMutex sync.RWMutex
 }
 
 // New creates a new BulkProcessor instance
@@ -60,10 +64,6 @@ func New(config Config) (*BulkProcessor, error) {
 		return nil, errors.Wrap(err, "failed to get S3 configuration from database")
 	}
 
-	// Log that we're using DB-provided configuration
-	fmt.Printf("Using S3 configuration from database: endpoint=%s, region=%s, bucket=%s, prefix=%s\n",
-		s3Config.Endpoint, s3Config.Region, s3Config.BucketName, s3Config.Prefix)
-
 	// Create S3 client with the appropriate config
 	s3Client, err := NewS3Client(*s3Config)
 	if err != nil {
@@ -74,7 +74,7 @@ func New(config Config) (*BulkProcessor, error) {
 
 	// Create file manager
 	filePrefix := fmt.Sprintf("relyt_bulk_%s", strings.ReplaceAll(config.PostgreSQL.Table, ".", "_"))
-	fileManager, err := NewFileManager(s3Client, filePrefix, config.BatchSize, processId)
+	fileManager, err := NewFileManager(s3Client, filePrefix, config.BatchSize, processId, config.BatchImportSize)
 	if err != nil {
 		// Make sure to close the clients if file manager creation fails
 		pgClient.Close()
@@ -91,15 +91,17 @@ func New(config Config) (*BulkProcessor, error) {
 	ctx, cancel = context.WithCancel(context.Background())
 
 	return &BulkProcessor{
-		config:          config,
-		processId:       processId,
-		pgClient:        pgClient,
-		s3Client:        s3Client,
-		fileManager:     fileManager,
-		ctx:             ctx,
-		cancel:          cancel,
-		importErrorChan: make(chan error, 100),   // Buffer for import errors
-		fileQueue:       make(chan string, 1000), // Buffer for file queue
+		config:            config,
+		processId:         processId,
+		pgClient:          pgClient,
+		s3Client:          s3Client,
+		fileManager:       fileManager,
+		ctx:               ctx,
+		cancel:            cancel,
+		importErrorChan:   make(chan error, 100),   // Buffer for import errors
+		fileQueue:         make(chan string, 1000), // Buffer for file queue
+		batchQueue:        make(chan string, 100),  // Buffer for batch queue
+		pendingBatchFiles: make(map[string]int),    // Tracks files pending in each batch
 	}, nil
 }
 
@@ -269,21 +271,27 @@ func (p *BulkProcessor) Insert(data interface{}) error {
 	// Prepare current file
 	currentFile := p.fileManager.GetCurrentFile()
 	if currentFile == nil || currentFile.State != FileStateOpen {
-		// Create a new file with headers
-		columnNames := GetColumnNames(p.fields)
-		var err error
-		currentFile, err = p.fileManager.CreateFile(columnNames)
-		if err != nil {
-			return err
-		}
-		p.fileManager.SetCurrentFile(currentFile)
+		p.mutex.Lock()
+		defer p.mutex.Unlock()
 
-		// Update checkpoint with new file
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
+		currentFile = p.fileManager.GetCurrentFile()
+		if currentFile == nil || currentFile.State != FileStateOpen {
+			// Create a new file
+			columnNames := GetColumnNames(p.fields)
+			var err error
+			currentFile, err = p.fileManager.CreateFile(columnNames)
+			if err != nil {
+				return err
+			}
+			p.fileManager.SetCurrentFile(currentFile)
 
-		if err := p.pgClient.UpdateCheckpointFile(ctx, p.processId, currentFile.ToCheckpointInfo()); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to update checkpoint with new file: %v\n", err)
+			// Update checkpoint with new file
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			if err := p.pgClient.UpdateCheckpointFile(ctx, p.processId, currentFile.ToCheckpointInfo()); err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to update checkpoint with new file: %v\n", err)
+			}
 		}
 	}
 
@@ -324,6 +332,15 @@ func (p *BulkProcessor) Insert(data interface{}) error {
 
 		// Check if file is full
 		if currentFile.IsFull(p.config.BatchSize) {
+			p.mutex.Lock()
+			defer p.mutex.Unlock()
+
+			currentFile = p.fileManager.GetCurrentFile()
+			if !currentFile.IsFull(p.config.BatchSize) {
+				// already been proccessed by other thread
+				continue
+			}
+
 			// Flush and close the file
 			if err := currentFile.Flush(); err != nil {
 				return err
@@ -378,11 +395,11 @@ func (p *BulkProcessor) Insert(data interface{}) error {
 	}
 
 	// Update last insert time
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := p.pgClient.UpdateCheckpointLastInsert(ctx, p.processId); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to update checkpoint last insert time: %v\n", err)
-	}
+	// ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// defer cancel()
+	// if err := p.pgClient.UpdateCheckpointLastInsert(ctx, p.processId); err != nil {
+	// 	fmt.Fprintf(os.Stderr, "Failed to update checkpoint last insert time: %v\n", err)
+	// }
 
 	return nil
 }
@@ -443,6 +460,16 @@ func (p *BulkProcessor) Flush() error {
 			return err
 		}
 
+		// flush all pendingBatchFiles
+		p.pendingBatchMutex.Lock()
+		for batchDir, count := range p.pendingBatchFiles {
+			if count > 0 {
+				p.batchQueue <- batchDir
+			}
+			delete(p.pendingBatchFiles, batchDir)
+		}
+		p.pendingBatchMutex.Unlock()
+
 		// Check for context cancellation
 		select {
 		case <-p.ctx.Done():
@@ -488,42 +515,55 @@ func (p *BulkProcessor) importerThread() {
 		select {
 		case <-p.ctx.Done():
 			return
-		case fileID := <-p.fileQueue:
-			file := p.fileManager.GetFile(fileID)
-			if file == nil {
+
+		case batchDir := <-p.batchQueue:
+			// Process a whole batch directory
+			if batchDir == "" {
 				continue
 			}
 
-			// Skip if not in frozen state
-			if file.State != FileStateFrozen {
+			// Get all files in this batch directory
+			files := p.fileManager.GetFilesByBatchDirectory(batchDir)
+			if len(files) == 0 {
 				continue
 			}
 
-			// Update state to importing
-			p.fileManager.UpdateFileState(fileID, FileStateImporting)
+			// Update state of all files to importing
+			for _, file := range files {
+				// Skip if not in frozen state
+				if file.State != FileStateFrozen {
+					continue
+				}
 
-			// Update checkpoint with importing file
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			if err := p.pgClient.UpdateCheckpointFile(ctx, p.processId, file.ToCheckpointInfo()); err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to update checkpoint for importing file: %v\n", err)
-			}
-			cancel()
+				// Update state to importing
+				p.fileManager.UpdateFileState(file.ID, FileStateImporting)
 
-			// Import file
-			err := p.importFile(file)
-			if err != nil {
-				file.SetError(fmt.Sprintf("failed to load: %v", err))
-
-				// Update checkpoint with error file
+				// Update checkpoint with importing file
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				if err2 := p.pgClient.UpdateCheckpointFile(ctx, p.processId, file.ToCheckpointInfo()); err2 != nil {
-					fmt.Fprintf(os.Stderr, "Failed to update checkpoint for error file: %v\n", err2)
+				if err := p.pgClient.UpdateCheckpointFile(ctx, p.processId, file.ToCheckpointInfo()); err != nil {
+					fmt.Fprintf(os.Stderr, "Failed to update checkpoint for importing file: %v\n", err)
 				}
 				cancel()
+			}
+
+			// Import the entire batch directory
+			err := p.importBatchDirectory(batchDir)
+			if err != nil {
+				// Mark all files as error
+				for _, file := range files {
+					file.SetError(fmt.Sprintf("failed to load batch: %v", err))
+
+					// Update checkpoint with error file
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					if err2 := p.pgClient.UpdateCheckpointFile(ctx, p.processId, file.ToCheckpointInfo()); err2 != nil {
+						fmt.Fprintf(os.Stderr, "Failed to update checkpoint for error file: %v\n", err2)
+					}
+					cancel()
+				}
 
 				// Update checkpoint status to failed
-				ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
-				errMsg := fmt.Sprintf("File import failed: %v", err)
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				errMsg := fmt.Sprintf("Batch import failed: %v", err)
 				if err3 := p.pgClient.UpdateCheckpointStatus(ctx, p.processId, CheckpointStatusFailed, errMsg); err3 != nil {
 					fmt.Fprintf(os.Stderr, "Failed to update checkpoint status to failed: %v\n", err3)
 				}
@@ -539,29 +579,66 @@ func (p *BulkProcessor) importerThread() {
 				return
 			}
 
-			// Update state to imported and record import time
-			file.ImportedAt = time.Now()
-			p.fileManager.UpdateFileState(fileID, FileStateImported)
+			// Update all files to imported state
+			for _, file := range files {
+				// Update state to imported and record import time
+				file.ImportedAt = time.Now()
+				p.fileManager.UpdateFileState(file.ID, FileStateImported)
 
-			// Update checkpoint with imported file
-			ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
-			if err := p.pgClient.UpdateCheckpointFile(ctx, p.processId, file.ToCheckpointInfo()); err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to update checkpoint for imported file: %v\n", err)
-			}
-			cancel()
+				// Update checkpoint with imported file
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				if err := p.pgClient.UpdateCheckpointFile(ctx, p.processId, file.ToCheckpointInfo()); err != nil {
+					fmt.Fprintf(os.Stderr, "Failed to update checkpoint for imported file: %v\n", err)
+				}
+				cancel()
 
-			// Cleanup file
-			if err := file.CleanupFile(); err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to cleanup file: %v\n", err)
+				// Cleanup file
+				if err := file.CleanupFile(); err != nil {
+					fmt.Fprintf(os.Stderr, "Failed to cleanup file: %v\n", err)
+				}
 			}
+
+		case fileID := <-p.fileQueue:
+			file := p.fileManager.GetFile(fileID)
+			if file == nil {
+				continue
+			}
+
+			// Skip if not in frozen state
+			if file.State != FileStateFrozen {
+				continue
+			}
+
+			batchDir := file.BatchDir
+
+			// Add to pending batch files
+			p.pendingBatchMutex.Lock()
+			p.pendingBatchFiles[batchDir]++
+			pendingCount := p.pendingBatchFiles[batchDir]
+
+			// If we have collected all files for this batch, queue the batch for import
+			if pendingCount >= p.config.BatchImportSize {
+				delete(p.pendingBatchFiles, batchDir) // Clear the counter
+
+				// Queue the batch for import
+				p.batchQueue <- batchDir
+			}
+			p.pendingBatchMutex.Unlock()
 		}
 	}
 }
 
-// importFile imports a file using external table
-func (p *BulkProcessor) importFile(file *File) error {
-	ctx, cancel := context.WithTimeout(p.ctx, 30*time.Minute)
+// importBatchDirectory imports all files in a batch directory with a single operation
+func (p *BulkProcessor) importBatchDirectory(batchDir string) error {
+	ctx, cancel := context.WithTimeout(p.ctx, 60*time.Minute) // Longer timeout for batch imports
 	defer cancel()
+
+	// Get S3 directory path
+	datePath := time.Now().Format("2006-01-02")
+	dirPath := filepath.Join(datePath, p.processId, batchDir)
+
+	// Get S3 directory URL
+	dirURL := p.s3Client.GetS3DirURL(dirPath)
 
 	// Generate a unique table name for the external table
 	externalTableName := fmt.Sprintf("ext_%s_%s",
@@ -571,28 +648,28 @@ func (p *BulkProcessor) importFile(file *File) error {
 	// Get column names from fields
 	columnNames := GetColumnNames(p.fields)
 
-	// Get fresh S3 config from database for each import
+	// Get fresh S3 config from database for the import
 	s3Config, err := p.pgClient.GetS3ConfigFromDB(ctx)
 	if err != nil {
-		return errors.Wrap(err, "failed to get S3 configuration from database for import")
+		return errors.Wrap(err, "failed to get S3 configuration from database for batch import")
 	}
-
 	// Create external table with column names (types will be taken from target table)
-	err = p.pgClient.CreateExternalTable(ctx, file.S3URL, externalTableName, columnNames, *s3Config)
+	// Note: Using directory URL instead of single file URL
+	err = p.pgClient.CreateExternalTable(ctx, dirURL, externalTableName, columnNames, *s3Config)
 	if err != nil {
-		return errors.Wrap(err, "failed to create external table")
+		return errors.Wrap(err, "failed to create external table for batch import")
 	}
 
 	// Import data from external table
 	err = p.pgClient.ImportFromExternalTable(ctx, externalTableName, columnNames)
 	if err != nil {
-		return errors.Wrap(err, "failed to load data from external table")
+		return errors.Wrap(err, "failed to load data from external table for batch import")
 	}
 
 	// Drop external table
 	err = p.pgClient.DropExternalTable(ctx, externalTableName)
 	if err != nil {
-		return errors.Wrap(err, "failed to drop external table")
+		return errors.Wrap(err, "failed to drop external table for batch import")
 	}
 
 	return nil

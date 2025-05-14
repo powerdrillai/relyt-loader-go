@@ -2,12 +2,14 @@ package bulkprocessor
 
 // S3Config represents the configuration for S3
 type S3Config struct {
-	Endpoint   string // S3 endpoint (e.g., s3.amazonaws.com)
-	Region     string // AWS region
-	BucketName string // S3 bucket name
-	Prefix     string // Key prefix for S3 objects
-	AccessKey  string // AWS access key
-	SecretKey  string // AWS secret key
+	Endpoint    string // S3 endpoint (e.g., s3.amazonaws.com)
+	Region      string // AWS region
+	BucketName  string // S3 bucket name
+	Prefix      string // Key prefix for S3 objects
+	AccessKey   string // AWS access key
+	SecretKey   string // AWS secret key
+	Concurrency int    // Number of concurrent uploads
+	PartSize    int64  // S3 multipart upload part size in bytes
 }
 
 // PostgreSQLConfig represents the configuration for PostgreSQL
@@ -26,6 +28,7 @@ type Config struct {
 	// S3 configuration is now always loaded from database through PostgreSQL connection
 	PostgreSQL      PostgreSQLConfig // PostgreSQL configuration
 	BatchSize       int              // Number of records per file
+	BatchImportSize int              // Number of files to import in a single batch (default: 1)
 	Concurrency     int              // Number of concurrent imports (default: 1)
 	TmpDir          string           // Temporary directory for local files (default: os.TempDir())
 	MaxErrorRecords int              // Maximum number of error records to ignore (default: 0)
@@ -53,6 +56,9 @@ func (c *Config) Validate() error {
 	}
 	if c.BatchSize <= 0 {
 		c.BatchSize = 10000 // Default batch size
+	}
+	if c.BatchImportSize <= 0 {
+		c.BatchImportSize = 10 // Default to importing 10 files at a time
 	}
 	if c.Concurrency <= 0 {
 		c.Concurrency = 1 // Default concurrency

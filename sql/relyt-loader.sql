@@ -6,7 +6,9 @@ CREATE TYPE loader_s3_config AS (
     bucket_name TEXT,
     prefix TEXT,
     access_key TEXT,
-    secret_key TEXT
+    secret_key TEXT,
+    concurrency INT,
+    part_size INT
 );
 
 -- create the LOADER_CONFIG function, return the s3 config info
@@ -21,7 +23,9 @@ AS $$
         'your-bucket'::TEXT AS bucket_name,
         'import/data'::TEXT AS prefix,
         'your-access-key'::TEXT AS access_key,
-        'your-secret-key'::TEXT AS secret_key
+        'your-secret-key'::TEXT AS secret_key,
+        20 AS concurrency,
+        5242880 AS part_size
     ;
 $$;
 
@@ -37,7 +41,9 @@ $$;
 --         'your-bucket'::TEXT AS bucket_name,
 --         'import/data'::TEXT AS prefix,
 --         'your-access-key'::TEXT AS access_key,
---         'your-secret-key'::TEXT AS secret_key
+--         'your-secret-key'::TEXT AS secret_key,
+--         20 AS concurrency,
+--         5242880 AS part_size
 --     ;
 -- $$;
 

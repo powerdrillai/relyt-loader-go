@@ -3,7 +3,6 @@ package bulkprocessor
 import (
 	"fmt"
 	"io"
-	"path/filepath"
 	"strings"
 	"sync"
 
@@ -37,6 +36,9 @@ type S3Writer struct {
 
 // NewS3Client creates a new S3 client
 func NewS3Client(config S3Config) (*S3Client, error) {
+	// Validate configuration
+	ValidateS3Config(&config)
+
 	var s3Config *aws.Config
 
 	if config.Endpoint != "" {
@@ -62,8 +64,8 @@ func NewS3Client(config S3Config) (*S3Client, error) {
 	// Create S3 client and uploader
 	s3Client := s3.New(sess)
 	uploader := s3manager.NewUploaderWithClient(s3Client, func(u *s3manager.Uploader) {
-		u.PartSize = 5 * 1024 * 1024 // 5MB part size
-		u.Concurrency = 5            // 5 concurrent uploads
+		u.PartSize = config.PartSize
+		u.Concurrency = int(config.Concurrency)
 	})
 
 	return &S3Client{
@@ -215,18 +217,64 @@ func (w *S3Writer) Close() error {
 	return nil
 }
 
-// GetS3URL returns the S3 URL for the given key
-func (c *S3Client) GetS3URL(s3Key string) string {
+// GetS3URL returns the S3 URL for a file
+func (c *S3Client) GetS3URL(key string) string {
 	// Ensure the key has the correct prefix
-	s3Key = c.ensurePrefix(s3Key)
+	key = c.ensurePrefix(key)
 
-	return fmt.Sprintf("s3://%s/%s/%s", c.config.Endpoint, c.bucketName, s3Key)
+	// Create S3 URL
+	return fmt.Sprintf("s3://%s/%s/%s", c.config.Endpoint, c.bucketName, key)
+}
+
+// GetS3DirURL returns the S3 URL for a directory (ending with a slash)
+func (c *S3Client) GetS3DirURL(dirPath string) string {
+	// Ensure the path has the correct prefix
+	dirPath = c.ensurePrefix(dirPath)
+
+	// Make sure the directory path ends with a slash for S3 directory semantics
+	if !strings.HasSuffix(dirPath, "/") {
+		dirPath = dirPath + "/"
+	}
+
+	// Create S3 URL for directory
+	return fmt.Sprintf("s3://%s/%s/%s", c.config.Endpoint, c.bucketName, dirPath)
 }
 
 // ensurePrefix ensures the key has the correct prefix
 func (c *S3Client) ensurePrefix(s3Key string) string {
-	if c.config.Prefix != "" && !strings.HasPrefix(s3Key, c.config.Prefix) {
-		s3Key = filepath.Join(c.config.Prefix, s3Key)
+	// If no prefix or key already has prefix, return as is
+	if c.config.Prefix == "" || strings.HasPrefix(s3Key, c.config.Prefix) {
+		return s3Key
 	}
-	return s3Key
+
+	// Join prefix and key with a slash in between
+	return fmt.Sprintf("%s/%s", strings.TrimSuffix(c.config.Prefix, "/"), strings.TrimPrefix(s3Key, "/"))
+}
+
+// ValidateS3Config validates the S3 configuration and sets default values if needed
+func ValidateS3Config(config *S3Config) {
+	// Validate and set default concurrency
+	if config.Concurrency <= 0 {
+		config.Concurrency = 20 // Default concurrency
+	}
+
+	// Ensure concurrency is reasonable (not too high to avoid overwhelming resources)
+	if config.Concurrency > 50 {
+		config.Concurrency = 50 // Cap concurrency to reasonable value
+	}
+
+	// Validate and set default part size
+	if config.PartSize <= 0 {
+		config.PartSize = 5 * 1024 * 1024 // Default to 5MB
+	}
+
+	// AWS requires a minimum of 5MB for all but the last part
+	if config.PartSize < 5*1024*1024 {
+		config.PartSize = 5 * 1024 * 1024 // Min 5MB
+	}
+
+	// Avoid excessive part sizes
+	if config.PartSize > 100*1024*1024 {
+		config.PartSize = 100 * 1024 * 1024 // Max 100MB
+	}
 }

@@ -7,7 +7,7 @@ import (
 	"os"
 	"strconv"
 
-	"relyt-loader-go/bulkprocessor"
+	"github.com/powerdrillai/relyt-loader-go/bulkprocessor"
 )
 
 // to run this example, you need to have a postgres database with the following table:
@@ -39,8 +39,8 @@ func main() {
 			Table:    "user_data",
 			Schema:   "public",
 		},
-		BatchSize:   100000, // number of records per file
-		Concurrency: 1,      // number of import threads
+		BatchSize:       100000, // number of records per file
+		BatchImportSize: 10,
 	}
 
 	// create processor

@@ -20,14 +20,13 @@ type PostgreSQLClient struct {
 
 // FileCheckpointInfo represents a file's status in the checkpoint
 type FileCheckpointInfo struct {
-	FileID      string    `json:"file_id"`
-	S3Key       string    `json:"s3_key"`
-	S3URL       string    `json:"s3_url"`
-	NumRecords  int       `json:"num_records"`
-	CreatedAt   time.Time `json:"created_at"`
-	ImportedAt  time.Time `json:"imported_at,omitempty"`
-	Status      string    `json:"status"` // CREATED, FROZEN, IMPORTING, IMPORTED, ERROR
-	ErrorReason string    `json:"error_reason,omitempty"`
+	S3Key       string            `json:"s3_key"`
+	NumRecords  int               `json:"num_records"`
+	CreatedAt   time.Time         `json:"created_at"`
+	ImportedAt  time.Time         `json:"imported_at,omitempty"`
+	Status      string            `json:"status"` // CREATED, FROZEN, IMPORTING, IMPORTED, ERROR
+	ErrorReason string            `json:"error_reason,omitempty"`
+	Metadata    map[string]string `json:"metadata,omitempty"` // Additional metadata for the file
 }
 
 // CheckpointStatus represents the status of a process in the checkpoint table
@@ -142,7 +141,7 @@ func (c *PostgreSQLClient) UpdateCheckpointFile(ctx context.Context, processId s
 	// Update or add the file info
 	found := false
 	for i, f := range fileDetails {
-		if f.FileID == fileInfo.FileID {
+		if f.S3Key == fileInfo.S3Key {
 			fileDetails[i] = fileInfo
 			found = true
 			break
@@ -201,7 +200,20 @@ func (c *PostgreSQLClient) GetS3ConfigFromDB(ctx context.Context) (*S3Config, er
 	var s3Config S3Config
 
 	// Query the LOADER_CONFIG function
-	row := c.pool.QueryRow(ctx, "SELECT * FROM LOADER_CONFIG()")
+	sqlStatement := `
+	SELECT 
+		endpoint, 
+		region, 
+		bucket_name, 
+		prefix, 
+		access_key, 
+		secret_key, 
+		concurrency, 
+		part_size
+	FROM LOADER_CONFIG()
+	`
+
+	row := c.pool.QueryRow(ctx, sqlStatement)
 	err := row.Scan(
 		&s3Config.Endpoint,
 		&s3Config.Region,
@@ -209,6 +221,8 @@ func (c *PostgreSQLClient) GetS3ConfigFromDB(ctx context.Context) (*S3Config, er
 		&s3Config.Prefix,
 		&s3Config.AccessKey,
 		&s3Config.SecretKey,
+		&s3Config.Concurrency,
+		&s3Config.PartSize,
 	)
 
 	if err != nil {
@@ -363,9 +377,6 @@ func (c *PostgreSQLClient) ImportFromExternalTable(ctx context.Context, external
 			c.config.Schema, c.config.Table, columnsList,
 			columnsList, c.config.Schema, externalTableName)
 	}
-
-	// Log the SQL statement for debugging
-	fmt.Println("Executing import SQL:", sqlStatement)
 
 	_, err = c.pool.Exec(ctx, sqlStatement)
 	if err != nil {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,6 +34,7 @@ type File struct {
 	ID          string    // Unique ID for the file
 	S3Key       string    // S3 key for the file
 	S3URL       string    // S3 URL for the file
+	BatchDir    string    // Batch directory this file belongs to
 	NumRecords  int       // Number of records in the file
 	CreatedAt   time.Time // Time the file was created
 	FrozenAt    time.Time // Time the file was frozen
@@ -47,34 +49,54 @@ type File struct {
 
 // FileManager manages files being processed
 type FileManager struct {
-	files       map[string]*File // Map of file ID to file
-	mutex       sync.RWMutex
-	s3Client    *S3Client // S3 client for streaming writes
-	filePrefix  string    // Prefix for file names
-	maxRecords  int       // Maximum number of records per file
-	currentFile *File     // Current file being written to
-	processId   string    // Unique process ID for distinguishing task files
+	files           map[string]*File // Map of file ID to file
+	mutex           sync.RWMutex
+	s3Client        *S3Client // S3 client for streaming writes
+	filePrefix      string    // Prefix for file names
+	maxRecords      int       // Maximum number of records per file
+	currentFile     *File     // Current file being written to
+	processId       string    // Unique process ID for distinguishing task files
+	currentBatchDir string    // Current batch directory (changes every batchImportSize files)
+	batchCounter    int       // Counter for files in the current batch
+	batchImportSize int       // Number of files per batch (from config)
 }
 
 // NewFileManager creates a new file manager
-func NewFileManager(s3Client *S3Client, filePrefix string, maxRecords int, processId string) (*FileManager, error) {
+func NewFileManager(s3Client *S3Client, filePrefix string, maxRecords int, processId string, batchImportSize int) (*FileManager, error) {
+	// Create a unique batch directory identifier
+	batchDir := fmt.Sprintf("batch_%s", uuid.New().String()[:8])
+
 	return &FileManager{
-		files:      make(map[string]*File),
-		s3Client:   s3Client,
-		filePrefix: filePrefix,
-		maxRecords: maxRecords,
-		processId:  processId,
+		files:           make(map[string]*File),
+		s3Client:        s3Client,
+		filePrefix:      filePrefix,
+		maxRecords:      maxRecords,
+		processId:       processId,
+		currentBatchDir: batchDir,
+		batchCounter:    0,
+		batchImportSize: batchImportSize,
 	}, nil
 }
 
 // CreateFile creates a new file
 func (m *FileManager) CreateFile(headers []string) (*File, error) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	// Check if we need to create a new batch directory
+	if m.batchCounter >= m.batchImportSize {
+		// Create a new batch directory for the next set of files
+		m.currentBatchDir = fmt.Sprintf("batch_%s", uuid.New().String()[:8])
+		m.batchCounter = 0
+	}
+
 	fileID := uuid.New().String()
 	fileName := fmt.Sprintf("%s_%s.csv", m.filePrefix, fileID)
 
-	// Include process ID in S3 key path
+	// Include process ID and batch directory in S3 key path
 	datePath := time.Now().Format("2006-01-02")
-	s3Key := filepath.Join(datePath, m.processId, fileName)
+
+	s3Key := filepath.Join(datePath, m.processId, m.currentBatchDir, fileName)
 
 	// Create S3 streaming writer
 	s3Writer, err := m.s3Client.NewStreamingWriter(s3Key)
@@ -88,6 +110,7 @@ func (m *FileManager) CreateFile(headers []string) (*File, error) {
 	f := &File{
 		ID:         fileID,
 		S3Key:      s3Key,
+		BatchDir:   m.currentBatchDir,
 		NumRecords: 0,
 		CreatedAt:  time.Now(),
 		State:      FileStateOpen,
@@ -96,9 +119,8 @@ func (m *FileManager) CreateFile(headers []string) (*File, error) {
 		headers:    headers,
 	}
 
-	m.mutex.Lock()
 	m.files[fileID] = f
-	m.mutex.Unlock()
+	m.batchCounter++
 
 	return f, nil
 }
@@ -118,10 +140,16 @@ func (m *FileManager) SetCurrentFile(file *File) {
 }
 
 // GetFile returns a file by ID
-func (m *FileManager) GetFile(fileID string) *File {
+func (m *FileManager) GetFile(id string) *File {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
-	return m.files[fileID]
+
+	// Return nil if file not found
+	if file, ok := m.files[id]; ok {
+		return file
+	}
+
+	return nil
 }
 
 // GetFilesByState returns files by state
@@ -246,9 +274,12 @@ func (m *FileManager) GetProcessId() string {
 	return m.processId
 }
 
-// ToCheckpointInfo converts a File to FileCheckpointInfo
+// ToCheckpointInfo converts a File to FileCheckpointInfo for checkpoint storage
 func (f *File) ToCheckpointInfo() FileCheckpointInfo {
-	status := "UNKNOWN"
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+
+	var status string
 	switch f.State {
 	case FileStateOpen:
 		status = "CREATED"
@@ -262,14 +293,68 @@ func (f *File) ToCheckpointInfo() FileCheckpointInfo {
 		status = "ERROR"
 	}
 
+	metadata := make(map[string]string)
+	metadata["batch_dir"] = f.BatchDir
+
 	return FileCheckpointInfo{
-		FileID:      f.ID,
 		S3Key:       f.S3Key,
-		S3URL:       f.S3URL,
 		NumRecords:  f.NumRecords,
 		CreatedAt:   f.CreatedAt,
 		ImportedAt:  f.ImportedAt,
 		Status:      status,
 		ErrorReason: f.ErrorReason,
+		Metadata:    metadata,
 	}
+}
+
+// GetBatchDirectoryPath returns the S3 path for the current batch directory
+func (m *FileManager) GetBatchDirectoryPath() string {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+
+	datePath := time.Now().Format("2006-01-02")
+	return filepath.Join(datePath, m.processId, m.currentBatchDir)
+}
+
+// GetFileBatchDirectory returns the batch directory a file belongs to
+func (m *FileManager) GetFileBatchDirectory(file *File) string {
+	if file == nil {
+		return ""
+	}
+
+	// Extract batch directory from S3 key
+	// Expected format: datePath/processId/batchDir/filename
+	parts := strings.Split(file.S3Key, "/")
+	if len(parts) >= 3 {
+		// If batch import is used, the batch directory is the second-to-last part before the filename
+		return parts[len(parts)-2]
+	}
+	return ""
+}
+
+// GetFilesByBatchDirectory returns all files in a specific batch directory
+func (m *FileManager) GetFilesByBatchDirectory(batchDir string) []*File {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+
+	var files []*File
+
+	// Iterate through all files and collect those in the specified batch directory
+	for _, file := range m.files {
+		// Only include files from the specified batch directory that are part of a batch import
+		if file.BatchDir == batchDir {
+			files = append(files, file)
+		}
+	}
+
+	return files
+}
+
+// IsInSameBatch checks if two files are in the same batch
+func (m *FileManager) IsInSameBatch(file1 *File, file2 *File) bool {
+	if file1 == nil || file2 == nil {
+		return false
+	}
+
+	return m.GetFileBatchDirectory(file1) == m.GetFileBatchDirectory(file2)
 }
