@@ -26,12 +26,13 @@ type PostgreSQLConfig struct {
 // Config represents the configuration for the bulk processor
 type Config struct {
 	// S3 configuration is now always loaded from database through PostgreSQL connection
-	PostgreSQL      PostgreSQLConfig // PostgreSQL configuration
-	BatchSize       int              // Number of records per file
-	BatchImportSize int              // Number of files to import in a single batch (default: 1)
-	Concurrency     int              // Number of concurrent imports (default: 1)
-	TmpDir          string           // Temporary directory for local files (default: os.TempDir())
-	MaxErrorRecords int              // Maximum number of error records to ignore (default: 0)
+	PostgreSQL       PostgreSQLConfig // PostgreSQL configuration
+	BatchSize        int              // Number of records per file
+	BatchImportSize  int              // Number of files to import in a single batch (default: 1)
+	Concurrency      int              // Number of concurrent imports (default: 1)
+	TmpDir           string           // Temporary directory for local files (default: os.TempDir())
+	MaxErrorRecords  int              // Maximum number of error records to ignore (default: 0)
+	UpdateOnConflict bool             // Whether to update or do nothing on primary key conflict (true=update, false=do nothing, default: true)
 }
 
 // Validate validates the configuration
@@ -68,6 +69,11 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxErrorRecords < 0 {
 		c.MaxErrorRecords = 0 // Default to not ignoring any errors
+	}
+	// UpdateOnConflict is true by default (update records on primary key conflict)
+	// bool defaults to false in Go, so we need to explicitly set it to true if not set
+	if !c.UpdateOnConflict {
+		c.UpdateOnConflict = true // Default to update on conflict
 	}
 	return nil
 }

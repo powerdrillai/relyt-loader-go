@@ -395,11 +395,11 @@ func (p *BulkProcessor) Insert(data interface{}) error {
 	}
 
 	// Update last insert time
-	// ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	// defer cancel()
-	// if err := p.pgClient.UpdateCheckpointLastInsert(ctx, p.processId); err != nil {
-	// 	fmt.Fprintf(os.Stderr, "Failed to update checkpoint last insert time: %v\n", err)
-	// }
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := p.pgClient.UpdateCheckpointLastInsert(ctx, p.processId); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to update checkpoint last insert time: %v\n", err)
+	}
 
 	return nil
 }
@@ -661,7 +661,7 @@ func (p *BulkProcessor) importBatchDirectory(batchDir string) error {
 	}
 
 	// Import data from external table
-	err = p.pgClient.ImportFromExternalTable(ctx, externalTableName, columnNames)
+	err = p.pgClient.ImportFromExternalTable(ctx, externalTableName, columnNames, p.config.UpdateOnConflict)
 	if err != nil {
 		return errors.Wrap(err, "failed to load data from external table for batch import")
 	}

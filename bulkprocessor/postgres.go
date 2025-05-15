@@ -321,7 +321,7 @@ func (c *PostgreSQLClient) GetTablePrimaryKeys(ctx context.Context) ([]string, e
 }
 
 // ImportFromExternalTable imports data from external table to target table
-func (c *PostgreSQLClient) ImportFromExternalTable(ctx context.Context, externalTableName string, columns []string) error {
+func (c *PostgreSQLClient) ImportFromExternalTable(ctx context.Context, externalTableName string, columns []string, updateOnConflict bool) error {
 	// Get primary key columns to handle conflicts
 	pkColumns, err := c.GetTablePrimaryKeys(ctx)
 	if err != nil {
@@ -336,46 +336,73 @@ func (c *PostgreSQLClient) ImportFromExternalTable(ctx context.Context, external
 		// Build the ON CONFLICT clause
 		conflictColumns := strings.Join(pkColumns, ", ")
 
-		// Build the update set clause (set each column to excluded.column)
-		updateSetParts := make([]string, 0, len(columns))
-		for _, col := range columns {
-			// Skip primary key columns in the update part
-			isPK := false
-			for _, pk := range pkColumns {
-				if pk == col {
-					isPK = true
-					break
-				}
-			}
-			if !isPK {
-				updateSetParts = append(updateSetParts, fmt.Sprintf("%s = excluded.%s", col, col))
-			}
+		// For the SELECT statement, we need to handle duplicate keys in the external table
+		// Use DISTINCT ON to get only one row per primary key combination
+		distinctOnClause := fmt.Sprintf("DISTINCT ON (%s)", conflictColumns)
+
+		// Build the WHERE clause to ensure all columns are not null
+		wherePartsForSelect := make([]string, 0, len(pkColumns))
+		for _, pk := range pkColumns {
+			wherePartsForSelect = append(wherePartsForSelect, fmt.Sprintf("%s IS NOT NULL", pk))
+		}
+		whereClauseForSelect := ""
+		if len(wherePartsForSelect) > 0 {
+			whereClauseForSelect = "WHERE " + strings.Join(wherePartsForSelect, " AND ")
 		}
 
-		// If there are non-PK columns to update
-		if len(updateSetParts) > 0 {
-			updateSet := strings.Join(updateSetParts, ", ")
-			sqlStatement = fmt.Sprintf(`INSERT INTO %s.%s (%s)
-			SELECT %s FROM %s.%s
-			ON CONFLICT (%s) DO UPDATE SET %s`,
-				c.config.Schema, c.config.Table, columnsList,
-				columnsList, c.config.Schema, externalTableName,
-				conflictColumns, updateSet)
+		if updateOnConflict {
+			// Build the update set clause (set each column to excluded.column)
+			updateSetParts := make([]string, 0, len(columns))
+			for _, col := range columns {
+				// Skip primary key columns in the update part
+				isPK := false
+				for _, pk := range pkColumns {
+					if pk == col {
+						isPK = true
+						break
+					}
+				}
+				if !isPK {
+					updateSetParts = append(updateSetParts, fmt.Sprintf("%s = excluded.%s", col, col))
+				}
+			}
+
+			// If there are non-PK columns to update
+			if len(updateSetParts) > 0 {
+				updateSet := strings.Join(updateSetParts, ", ")
+				sqlStatement = fmt.Sprintf(`INSERT INTO %s.%s (%s)
+				SELECT %s %s FROM %s.%s %s
+				ON CONFLICT (%s) DO UPDATE SET %s`,
+					c.config.Schema, c.config.Table, columnsList,
+					distinctOnClause, columnsList, c.config.Schema, externalTableName, whereClauseForSelect,
+					conflictColumns, updateSet)
+			} else {
+				// All columns are primary keys, do nothing on conflict
+				sqlStatement = fmt.Sprintf(`INSERT INTO %s.%s (%s)
+				SELECT %s %s FROM %s.%s %s
+				ON CONFLICT (%s) DO NOTHING`,
+					c.config.Schema, c.config.Table, columnsList,
+					distinctOnClause, columnsList, c.config.Schema, externalTableName, whereClauseForSelect,
+					conflictColumns)
+			}
 		} else {
-			// All columns are primary keys, do nothing on conflict
+			// Do nothing on conflict (as per configuration)
 			sqlStatement = fmt.Sprintf(`INSERT INTO %s.%s (%s)
-			SELECT %s FROM %s.%s
+			SELECT %s %s FROM %s.%s %s
 			ON CONFLICT (%s) DO NOTHING`,
 				c.config.Schema, c.config.Table, columnsList,
-				columnsList, c.config.Schema, externalTableName,
+				distinctOnClause, columnsList, c.config.Schema, externalTableName, whereClauseForSelect,
 				conflictColumns)
 		}
 	} else {
-		// No primary key, use standard INSERT
+		// No primary key, use standard INSERT with GROUP BY to avoid duplicates
+		// In this case, we use GROUP BY all columns to eliminate exact duplicates
 		sqlStatement = fmt.Sprintf(`INSERT INTO %s.%s (%s)
-		SELECT %s FROM %s.%s`,
+		SELECT %s FROM %s.%s
+		GROUP BY %s`,
 			c.config.Schema, c.config.Table, columnsList,
-			columnsList, c.config.Schema, externalTableName)
+			columnsList, c.config.Schema, externalTableName,
+			columnsList)
 	}
 
 	_, err = c.pool.Exec(ctx, sqlStatement)

@@ -28,6 +28,10 @@ AS $$
         5242880 AS part_size
     ;
 $$;
+-- revoke the execute permission from public for safety
+REVOKE EXECUTE ON FUNCTION LOADER_CONFIG() FROM PUBLIC;
+-- grant the execute permission to the role who runs the loader
+GRANT EXECUTE ON FUNCTION LOADER_CONFIG() TO loader-user;
 
 -- example: how to update the config (only admin can update this function)
 -- CREATE OR REPLACE FUNCTION LOADER_CONFIG()
