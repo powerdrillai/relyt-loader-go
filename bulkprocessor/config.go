@@ -29,8 +29,6 @@ type Config struct {
 	PostgreSQL       PostgreSQLConfig // PostgreSQL configuration
 	BatchSize        int              // Number of records per file
 	BatchImportSize  int              // Number of files to import in a single batch (default: 1)
-	Concurrency      int              // Number of concurrent imports (default: 1)
-	TmpDir           string           // Temporary directory for local files (default: os.TempDir())
 	MaxErrorRecords  int              // Maximum number of error records to ignore (default: 0)
 	UpdateOnConflict bool             // Whether to update or do nothing on primary key conflict (true=update, false=do nothing, default: true)
 }
@@ -61,17 +59,9 @@ func (c *Config) Validate() error {
 	if c.BatchImportSize <= 0 {
 		c.BatchImportSize = 10 // Default to importing 10 files at a time
 	}
-	if c.Concurrency <= 0 {
-		c.Concurrency = 1 // Default concurrency
-	}
-	if c.TmpDir == "" {
-		c.TmpDir = "" // Will use os.TempDir() in processor
-	}
 	if c.MaxErrorRecords < 0 {
 		c.MaxErrorRecords = 0 // Default to not ignoring any errors
 	}
-	// UpdateOnConflict is true by default (update records on primary key conflict)
-	// bool defaults to false in Go, so we need to explicitly set it to true if not set
 	if !c.UpdateOnConflict {
 		c.UpdateOnConflict = true // Default to update on conflict
 	}
