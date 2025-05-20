@@ -31,6 +31,7 @@ type Config struct {
 	BatchImportSize  int              // Number of files to import in a single batch (default: 1)
 	MaxErrorRecords  int              // Maximum number of error records to ignore (default: 0)
 	UpdateOnConflict bool             // Whether to update or do nothing on primary key conflict (true=update, false=do nothing, default: true)
+	FlushSleepTime   int              // Sleep time in milliseconds between processing iterations (default: 10)
 }
 
 // Validate validates the configuration
@@ -64,6 +65,9 @@ func (c *Config) Validate() error {
 	}
 	if !c.UpdateOnConflict {
 		c.UpdateOnConflict = true // Default to update on conflict
+	}
+	if c.FlushSleepTime <= 0 {
+		c.FlushSleepTime = 10 // Default sleep time to 10ms
 	}
 	return nil
 }

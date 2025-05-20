@@ -503,7 +503,7 @@ func (p *BulkProcessor) Flush() error {
 		}
 
 		// Short sleep to avoid excessive CPU usage
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(time.Duration(p.config.FlushSleepTime) * time.Millisecond)
 	}
 }
 
