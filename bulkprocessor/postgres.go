@@ -447,7 +447,7 @@ func (c *PostgreSQLClient) UpdateCheckpointErrorRecords(ctx context.Context, pro
 	return nil
 }
 
-// GetCheckpointErrorRecords gets the current error records count from the checkpoint
+// GetCheckpointErrorRecords gets the number of error records in the checkpoint
 func (c *PostgreSQLClient) GetCheckpointErrorRecords(ctx context.Context, processId string) (int, error) {
 	sqlStatement := `
 	SELECT error_records FROM relyt_loader_checkpoint
@@ -457,10 +457,25 @@ func (c *PostgreSQLClient) GetCheckpointErrorRecords(ctx context.Context, proces
 	var errorRecords int
 	err := c.pool.QueryRow(ctx, sqlStatement, processId).Scan(&errorRecords)
 	if err != nil {
-		return 0, errors.Wrap(err, "failed to get checkpoint error records count")
+		return 0, errors.Wrap(err, "failed to get error records count from checkpoint")
 	}
 
 	return errorRecords, nil
+}
+
+// DeleteCheckpoint deletes checkpoint records for the given process ID
+func (c *PostgreSQLClient) DeleteCheckpoint(ctx context.Context, processId string) error {
+	sqlStatement := `
+	DELETE FROM relyt_loader_checkpoint
+	WHERE process_id = $1
+	`
+
+	_, err := c.pool.Exec(ctx, sqlStatement, processId)
+	if err != nil {
+		return errors.Wrap(err, "failed to delete checkpoint records")
+	}
+
+	return nil
 }
 
 // GetTableSchema retrieves the schema of a PostgreSQL table

@@ -1,6 +1,7 @@
 package bulkprocessor
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"strings"
@@ -249,6 +250,52 @@ func (c *S3Client) ensurePrefix(s3Key string) string {
 
 	// Join prefix and key with a slash in between
 	return fmt.Sprintf("%s/%s", strings.TrimSuffix(c.config.Prefix, "/"), strings.TrimPrefix(s3Key, "/"))
+}
+
+// DeleteObjects deletes multiple objects from S3 by key
+func (c *S3Client) DeleteObjects(ctx context.Context, keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+
+	// S3 delete objects can handle up to 1000 keys at a time
+	// Process in batches if necessary
+	const maxKeysPerRequest = 1000
+
+	for i := 0; i < len(keys); i += maxKeysPerRequest {
+		end := i + maxKeysPerRequest
+		if end > len(keys) {
+			end = len(keys)
+		}
+
+		// Create batch for deletion
+		batch := keys[i:end]
+
+		// Prepare the delete objects input
+		var objects []*s3.ObjectIdentifier
+		for _, key := range batch {
+			// Ensure the key has the correct prefix
+			formattedKey := c.ensurePrefix(key)
+			objects = append(objects, &s3.ObjectIdentifier{
+				Key: aws.String(formattedKey),
+			})
+		}
+
+		// Delete the objects
+		_, err := c.client.DeleteObjectsWithContext(ctx, &s3.DeleteObjectsInput{
+			Bucket: aws.String(c.bucketName),
+			Delete: &s3.Delete{
+				Objects: objects,
+				Quiet:   aws.Bool(true), // Don't return deletion results for each object
+			},
+		})
+
+		if err != nil {
+			return errors.Wrap(err, "failed to delete objects from S3")
+		}
+	}
+
+	return nil
 }
 
 // ValidateS3Config validates the S3 configuration and sets default values if needed

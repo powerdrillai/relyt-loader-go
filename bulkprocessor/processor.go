@@ -148,24 +148,49 @@ func (p *BulkProcessor) Shutdown() error {
 		fmt.Fprintf(os.Stderr, "Failed to update checkpoint status on shutdown: %v\n", err)
 	}
 
+	// Create a list of all files that need to be cleaned up from S3
+	allFiles := append(
+		p.fileManager.GetFilesByState(FileStateFrozen),
+		append(
+			p.fileManager.GetFilesByState(FileStateImporting),
+			p.fileManager.GetFilesByState(FileStateImported)...,
+		)...,
+	)
+
+	// Cleanup files from local filesystem
+	for _, file := range allFiles {
+		if err := file.CleanupFile(); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to cleanup local file: %v\n", err)
+		}
+	}
+
+	// Cleanup S3 files
+	// First gather all S3 keys that need to be deleted
+	var s3Keys []string
+	for _, file := range allFiles {
+		if file.S3Key != "" {
+			s3Keys = append(s3Keys, file.S3Key)
+		}
+	}
+
+	// Delete files from S3 if there are any
+	if len(s3Keys) > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := p.s3Client.DeleteObjects(ctx, s3Keys); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to delete S3 objects during shutdown: %v\n", err)
+		}
+		cancel()
+	}
+
+	// Cleanup checkpoint records
+	ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+	if err := p.pgClient.DeleteCheckpoint(ctx, p.processId); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to delete checkpoint records during shutdown: %v\n", err)
+	}
+	cancel()
+
 	// Close clients
 	p.pgClient.Close()
-
-	// Cleanup files
-	frozenFiles := p.fileManager.GetFilesByState(FileStateFrozen)
-	for _, file := range frozenFiles {
-		file.CleanupFile()
-	}
-
-	importingFiles := p.fileManager.GetFilesByState(FileStateImporting)
-	for _, file := range importingFiles {
-		file.CleanupFile()
-	}
-
-	importedFiles := p.fileManager.GetFilesByState(FileStateImported)
-	for _, file := range importedFiles {
-		file.CleanupFile()
-	}
 
 	return nil
 }
