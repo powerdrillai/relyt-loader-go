@@ -89,7 +89,7 @@ CREATE TYPE loader_s3_config AS (
 );
 
 -- Create the LOADER_CONFIG function
-CREATE OR REPLACE FUNCTION LOADER_CONFIG()
+CREATE OR REPLACE FUNCTION relyt_sys.LOADER_CONFIG()
 RETURNS loader_s3_config
 LANGUAGE SQL
 IMMUTABLE
@@ -100,7 +100,11 @@ AS $$
         'your-bucket'::TEXT AS bucket_name,
         'import/data'::TEXT AS prefix,
         'your-access-key'::TEXT AS access_key,
-        'your-secret-key'::TEXT AS secret_key
+        'your-secret-key'::TEXT AS secret_key,
+        20 AS concurrency,
+        5242880 AS part_size,
+        1800 AS import_timeout,
+        10 AS import_error_sleep_time
     ;
 $$;
 ```
@@ -110,7 +114,7 @@ $$;
 The SDK automatically creates and maintains a checkpoint table in PostgreSQL to track task progress:
 
 ```sql
-CREATE TABLE IF NOT EXISTS relyt_loader_checkpoint (
+CREATE TABLE IF NOT EXISTS relyt_sys.relyt_loader_checkpoint (
     process_id TEXT PRIMARY KEY,
     pg_table TEXT NOT NULL,
     status TEXT NOT NULL,
@@ -152,16 +156,16 @@ SELECT
     start_time, last_insert_time,
     files_total, files_imported,
     error_records
-FROM relyt_loader_checkpoint;
+FROM relyt_sys.relyt_loader_checkpoint;
 
 -- Get details of a specific task
-SELECT * FROM relyt_loader_checkpoint
+SELECT * FROM relyt_sys.relyt_loader_checkpoint
 WHERE process_id = 'your-process-id';
 
 -- Get file details for a task
 SELECT 
     file_id, status, s3_key, num_records, created_at, imported_at
-FROM relyt_loader_checkpoint,
+FROM relyt_sys.relyt_loader_checkpoint,
      jsonb_array_elements(file_details) AS file
 WHERE process_id = 'your-process-id';
 ```
@@ -197,7 +201,7 @@ The default value for `MaxErrorRecords` is 0, which means no errors are tolerate
 
 ## How It Works
 
-1. On initialization, the SDK connects to PostgreSQL and calls the `LOADER_CONFIG()` function
+1. On initialization, the SDK connects to PostgreSQL and calls the `relyt_sys.LOADER_CONFIG()` function
 2. The S3 configuration is retrieved and used for all S3 operations
 3. The SDK generates a unique process ID for the task and creates a checkpoint record
 4. When you call `Insert`, data is streamed directly to S3
@@ -213,6 +217,6 @@ The default value for `MaxErrorRecords` is 0, which means no errors are tolerate
 ## Requirements
 
 - PostgreSQL must have access to the S3 storage
-- The `LOADER_CONFIG()` function must be created in your database
-- The `relyt_loader_checkpoint` table must be created in your database
+- The `relyt_sys.LOADER_CONFIG()` function must be created in your database
+- The `relyt_sys.relyt_loader_checkpoint` table must be created in your database
 - Structs must use `json:"column_name"` tags to specify column names

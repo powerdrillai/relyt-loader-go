@@ -2,10 +2,12 @@ package main
 
 import (
 	"encoding/csv"
+	"fmt"
 	"io"
 	"log"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/powerdrillai/relyt-loader-go/bulkprocessor"
 )
@@ -25,22 +27,50 @@ type UserData struct {
 	Vector string `json:"vector"`
 }
 
+// define a struct to hold error handler resources
+type ErrorHandlerResources struct {
+	// add any resources needed for error handling, e.g., database connection, logger, etc.
+	LogFile *os.File
+}
+
+func WriteErrorsToFiles(fieldname string, values []string, err error, resources interface{}) {
+    res := resources.(*ErrorHandlerResources)
+	feedbackKeysString := fmt.Sprintf("failed %s is [%s] with error: %v.", fieldname, strings.Join(values, ","), err)
+	res.LogFile.WriteString("Error: " + feedbackKeysString + "\n")
+	log.Printf("Error: %s", feedbackKeysString)
+}
+
 // to run
 func main() {
+	// open a error.log
+    logFile, err := os.OpenFile("/tmp/error.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+    if err != nil {
+        log.Fatalf("Failed to open log file: %v", err)
+    }
+    defer logFile.Close()
+
+    // 创建用户定义的资源结构体
+    resources := &ErrorHandlerResources{
+        LogFile: logFile,
+    }
+
 	// initialize config
 	config := bulkprocessor.Config{
 		// PostgreSQL config (required)
 		PostgreSQL: bulkprocessor.PostgreSQLConfig{
-			Host:     "postgres-host", // use your own host
-			Port:     5432,
+			Host:     "127.0.0.1", // use your own host
+			Port:     7000,
 			Username: "postgres",
-			Password: "xxxxx",        // use your own password
-			Database: "testdatabase", // use your own database
+			Password: "",        // use your own password
+			Database: "postgres", // use your own database
 			Table:    "user_data",
 			Schema:   "public",
 		},
-		BatchSize:       100000, // number of records per file
-		BatchImportSize: 10,
+		BatchSize:       10, // number of records per file
+		BatchImportSize: 2,
+		FeedbackColumn:      "id", // column name for error messages
+		ImportErrorCallback: WriteErrorsToFiles,
+		CallbackResource: resources,
 	}
 
 	// create processor
@@ -62,7 +92,7 @@ func main() {
 	}
 
 	filePath := os.Args[1]
-	batchSize := 1000
+	batchSize := 10
 	var users []UserData
 
 	csvFile, err := os.Open(filePath)
@@ -88,6 +118,11 @@ func main() {
 		id, err := strconv.Atoi(record[0])
 		if err != nil {
 			log.Fatalf("failed to parse id: %v", err)
+		}
+		if len(record) < 3 {
+			log.Fatalf("record does not contain enough fields: %v", record)
+		} else {
+			log.Printf("record %d: id=%d, ext=%s, vector=%s", i, id, record[1], record[2])
 		}
 		ext := record[1]
 		vector := record[2]

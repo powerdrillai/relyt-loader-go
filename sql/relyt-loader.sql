@@ -8,11 +8,13 @@ CREATE TYPE loader_s3_config AS (
     access_key TEXT,
     secret_key TEXT,
     concurrency INT,
-    part_size INT
+    part_size INT,
+    import_timeout INT,
+    import_error_sleep_time INT
 );
 
 -- create the LOADER_CONFIG function, return the s3 config info
-CREATE OR REPLACE FUNCTION LOADER_CONFIG()
+CREATE OR REPLACE FUNCTION relyt_sys.LOADER_CONFIG()
 RETURNS loader_s3_config
 LANGUAGE SQL
 IMMUTABLE
@@ -25,16 +27,18 @@ AS $$
         'your-access-key'::TEXT AS access_key,
         'your-secret-key'::TEXT AS secret_key,
         20 AS concurrency,
-        5242880 AS part_size
+        5242880 AS part_size,
+        1800 AS import_timeout,
+        10 AS import_error_sleep_time
     ;
 $$;
 -- revoke the execute permission from public for safety
-REVOKE EXECUTE ON FUNCTION LOADER_CONFIG() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION relyt_sys.LOADER_CONFIG() FROM PUBLIC;
 -- grant the execute permission to the role who runs the loader
-GRANT EXECUTE ON FUNCTION LOADER_CONFIG() TO loader-user;
+GRANT EXECUTE ON FUNCTION relyt_sys.LOADER_CONFIG() TO loader-user;
 
 -- example: how to update the config (only admin can update this function)
--- CREATE OR REPLACE FUNCTION LOADER_CONFIG()
+-- CREATE OR REPLACE FUNCTION relyt_sys.LOADER_CONFIG()
 -- RETURNS loader_s3_config
 -- LANGUAGE SQL
 -- IMMUTABLE
@@ -47,15 +51,17 @@ GRANT EXECUTE ON FUNCTION LOADER_CONFIG() TO loader-user;
 --         'your-access-key'::TEXT AS access_key,
 --         'your-secret-key'::TEXT AS secret_key,
 --         20 AS concurrency,
---         5242880 AS part_size
+--         5242880 AS part_size,
+--         1600 AS import_timeout,
+--         10 AS import_error_sleep_time
 --     ;
 -- $$;
 
 -- example: test the function
--- SELECT * FROM LOADER_CONFIG(); 
+-- SELECT * FROM relyt_sys.LOADER_CONFIG(); 
 
 -- checkpoint table
-CREATE TABLE IF NOT EXISTS relyt_loader_checkpoint (
+CREATE TABLE IF NOT EXISTS relyt_sys.relyt_loader_checkpoint (
 	process_id TEXT PRIMARY KEY,
 	pg_table TEXT NOT NULL,
 	status TEXT NOT NULL,
@@ -67,4 +73,19 @@ CREATE TABLE IF NOT EXISTS relyt_loader_checkpoint (
 	error_message TEXT,
 	error_records INT DEFAULT 0
 );
-GRANT SELECT,INSERT ON relyt_loader_checkpoint TO public;
+GRANT SELECT,INSERT ON relyt_sys.relyt_loader_checkpoint TO public;
+
+
+-- delta checkpoint table
+CREATE TABLE IF NOT EXISTS relyt_sys.relyt_loader_delta_checkpoint (
+	process_id TEXT NOT NULL,
+	pg_table TEXT NOT NULL,
+	status TEXT NOT NULL,
+	start_time TIMESTAMP WITH TIME ZONE NOT NULL,
+	finish_time TIMESTAMP WITH TIME ZONE,
+	filepath TEXT NOT NULL,
+	error_message TEXT DEFAULT '',
+	error_records INT DEFAULT 0,
+    PRIMARY KEY (process_id, filepath)
+) using heap;
+GRANT SELECT,INSERT ON relyt_sys.relyt_loader_delta_checkpoint TO public;

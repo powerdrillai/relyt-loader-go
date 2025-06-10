@@ -4,10 +4,12 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
+	"log"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+	"context"
 
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
@@ -59,6 +61,9 @@ type FileManager struct {
 	currentBatchDir string    // Current batch directory (changes every batchImportSize files)
 	batchCounter    int       // Counter for files in the current batch
 	batchImportSize int       // Number of files per batch (from config)
+	// Mutex for files operations, different from the file mutex is this mutex 
+	// will protect a continuous operations on files.
+	fileOperationsMutex     sync.Mutex 
 }
 
 // NewFileManager creates a new file manager
@@ -169,8 +174,8 @@ func (m *FileManager) GetFilesByState(state FileState) []*File {
 
 // UpdateFileState updates the state of a file
 func (m *FileManager) UpdateFileState(fileID string, state FileState) {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
 
 	if file, ok := m.files[fileID]; ok {
 		file.mutex.Lock()
@@ -185,6 +190,21 @@ func (m *FileManager) UpdateFileState(fileID string, state FileState) {
 			file.ImportedAt = time.Now()
 		}
 	}
+}
+
+// GetFilesByStateAndDirectory returns files by state
+func (m *FileManager) GetFilesByStateAndDirectory(state FileState, directory string) []*File {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+
+	var files []*File
+	for _, file := range m.files {
+		if file.State == state && file.BatchDir == directory {
+			files = append(files, file)
+		}
+	}
+
+	return files
 }
 
 // WriteRecord writes a record to a file
@@ -242,6 +262,11 @@ func (f *File) IsFull(maxRecords int) bool {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
 	return f.NumRecords >= maxRecords
+}
+
+func (f *File) IsTimeout(fileTimeout int) bool {
+	fileTimeoutDuration := time.Duration(fileTimeout) * time.Second
+	return time.Since(f.CreatedAt) >= fileTimeoutDuration
 }
 
 // SetError sets the error state and reason
@@ -357,4 +382,53 @@ func (m *FileManager) IsInSameBatch(file1 *File, file2 *File) bool {
 	}
 
 	return m.GetFileBatchDirectory(file1) == m.GetFileBatchDirectory(file2)
+}
+
+// delete the files that are imported or error from memory and S3, and return the file paths
+// with status imported which are used to delete the delta checkpoint, we want to keep the 
+// file paths with status error in the table relyt_loader_delta_checkpoint, after we check the reason
+// of the error, we can delete the file paths from the table relyt_loader_delta_checkpoint manually.
+func (m *FileManager) RecycleFiles() []string {
+	// Create a list of all files that need to be cleaned up from S3
+	allFiles := append(
+		m.GetFilesByState(FileStateImported),
+		m.GetFilesByState(FileStateError)...,
+	)
+
+	// Cleanup files from local filesystem
+	for _, file := range allFiles {
+		if err := file.CleanupFile(); err != nil {
+			log.Printf("Failed to cleanup local file: %v\n", err)
+		}
+	}
+
+	// Cleanup S3 files
+	// First gather all S3 keys that need to be deleted
+	var s3Keys []string
+	var importedFilepaths []string
+	m.mutex.Lock()
+	for _, file := range allFiles {
+		if file.S3Key != "" {
+			// remove the error file from memory, keep the Error file in S3 and relyt_loader_delta_checkpoint
+			// for further check, this files will be deleted from S3 with a expired time
+			// and be deleted from relyt_loader_delta_checkpoint manually.
+			delete(m.files, file.ID)
+			if file.State != FileStateError {
+				importedFilepaths = append(importedFilepaths, file.S3Key)
+				s3Keys = append(s3Keys, file.S3Key)
+			}
+		}
+	}
+	m.mutex.Unlock()
+
+	// Delete files from S3 if there are any
+	if len(s3Keys) > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := m.s3Client.DeleteObjects(ctx, s3Keys); err != nil {
+			log.Printf("Failed to delete S3 objects during shutdown: %v\n", err)
+		}
+		cancel()
+	}
+
+	return importedFilepaths
 }

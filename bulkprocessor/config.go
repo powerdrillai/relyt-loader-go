@@ -1,5 +1,6 @@
 package bulkprocessor
 
+type ImportErrorHandler func(fieldname string, values []string, err error, resources interface{})
 // S3Config represents the configuration for S3
 type S3Config struct {
 	Endpoint    string // S3 endpoint (e.g., s3.amazonaws.com)
@@ -32,6 +33,14 @@ type Config struct {
 	MaxErrorRecords  int              // Maximum number of error records to ignore (default: 0)
 	UpdateOnConflict bool             // Whether to update or do nothing on primary key conflict (true=update, false=do nothing, default: true)
 	FlushSleepTime   int              // Sleep time in milliseconds between processing iterations (default: 10)
+	FeedbackColumn   string           // Column name for error messages (default: "") when import failed
+	ImportErrorCallback ImportErrorHandler
+	CallbackResource interface{}
+	FileWriteTimeout int // a new file opened for a limited time to write, default: 10 seconds
+	GCInterval int // GC interval in seconds, default: 60 seconds
+	ImportTimeout int // S3 import timeout in seconds
+	ImportErrorSleepTime int // S3 import error sleep time in seconds
+	RoutingColumn string // routing column name
 }
 
 // Validate validates the configuration
@@ -68,6 +77,18 @@ func (c *Config) Validate() error {
 	}
 	if c.FlushSleepTime <= 0 {
 		c.FlushSleepTime = 10 // Default sleep time to 10ms
+	}
+	if c.FileWriteTimeout <= 0 {
+		c.FileWriteTimeout = 6 // Default auto flush interval to 6 seconds
+	}
+	if c.GCInterval <= 0 {
+		c.GCInterval = 60 // Default GC interval to 60 seconds
+	}
+	if c.ImportTimeout <= 0 {
+		c.ImportTimeout = 1800 // Default import timeout to 1800 seconds
+	}
+	if c.ImportErrorSleepTime <= 0 {
+		c.ImportErrorSleepTime = 60 // Default import error sleep time to 60 seconds
 	}
 	return nil
 }

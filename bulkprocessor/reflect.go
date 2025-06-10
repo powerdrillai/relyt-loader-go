@@ -2,6 +2,7 @@ package bulkprocessor
 
 import (
 	"fmt"
+	"log"
 	"reflect"
 	"time"
 )
@@ -45,6 +46,9 @@ func GetStructFields(structType reflect.Type) ([]FieldInfo, error) {
 			jsonName = jsonName[:len(jsonName)-len(comma)-1]
 		}
 
+		// print Name and JSONName for debugging
+		log.Printf("FieldName: %s, JSONName: %s\n", field.Name, jsonName)
+
 		fields = append(fields, FieldInfo{
 			Name:     field.Name,
 			JSONName: jsonName,
@@ -69,6 +73,7 @@ func GetFieldValues(obj interface{}, fields []FieldInfo) ([]string, error) {
 
 	values := make([]string, len(fields))
 	for i, field := range fields {
+
 		fieldVal := val.Field(field.Index)
 		values[i] = formatValue(fieldVal)
 	}
@@ -151,4 +156,14 @@ func getSQLType(t reflect.Type) string {
 	default:
 		return "TEXT"
 	}
+}
+
+// GetColumnIndex returns the index for a given field name
+func GetColumnIndex(fields []FieldInfo, fieldname string) int {
+	for _, field := range fields {
+		if field.JSONName == fieldname {
+			return field.Index
+		}
+	}
+	return -1 // Not found
 }

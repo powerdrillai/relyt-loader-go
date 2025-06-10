@@ -89,7 +89,7 @@ func (c *PostgreSQLClient) Close() {
 // InitializeCheckpoint initializes a new process in the checkpoint table
 func (c *PostgreSQLClient) InitializeCheckpoint(ctx context.Context, processId string, pgTable string) error {
 	sqlStatement := `
-	INSERT INTO relyt_loader_checkpoint
+	INSERT INTO relyt_sys.relyt_loader_checkpoint
 	(process_id, pg_table, status, start_time, files_total, files_imported, file_details, error_records)
 	VALUES ($1, $2, $3, $4, 0, 0, '[]'::jsonb, 0)
 	`
@@ -105,7 +105,7 @@ func (c *PostgreSQLClient) InitializeCheckpoint(ctx context.Context, processId s
 // UpdateCheckpointLastInsert updates the last insert time in the checkpoint
 func (c *PostgreSQLClient) UpdateCheckpointLastInsert(ctx context.Context, processId string) error {
 	sqlStatement := `
-	UPDATE relyt_loader_checkpoint
+	UPDATE relyt_sys.relyt_loader_checkpoint
 	SET last_insert_time = $1
 	WHERE process_id = $2
 	`
@@ -123,7 +123,7 @@ func (c *PostgreSQLClient) UpdateCheckpointFile(ctx context.Context, processId s
 	// First, get current file_details
 	var fileDetails []FileCheckpointInfo
 	sqlSelect := `
-	SELECT file_details FROM relyt_loader_checkpoint
+	SELECT file_details FROM relyt_sys.relyt_loader_checkpoint
 	WHERE process_id = $1
 	`
 
@@ -160,7 +160,7 @@ func (c *PostgreSQLClient) UpdateCheckpointFile(ctx context.Context, processId s
 
 	// Update checkpoint record
 	sqlUpdate := `
-	UPDATE relyt_loader_checkpoint
+	UPDATE relyt_sys.relyt_loader_checkpoint
 	SET file_details = $1,
 	    files_total = $2,
 	    files_imported = (
@@ -181,7 +181,7 @@ func (c *PostgreSQLClient) UpdateCheckpointFile(ctx context.Context, processId s
 // UpdateCheckpointStatus updates the status of a process in the checkpoint
 func (c *PostgreSQLClient) UpdateCheckpointStatus(ctx context.Context, processId string, status CheckpointStatus, errorMsg string) error {
 	sqlStatement := `
-	UPDATE relyt_loader_checkpoint
+	UPDATE relyt_sys.relyt_loader_checkpoint
 	SET status = $1, 
 	    error_message = $2
 	WHERE process_id = $3
@@ -195,8 +195,8 @@ func (c *PostgreSQLClient) UpdateCheckpointStatus(ctx context.Context, processId
 	return nil
 }
 
-// GetS3ConfigFromDB retrieves S3 configuration from the database
-func (c *PostgreSQLClient) GetS3ConfigFromDB(ctx context.Context) (*S3Config, error) {
+// GetLoadConfigFromDB retrieves loader configuration from the database
+func (c *PostgreSQLClient) GetLoadConfigFromDB(ctx context.Context, config *Config) (*S3Config, error) {
 	var s3Config S3Config
 
 	// Query the LOADER_CONFIG function
@@ -209,8 +209,10 @@ func (c *PostgreSQLClient) GetS3ConfigFromDB(ctx context.Context) (*S3Config, er
 		access_key, 
 		secret_key, 
 		concurrency, 
-		part_size
-	FROM LOADER_CONFIG()
+		part_size,
+		import_timeout,
+		import_error_sleep_time
+	FROM relyt_sys.LOADER_CONFIG()
 	`
 
 	row := c.pool.QueryRow(ctx, sqlStatement)
@@ -223,6 +225,8 @@ func (c *PostgreSQLClient) GetS3ConfigFromDB(ctx context.Context) (*S3Config, er
 		&s3Config.SecretKey,
 		&s3Config.Concurrency,
 		&s3Config.PartSize,
+		&config.ImportTimeout,
+		&config.ImportErrorSleepTime,
 	)
 
 	if err != nil {
@@ -259,7 +263,8 @@ func (c *PostgreSQLClient) CreateExternalTable(ctx context.Context, s3URL, table
 		}
 	}
 
-	// Create temporary external table
+	// Create temporary external table, we have a retry mechanism in the import process
+	// , so we use IF NOT EXISTS to avoid error when retrying
 	sqlStatement := fmt.Sprintf(`CREATE EXTERNAL TABLE %s.%s (
 		%s
 	)
@@ -268,7 +273,9 @@ func (c *PostgreSQLClient) CreateExternalTable(ctx context.Context, s3URL, table
           secret=%s 
           region=%s 
           version=2')
-	FORMAT 'CSV'`, c.config.Schema, tableName, strings.Join(columnDefs, ",\n"), s3URL, s3Config.AccessKey, s3Config.SecretKey, s3Config.Region)
+	FORMAT 'CSV'
+	(delimiter ',' null 'null')
+	`, c.config.Schema, tableName, strings.Join(columnDefs, ",\n"), s3URL, s3Config.AccessKey, s3Config.SecretKey, s3Config.Region)
 
 	_, err = c.pool.Exec(ctx, sqlStatement)
 	if err != nil {
@@ -407,7 +414,7 @@ func (c *PostgreSQLClient) ImportFromExternalTable(ctx context.Context, external
 
 	_, err = c.pool.Exec(ctx, sqlStatement)
 	if err != nil {
-		return errors.Wrap(err, "failed to load data from external table")
+		return err
 	}
 
 	return nil
@@ -420,7 +427,7 @@ func (c *PostgreSQLClient) DropExternalTable(ctx context.Context, tableName stri
 
 	_, err := c.pool.Exec(ctx, sqlStatement)
 	if err != nil {
-		return errors.Wrap(err, "failed to drop external table")
+		return err
 	}
 
 	return nil
@@ -434,14 +441,14 @@ func (c *PostgreSQLClient) ExecuteSQL(ctx context.Context, sql string, args ...i
 // UpdateCheckpointErrorRecords increments the error records count in the checkpoint
 func (c *PostgreSQLClient) UpdateCheckpointErrorRecords(ctx context.Context, processId string, count int) error {
 	sqlStatement := `
-	UPDATE relyt_loader_checkpoint
+	UPDATE relyt_sys.relyt_loader_checkpoint
 	SET error_records = error_records + $1
 	WHERE process_id = $2
 	`
 
 	_, err := c.pool.Exec(ctx, sqlStatement, count, processId)
 	if err != nil {
-		return errors.Wrap(err, "failed to update checkpoint error records count")
+		return err
 	}
 
 	return nil
@@ -450,7 +457,7 @@ func (c *PostgreSQLClient) UpdateCheckpointErrorRecords(ctx context.Context, pro
 // GetCheckpointErrorRecords gets the number of error records in the checkpoint
 func (c *PostgreSQLClient) GetCheckpointErrorRecords(ctx context.Context, processId string) (int, error) {
 	sqlStatement := `
-	SELECT error_records FROM relyt_loader_checkpoint
+	SELECT error_records FROM relyt_sys.relyt_loader_checkpoint
 	WHERE process_id = $1
 	`
 
@@ -466,13 +473,13 @@ func (c *PostgreSQLClient) GetCheckpointErrorRecords(ctx context.Context, proces
 // DeleteCheckpoint deletes checkpoint records for the given process ID
 func (c *PostgreSQLClient) DeleteCheckpoint(ctx context.Context, processId string) error {
 	sqlStatement := `
-	DELETE FROM relyt_loader_checkpoint
+	DELETE FROM relyt_sys.relyt_loader_checkpoint
 	WHERE process_id = $1
 	`
 
 	_, err := c.pool.Exec(ctx, sqlStatement, processId)
 	if err != nil {
-		return errors.Wrap(err, "failed to delete checkpoint records")
+		return err
 	}
 
 	return nil
@@ -534,3 +541,94 @@ func (c *PostgreSQLClient) GetTableSchema(ctx context.Context) ([]TableColumn, e
 	}
 	return columns, nil
 }
+
+// Insert a delta checkpoint record
+func (c *PostgreSQLClient) InsertDeltaCheckpoint(ctx context.Context, processId string, pgTable string, filePath string) error {
+	sqlStatement := `
+	INSERT INTO relyt_sys.relyt_loader_delta_checkpoint
+	(process_id, pg_table, status, start_time, finish_time, filepath)
+	VALUES ($1, $2, $3, $4, $5, $6)
+	`
+
+	_, err := c.pool.Exec(ctx, sqlStatement, processId, pgTable, string(CheckpointStatusRunning), time.Now(), nil, filePath)
+	if err != nil {
+		return errors.Wrap(err, "failed to insert delta checkpoint")
+	}
+
+	return nil
+}
+
+// Update delta checkpoint record
+func (c *PostgreSQLClient) UpdateDeltaCheckpointStatus(ctx context.Context, processId string, filePaths []string, status CheckpointStatus, errorRecords int, errorMessage string) error {
+	var placeholders []string
+    for i := range filePaths {
+        placeholders = append(placeholders, fmt.Sprintf("$%d", i+6)) // $6, $7, ...
+    }
+
+	sqlStatement := fmt.Sprintf(`
+	UPDATE relyt_sys.relyt_loader_delta_checkpoint
+	SET finish_time = $1, status = $2, error_message = $3, error_records = $4
+	WHERE process_id = $5 and filepath in (%s)
+	`, strings.Join(placeholders, ", "))
+
+	args := make([]interface{}, len(filePaths)+5)
+	args[0] = time.Now()
+	args[1] = string(status)
+	args[2] = errorMessage
+	args[3] = errorRecords
+	args[4] = processId
+
+	for i, filePath := range filePaths {
+		args[i+5] = filePath
+	}
+
+	_, err := c.pool.Exec(ctx, sqlStatement, args...)
+	if err != nil {
+		return errors.Wrap(err, "failed to update delta checkpoint")
+	}
+
+	return nil
+}
+
+// Delete delta checkpoint record
+func (c *PostgreSQLClient) DeleteDeltaCheckpointByProcessIdAndFilepaths(ctx context.Context, processId string, filePaths []string) error {
+	
+	var placeholders []string
+    for i := range filePaths {
+        placeholders = append(placeholders, fmt.Sprintf("$%d", i+2)) // $2, $3, ...
+    }
+
+	sqlStatement := fmt.Sprintf(`
+	DELETE FROM relyt_sys.relyt_loader_delta_checkpoint
+	WHERE process_id = $1 and filepath in (%s)
+	`, strings.Join(placeholders, ", "))
+
+	args := make([]interface{}, len(filePaths)+1)
+	args[0] = processId
+    for i, filePath := range filePaths {
+        args[i+1] = filePath
+    }
+	
+	_, err := c.pool.Exec(ctx, sqlStatement, args...)
+	if err != nil {
+		return errors.Wrap(err, "failed to delete delta checkpoint")
+	}
+
+	return nil
+}
+
+// Delete delta checkpoint record
+func (c *PostgreSQLClient) DeleteDeltaCheckpointByProcessId(ctx context.Context, processId string) error {
+	sqlStatement := `
+	DELETE FROM relyt_sys.relyt_loader_delta_checkpoint
+	WHERE process_id = $1
+	`
+
+	_, err := c.pool.Exec(ctx, sqlStatement, processId)
+	if err != nil {
+		return errors.Wrap(err, "failed to delete delta checkpoint")
+	}
+
+	return nil
+}
+

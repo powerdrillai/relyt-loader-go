@@ -1,0 +1,532 @@
+package bulkprocessor
+
+import (
+	"testing"
+	"fmt"
+	"log"
+	"os"
+	"strings"
+	"encoding/csv"
+	"io"
+	"strconv"
+	"time"
+	"os/exec"
+
+	"database/sql"
+	 _ "github.com/lib/pq" // PostgreSQL driver
+)
+
+type TestData struct {
+	ID     int    `json:"id"`
+	Ext    string `json:"ext"`
+	Vector string `json:"vector"`
+}
+
+// 定义一个结构体，包含数据库连接信息
+type DatabaseConfig struct {
+    Host     string
+    Port     int
+    Username string
+    Password string
+    Database string
+}
+
+// define a struct to hold error handler resources
+type ErrorHandlerResources struct {
+	// add any resources needed for error handling, e.g., database connection, logger, etc.
+	LogFile *os.File
+}
+
+func WriteErrorsToFiles(fieldname string, values []string, err error, resources interface{}) {
+    res := resources.(*ErrorHandlerResources)
+	feedbackKeysString := fmt.Sprintf("failed %s is [%s] with error: %v.", fieldname, strings.Join(values, ","), err)
+	res.LogFile.WriteString("Error: " + feedbackKeysString + "\n")
+	log.Printf("Error: %s", feedbackKeysString)
+}
+
+func NewProcessor(dbconfig DatabaseConfig, fileTimeout int) *BulkProcessor {
+	// open a error.log
+    logFile, err := os.OpenFile("/tmp/error.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+    if err != nil {
+        log.Fatalf("Failed to open log file: %v", err)
+    }
+
+    // 创建用户定义的资源结构体
+    resources := &ErrorHandlerResources{
+        LogFile: logFile,
+    }
+
+	// initialize config
+	config := Config{
+		// PostgreSQL config (required)
+		PostgreSQL: PostgreSQLConfig{
+			Host:     dbconfig.Host, // use your own host
+			Port:     dbconfig.Port,
+			Username: dbconfig.Username,
+			Password: dbconfig.Password, // use your own password
+			Database: dbconfig.Database, // use your own database
+			Table:    "test_data",
+			Schema:   "public",
+		},
+		BatchSize:       10, // number of records per file
+		BatchImportSize: 2,
+		FeedbackColumn:      "id", // column name for error messages
+		ImportErrorCallback: WriteErrorsToFiles,
+		CallbackResource: resources,
+		FileWriteTimeout: fileTimeout, // set file write timeout
+		GCInterval: 10, // set GC interval
+	}
+
+	// create processor
+	processor, err := New(config)
+	if err != nil {
+		log.Fatalf("failed to create processor: %v", err)
+	}
+	return processor
+}
+
+func InitDatabaseConfig(host string, port int, username, password, database string) DatabaseConfig {
+	return DatabaseConfig{
+		Host:     host,
+		Port:     port,
+		Username: username,
+		Password: password,
+		Database: database,
+	}
+}
+
+func SetupDataBase(config DatabaseConfig) (*sql.DB, error) {
+	// Construct the connection string
+	connStr := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
+		config.Host, config.Port, config.Username, config.Password, config.Database)
+
+	// Open a database connection
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to database: %w", err)
+	}
+
+	// Check if the connection is alive
+	if err := db.Ping(); err != nil {
+		return nil, fmt.Errorf("failed to ping database: %w", err)
+	}
+
+	log.Println("Database connection established successfully.")
+	return db, nil
+}
+
+func CreateTestDataTale(db *sql.DB) error {
+	// This function is a placeholder for creating the test table in PostgreSQL.
+	// You can implement the logic to create the necessary table structure here.
+	// For example, you might use a SQL command like:
+	// CREATE TABLE test_data (id SERIAL PRIMARY KEY, ext TEXT, vector TEXT);
+	log.Println("Creating test table in PostgreSQL...")
+	query := `
+	CREATE TABLE IF NOT EXISTS test_data (
+		id bigint NOT NULL PRIMARY KEY,
+		ext text,
+		vector vecf16(3) NOT NULL
+	);`
+	_, err := db.Exec(query)
+	if err != nil {
+		return fmt.Errorf("failed to create test table: %w", err)
+	}
+	log.Println("Test table created successfully.")
+	return nil
+}
+
+func TruncateTestDataTable(db *sql.DB) error {
+	// This function is a placeholder for truncating the test table in PostgreSQL.
+	// You can implement the logic to truncate the table here.
+	log.Println("Truncating test table in PostgreSQL...")
+	query := `TRUNCATE TABLE test_data;`
+	_, err := db.Exec(query)
+	if err != nil {
+		return fmt.Errorf("failed to truncate test table: %w", err)
+	}
+	log.Println("Test table truncated successfully.")
+	return nil
+}
+
+func GetCountFromTestDataTable(db *sql.DB) (int, error) {
+	// This function retrieves the count of records in the test table.
+	log.Println("Counting records in test table...")
+	query := `SELECT COUNT(*) FROM test_data;`
+	var count int
+	err := db.QueryRow(query).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count records: %w", err)
+	}
+	log.Printf("Counted %d records in test table.", count)
+	return count, nil
+}
+
+// TestInsertWithSomeErrors test the case we have some error data from csv to insert,
+// and we will write the error data to a file via the ImportErrorCallback function.
+func TestInsertWithSomeErrors(t *testing.T) {
+	// Initialize database connection
+	dbConfig := InitDatabaseConfig("127.0.0.1", 7000, "postgres", "", "postgres")
+	db, err := SetupDataBase(dbConfig)
+	if err != nil {
+		log.Fatalf("failed to setup database: %v", err)
+	} else {
+		err := CreateTestDataTale(db)
+		if err != nil {
+			log.Fatalf("failed to create test table: %v", err)
+			return
+		}
+		err = TruncateTestDataTable(db)
+		if err != nil {
+			log.Fatalf("failed to truncate test table: %v", err)
+			return
+		}
+	}
+	defer db.Close()
+
+	processor := NewProcessor(dbConfig, 6)
+	defer processor.Shutdown()
+
+	filePath := "../examples/data/test_multiple_s3_file_error.csv"
+
+	batchSize := 10
+	var tests []TestData
+
+	csvFile, err := os.Open(filePath)
+	if err != nil {
+		log.Fatalf("failed to open csv file: %v", err)
+	}
+	defer csvFile.Close()
+
+	csvReader := csv.NewReader(csvFile)
+	csvReader.FieldsPerRecord = -1
+	csvReader.Comma = '\t'
+	csvReader.ReuseRecord = true
+
+	i := 0
+	for {
+		record, err := csvReader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Errorf("failed to read csv file: %v", err)
+		}
+		id, err := strconv.Atoi(record[0])
+		if err != nil {
+			t.Errorf("failed to parse id: %v", err)
+		}
+		if len(record) < 3 {
+			t.Errorf("record does not contain enough fields: %v", record)
+		} else {
+			log.Printf("record %d: id=%d, ext=%s, vector=%s", i, id, record[1], record[2])
+		}
+		ext := record[1]
+		vector := record[2]
+		tests = append(tests, TestData{
+			ID:     id,
+			Ext:    ext,
+			Vector: vector,
+		})
+		i++
+
+		// insert batch
+		if i%batchSize == 0 {
+			err := processor.Insert(tests)
+			if err != nil {
+				t.Errorf("failed to insert data: %v", err)
+			}
+			tests = nil // clear the list, prepare for the next batch
+		}
+	}
+	if len(tests) > 0 {
+		err := processor.Insert(tests)
+		if err != nil {
+			t.Errorf("failed to insert data: %v", err)
+		}
+	}
+	// refresh all data and wait for import to complete
+	log.Println("refreshing data and waiting for import to complete...")
+	err = processor.Flush()
+	if err != nil {
+		log.Fatalf("failed to refresh data: %v", err)
+	}
+	// Check the count of records in the test table
+	count, err := GetCountFromTestDataTable(db)
+	if err != nil {
+		t.Errorf("failed to get count from test table: %v", err)
+	} else {
+		log.Printf("Counted %d records in test table.", count)
+		if count != 21 {
+			t.Errorf("expected %d records, but got %d", i, count)
+		}
+	}
+}
+
+// TestInsertWithSleep test the case we write data intermittently.
+func TestInsertWithSleep(t *testing.T) {
+	// Initialize database connection
+	dbConfig := InitDatabaseConfig("127.0.0.1", 7000, "postgres", "", "postgres")
+	db, err := SetupDataBase(dbConfig)
+	if err != nil {
+		log.Fatalf("failed to setup database: %v", err)
+	} else {
+		err := CreateTestDataTale(db)
+		if err != nil {
+			log.Fatalf("failed to create test table: %v", err)
+			return
+		}
+		err = TruncateTestDataTable(db)
+		if err != nil {
+			log.Fatalf("failed to truncate test table: %v", err)
+			return
+		}
+	}
+	defer db.Close()
+
+	fileTimeout := 3 // set file write timeout to 2 seconds
+	processor := NewProcessor(dbConfig, fileTimeout)
+	defer processor.Shutdown()
+
+	filePath := "../examples/data/test_sleep.csv"
+
+	// we write 5 records per batch and we will sleep for 2 seconds after each batch insert,
+	// even though we set BatchSize = 10 at NewProcessor, we will have 2 files after we write 
+	// 15 records because the file timeout, and then import thread will import these 
+	// 2 files to PostgreSQL in parallel.
+	batchSize := 5
+	s3BatchSize := 10
+	var tests []TestData
+
+	csvFile, err := os.Open(filePath)
+	if err != nil {
+		log.Fatalf("failed to open csv file: %v", err)
+	}
+	defer csvFile.Close()
+
+	csvReader := csv.NewReader(csvFile)
+	csvReader.FieldsPerRecord = -1
+	csvReader.Comma = '\t'
+	csvReader.ReuseRecord = true
+
+	i := 0
+	for {
+		record, err := csvReader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Errorf("failed to read csv file: %v", err)
+		}
+		id, err := strconv.Atoi(record[0])
+		if err != nil {
+			t.Errorf("failed to parse id: %v", err)
+		}
+		if len(record) < 3 {
+			t.Errorf("record does not contain enough fields: %v", record)
+		} else {
+			log.Printf("record %d: id=%d, ext=%s, vector=%s", i, id, record[1], record[2])
+		}
+		ext := record[1]
+		vector := record[2]
+		tests = append(tests, TestData{
+			ID:     id,
+			Ext:    ext,
+			Vector: vector,
+		})
+		i++
+
+		// insert batch
+		if i%batchSize == 0 {
+			log.Printf("insert batch %d, contains %d records", i/batchSize, len(tests))
+			err := processor.Insert(tests)
+			time.Sleep(time.Duration(fileTimeout - 1) * time.Second) // sleep for 2 seconds before next insert
+			if err != nil {
+				t.Errorf("failed to insert data: %v", err)
+			}
+			tests = nil // clear the list, prepare for the next batch
+			if i > s3BatchSize {
+				// Check the count of records in the test table
+				count, err := GetCountFromTestDataTable(db)
+				if err != nil {
+					t.Errorf("failed to get count from test table: %v", err)
+				} else {
+					log.Printf("Counted %d records in test table.", count)
+					if count != s3BatchSize {
+						t.Errorf("expected %d records, but got %d", s3BatchSize, count)
+					}
+				}
+			}
+		}
+	}
+
+	if len(tests) > 0 {
+		log.Printf("insert batch %d, contains %d records", i/batchSize, len(tests))
+		err := processor.Insert(tests)
+		if err != nil {
+			t.Errorf("failed to insert data: %v", err)
+		}
+	}
+	// refresh all data and wait for import to complete
+	log.Println("refreshing data and waiting for import to complete...")
+	err = processor.Flush()
+	if err != nil {
+		log.Fatalf("failed to refresh data: %v", err)
+	}
+
+	// Check the count of records in the test table
+	count, err := GetCountFromTestDataTable(db)
+	if err != nil {
+		t.Errorf("failed to get count from test table: %v", err)
+	} else {
+		log.Printf("Counted %d records in test table.", count)
+		if count != i {
+			t.Errorf("expected %d records, but got %d", i, count)
+		}
+	}
+}
+
+// TestInsertWithPgRecovery test the case when pg is down.
+func TestInsertWithPgRecovery(t *testing.T) {
+	// Initialize database connection
+	dbConfig := InitDatabaseConfig("127.0.0.1", 7000, "postgres", "", "postgres")
+	db, err := SetupDataBase(dbConfig)
+	if err != nil {
+		log.Fatalf("failed to setup database: %v", err)
+	} else {
+		err := CreateTestDataTale(db)
+		if err != nil {
+			log.Fatalf("failed to create test table: %v", err)
+			return
+		}
+		err = TruncateTestDataTable(db)
+		if err != nil {
+			log.Fatalf("failed to truncate test table: %v", err)
+			return
+		}
+	}
+	defer db.Close()
+
+	fileTimeout := 6 // set file write timeout to 2 seconds
+	processor := NewProcessor(dbConfig, fileTimeout)
+	defer processor.Shutdown()
+
+	filePath := "../examples/data/test_sleep.csv"
+
+	// we write 5 records per batch and we will sleep for 2 seconds after each batch insert,
+	// even though we set BatchSize = 10 at NewProcessor, we will have 2 files after we write 
+	// 15 records because the file timeout, and then import thread will import these 
+	// 2 files to PostgreSQL in parallel.
+	batchSize := 5
+	s3BatchSize := 10
+	var tests []TestData
+
+	csvFile, err := os.Open(filePath)
+	if err != nil {
+		log.Fatalf("failed to open csv file: %v", err)
+	}
+	defer csvFile.Close()
+
+	csvReader := csv.NewReader(csvFile)
+	csvReader.FieldsPerRecord = -1
+	csvReader.Comma = '\t'
+	csvReader.ReuseRecord = true
+
+	i := 0
+	for {
+		record, err := csvReader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Errorf("failed to read csv file: %v", err)
+		}
+		id, err := strconv.Atoi(record[0])
+		if err != nil {
+			t.Errorf("failed to parse id: %v", err)
+		}
+		if len(record) < 3 {
+			t.Errorf("record does not contain enough fields: %v", record)
+		} else {
+			log.Printf("record %d: id=%d, ext=%s, vector=%s", i, id, record[1], record[2])
+		}
+		ext := record[1]
+		vector := record[2]
+		tests = append(tests, TestData{
+			ID:     id,
+			Ext:    ext,
+			Vector: vector,
+		})
+		i++
+
+		// insert batch
+		if i % batchSize == 0 {
+			log.Printf("insert batch %d, contains %d records", i/batchSize, len(tests))
+			err := processor.Insert(tests)
+			if err != nil {
+				t.Errorf("failed to insert data: %v", err)
+			}
+			if i == s3BatchSize {
+				// shut down the pg-server
+				log.Printf("shutting down the pg-server...")
+				cmd := exec.Command("/bin/sh", "-c", "source /workspace/phoenix/neon/pg_install/v12/greenplum_path.sh; source /workspace/phoenix/gpAux/gpdemo/gpdemo-env.sh;gpstop -ia;")
+				err := cmd.Run()
+				if err != nil {
+					t.Errorf("failed to kill pg-server: %v", err)
+				}
+				log.Printf("finish shut down the pg-server...")
+			}
+			time.Sleep(time.Duration(fileTimeout / 2) * time.Second) // sleep for 2 seconds before next insert
+			if i == s3BatchSize {
+				// start the pg-server
+				log.Printf("starting the pg-server...")
+				cmd := exec.Command("/bin/sh", "-c", "source /workspace/phoenix/neon/pg_install/v12/greenplum_path.sh; source /workspace/phoenix/gpAux/gpdemo/gpdemo-env.sh;gpstart -a;")
+				err := cmd.Run()
+				if err != nil {
+					t.Errorf("failed to start pg-server: %v", err)
+				}
+				// 2 times of import error sleep time
+				log.Printf("sleep for %d seconds before next insert", processor.config.ImportErrorSleepTime * 2)
+				time.Sleep(time.Duration(processor.config.ImportErrorSleepTime * 2) * time.Second)
+			}
+			tests = nil // clear the list, prepare for the next batch
+			if i > s3BatchSize {
+				// Check the count of records in the test table
+				count, err := GetCountFromTestDataTable(db)
+				if err != nil {
+					t.Errorf("failed to get count from test table: %v", err)
+				} else {
+					log.Printf("Counted %d records in test table.", count)
+					if count != s3BatchSize {
+						t.Errorf("expected %d records, but got %d", s3BatchSize, count)
+					}
+				}
+			}
+		}
+	}
+
+	if len(tests) > 0 {
+		log.Printf("insert batch %d, contains %d records", i/batchSize, len(tests))
+		err := processor.Insert(tests)
+		if err != nil {
+			t.Errorf("failed to insert data: %v", err)
+		}
+	}
+	// refresh all data and wait for import to complete
+	log.Println("refreshing data and waiting for import to complete...")
+	err = processor.Flush()
+	if err != nil {
+		log.Fatalf("failed to refresh data: %v", err)
+	}
+
+	// Check the count of records in the test table
+	count, err := GetCountFromTestDataTable(db)
+	if err != nil {
+		t.Errorf("failed to get count from test table: %v", err)
+	} else {
+		log.Printf("Counted %d records in test table.", count)
+		if count != i {
+			t.Errorf("expected %d records, but got %d", i, count)
+		}
+	}
+}
+

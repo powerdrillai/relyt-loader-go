@@ -3,11 +3,13 @@ package bulkprocessor
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -28,13 +30,28 @@ type BulkProcessor struct {
 	ctx               context.Context
 	cancel            context.CancelFunc
 	isStarted         bool
-	isFlushing        bool
+	flushMutex       sync.RWMutex
 	isShutdown        bool
 	importErrorChan   chan error
 	fileQueue         chan string    // Queue of file IDs to be imported
 	batchQueue        chan string    // Queue of batch directories to be imported
 	pendingBatchFiles map[string]int // Map of batch directory to count of pending files
 	pendingBatchMutex sync.RWMutex
+
+	recordsQueue      chan []string // Channel to write records, support one processor used by multiple goroutines
+	recordsNum        int32 // Number of records in the recordsQueue
+	// this hashmap used to store the column value, return the values to the upper layer
+	// when import failed.
+	// init: new processor, initialize the map.
+	// write: for every insert record, write the specific column value into the map if 
+	// the value does not existed in the map.
+	// read: when import failed, scan the map to get all the column values.
+	// clear: finish the import, clear the map.
+	feedbackKeys      map[string]bool
+	feedbackKeysMutex sync.RWMutex
+	ImportErrorCallback ImportErrorHandler // Callback function to handle import errors
+	feedFieldIndex    int
+	lastFlushTime     time.Time
 }
 
 // New creates a new BulkProcessor instance
@@ -58,7 +75,7 @@ func New(config Config) (*BulkProcessor, error) {
 	defer cancel()
 
 	// Get S3 config from database
-	s3Config, err := pgClient.GetS3ConfigFromDB(ctx)
+	s3Config, err := pgClient.GetLoadConfigFromDB(ctx, &config)
 	if err != nil {
 		pgClient.Close()
 		return nil, errors.Wrap(err, "failed to get S3 configuration from database")
@@ -100,8 +117,12 @@ func New(config Config) (*BulkProcessor, error) {
 		cancel:            cancel,
 		importErrorChan:   make(chan error, 100),   // Buffer for import errors
 		fileQueue:         make(chan string, 1000), // Buffer for file queue
-		batchQueue:        make(chan string, 100),  // Buffer for batch queue
+		batchQueue:        make(chan string, 1000),  // Buffer for batch queue
 		pendingBatchFiles: make(map[string]int),    // Tracks files pending in each batch
+		feedbackKeys:      make(map[string]bool),   // Tracks error keys for failed imports
+		recordsQueue:      make(chan []string, 10000),
+		feedFieldIndex:    -1,
+		lastFlushTime:     time.Now(),
 	}, nil
 }
 
@@ -120,8 +141,18 @@ func (p *BulkProcessor) Start() error {
 	}
 
 	p.isStarted = true
+
 	p.importerWg.Add(1)
-	go p.importerThread()
+	go p.InsertThread()
+
+	p.importerWg.Add(1)
+	go p.ImporterThread()
+
+	p.importerWg.Add(1)
+	go p.AutoFlushThread()
+
+	p.importerWg.Add(1)
+	go p.GCThread()
 
 	return nil
 }
@@ -140,13 +171,6 @@ func (p *BulkProcessor) Shutdown() error {
 
 	// Wait for importer to finish
 	p.importerWg.Wait()
-
-	// Update checkpoint status to completed
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := p.pgClient.UpdateCheckpointStatus(ctx, p.processId, CheckpointStatusCompleted, ""); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to update checkpoint status on shutdown: %v\n", err)
-	}
 
 	// Create a list of all files that need to be cleaned up from S3
 	allFiles := append(
@@ -167,9 +191,11 @@ func (p *BulkProcessor) Shutdown() error {
 	// Cleanup S3 files
 	// First gather all S3 keys that need to be deleted
 	var s3Keys []string
+	var normalFilepaths []string
 	for _, file := range allFiles {
-		if file.S3Key != "" {
+		if file.S3Key != "" && file.State != FileStateError {
 			s3Keys = append(s3Keys, file.S3Key)
+			normalFilepaths = append(normalFilepaths, file.S3Key)
 		}
 	}
 
@@ -183,8 +209,8 @@ func (p *BulkProcessor) Shutdown() error {
 	}
 
 	// Cleanup checkpoint records
-	ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
-	if err := p.pgClient.DeleteCheckpoint(ctx, p.processId); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := p.pgClient.DeleteDeltaCheckpointByProcessIdAndFilepaths(ctx, p.processId, normalFilepaths); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to delete checkpoint records during shutdown: %v\n", err)
 	}
 	cancel()
@@ -236,11 +262,6 @@ func (p *BulkProcessor) checkImportError() error {
 
 // Insert inserts data into the processor
 func (p *BulkProcessor) Insert(data interface{}) error {
-	// Check for import errors first
-	if err := p.checkImportError(); err != nil {
-		return errors.Wrap(err, "previous import operation failed")
-	}
-
 	p.mutex.RLock()
 	if p.isShutdown {
 		p.mutex.RUnlock()
@@ -293,33 +314,6 @@ func (p *BulkProcessor) Insert(data interface{}) error {
 		p.fields = fields
 	}
 
-	// Prepare current file
-	currentFile := p.fileManager.GetCurrentFile()
-	if currentFile == nil || currentFile.State != FileStateOpen {
-		p.mutex.Lock()
-		defer p.mutex.Unlock()
-
-		currentFile = p.fileManager.GetCurrentFile()
-		if currentFile == nil || currentFile.State != FileStateOpen {
-			// Create a new file
-			columnNames := GetColumnNames(p.fields)
-			var err error
-			currentFile, err = p.fileManager.CreateFile(columnNames)
-			if err != nil {
-				return err
-			}
-			p.fileManager.SetCurrentFile(currentFile)
-
-			// Update checkpoint with new file
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-
-			if err := p.pgClient.UpdateCheckpointFile(ctx, p.processId, currentFile.ToCheckpointInfo()); err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to update checkpoint with new file: %v\n", err)
-			}
-		}
-	}
-
 	// To track error records in this batch
 	errorRecordsCount := 0
 
@@ -344,127 +338,178 @@ func (p *BulkProcessor) Insert(data interface{}) error {
 			return err
 		}
 
-		// Write record to file
-		err = currentFile.WriteRecord(values)
-		if err != nil {
-			if p.checkErrorCount(err, &errorRecordsCount, i, "writing") {
-				continue // Skip this record and continue
-			}
-
-			// Either too many errors or couldn't get error count
-			return err
+		if p.feedFieldIndex < 0 {
+			p.feedFieldIndex = GetColumnIndex(p.fields, p.config.FeedbackColumn)
 		}
 
-		// Check if file is full
-		if currentFile.IsFull(p.config.BatchSize) {
-			p.mutex.Lock()
-			defer p.mutex.Unlock()
-
-			currentFile = p.fileManager.GetCurrentFile()
-			if !currentFile.IsFull(p.config.BatchSize) {
-				// already been proccessed by other thread
-				continue
-			}
-
-			// Flush and close the file
-			if err := currentFile.Flush(); err != nil {
-				return err
-			}
-
-			// Close the file to finalize the S3 upload
-			if err := currentFile.Close(); err != nil {
-				return err
-			}
-
-			// Set S3 URL
-			currentFile.S3URL = p.s3Client.GetS3URL(currentFile.S3Key)
-
-			// Update file state to frozen
-			p.fileManager.UpdateFileState(currentFile.ID, FileStateFrozen)
-
-			// Update checkpoint with frozen file
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			fileInfo := currentFile.ToCheckpointInfo()
-			if err := p.pgClient.UpdateCheckpointFile(ctx, p.processId, fileInfo); err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to update checkpoint with frozen file: %v\n", err)
-			}
-			cancel()
-
-			// Queue file for import
-			p.fileQueue <- currentFile.ID
-
-			// Create a new file
-			columnNames := GetColumnNames(p.fields)
-			currentFile, err = p.fileManager.CreateFile(columnNames)
-			if err != nil {
-				return err
-			}
-			p.fileManager.SetCurrentFile(currentFile)
-
-			// Update checkpoint with new file
-			ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
-			if err := p.pgClient.UpdateCheckpointFile(ctx, p.processId, currentFile.ToCheckpointInfo()); err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to update checkpoint with new file: %v\n", err)
-			}
-			cancel()
-		}
-	}
-
-	// If we had error records in this batch, update the checkpoint
-	if errorRecordsCount > 0 {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if err := p.pgClient.UpdateCheckpointErrorRecords(ctx, p.processId, errorRecordsCount); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to update checkpoint error records count: %v\n", err)
-		}
-		cancel()
-	}
-
-	// Update last insert time
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := p.pgClient.UpdateCheckpointLastInsert(ctx, p.processId); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to update checkpoint last insert time: %v\n", err)
+		p.recordsQueue <- values
+		atomic.AddInt32(&p.recordsNum, 1)
 	}
 
 	return nil
 }
 
+// consume records from the recordsQueue and process them
+func (p *BulkProcessor) InsertThread() error {
+	defer p.importerWg.Done()
+
+	for {
+		select {
+		case <-p.ctx.Done():
+			log.Println("Insert thread context canceled, exiting...")
+			return nil
+		case values := <-p.recordsQueue:
+			if p.feedFieldIndex >= 0 {
+				index := p.feedFieldIndex
+				p.feedbackKeysMutex.Lock()
+				// Check if feedback column value already exists in the map
+				if _, exists := p.feedbackKeys[values[index]]; !exists {
+					// Add the feedback column value to the map
+					p.feedbackKeys[values[index]] = true
+				} else {
+					// If it already exists, we can skip adding it again
+					log.Printf("Feedback key already exists: %s", values[index])
+				}
+				p.feedbackKeysMutex.Unlock()
+			}
+
+			p.fileManager.fileOperationsMutex.Lock()
+
+			currentFile := p.fileManager.GetCurrentFile()
+			if currentFile == nil || currentFile.State != FileStateOpen {
+				log.Printf("InsertThread Current file is nil or not open, creating a new file")
+				// Create a new file
+				columnNames := GetColumnNames(p.fields)
+				var err error
+				currentFile, err = p.fileManager.CreateFile(columnNames)
+				if err != nil {
+					feedbackKeysArray := p.getFeedbackValues()
+					if p.config.ImportErrorCallback != nil {
+						p.config.ImportErrorCallback(p.config.FeedbackColumn, feedbackKeysArray, err, p.config.CallbackResource)
+					} else {
+						feedbackKeysString := fmt.Sprintf("failed %s is [%s].", p.config.FeedbackColumn, strings.Join(feedbackKeysArray, ","))
+						log.Printf("Batch import failed with no callback: %s", feedbackKeysString)
+					}
+					p.fileManager.fileOperationsMutex.Unlock()
+					continue
+				}
+				p.fileManager.SetCurrentFile(currentFile)
+				log.Printf("InsertThread Current file created: %s", currentFile.S3Key)
+
+				// Update checkpoint with new file
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+
+				pgTable := fmt.Sprintf("%s.%s", p.config.PostgreSQL.Schema, p.config.PostgreSQL.Table)
+
+				if err := p.pgClient.InsertDeltaCheckpoint(ctx, p.processId, pgTable, currentFile.S3Key); err != nil {
+					fmt.Fprintf(os.Stderr, "Failed to insert delta checkpoint with new file: %v\n", err)
+				}
+			}
+			//log.Printf("InsertThread Current file state: %v, num records: %d", currentFile.State, currentFile.NumRecords)
+			// Write record to file
+			err := currentFile.WriteRecord(values)
+			if err != nil {
+				feedbackKeysArray := p.getFeedbackValues()
+				if p.config.ImportErrorCallback != nil {
+					p.config.ImportErrorCallback(p.config.FeedbackColumn, feedbackKeysArray, err, p.config.CallbackResource)
+				} else {
+					feedbackKeysString := fmt.Sprintf("failed %s is [%s].", p.config.FeedbackColumn, strings.Join(feedbackKeysArray, ","))
+					log.Printf("Batch import failed with no callback: %s", feedbackKeysString)
+				}
+				p.fileManager.fileOperationsMutex.Unlock()
+				continue
+			}
+
+			// Check if file is full
+			if currentFile.IsFull(p.config.BatchSize) {
+				// Flush and close the file
+				if err := currentFile.Flush(); err != nil {
+					feedbackKeysArray := p.getFeedbackValues()
+					if p.config.ImportErrorCallback != nil {
+						p.config.ImportErrorCallback(p.config.FeedbackColumn, feedbackKeysArray, err, p.config.CallbackResource)
+					} else {
+						feedbackKeysString := fmt.Sprintf("failed %s is [%s].", p.config.FeedbackColumn, strings.Join(feedbackKeysArray, ","))
+						log.Printf("Batch import failed with no callback: %s", feedbackKeysString)
+					}
+					p.fileManager.fileOperationsMutex.Unlock()
+					continue
+				}
+
+				// Close the file to finalize the S3 upload
+				if err := currentFile.Close(); err != nil {
+					feedbackKeysArray := p.getFeedbackValues()
+					if p.config.ImportErrorCallback != nil {
+						p.config.ImportErrorCallback(p.config.FeedbackColumn, feedbackKeysArray, err, p.config.CallbackResource)
+					} else {
+						feedbackKeysString := fmt.Sprintf("failed %s is [%s].", p.config.FeedbackColumn, strings.Join(feedbackKeysArray, ","))
+						log.Printf("Batch import failed with no callback: %s", feedbackKeysString)
+					}
+					p.fileManager.fileOperationsMutex.Unlock()
+					continue
+				}
+
+				p.fileManager.fileOperationsMutex.Unlock()
+
+				// Set S3 URL
+				currentFile.S3URL = p.s3Client.GetS3URL(currentFile.S3Key)
+
+				// Update file state to frozen
+				p.fileManager.UpdateFileState(currentFile.ID, FileStateFrozen)
+				
+				if err := p.AddFileToPendingBatchFiles(currentFile); err != nil {
+					feedbackKeysArray := p.getFeedbackValues()
+					if p.config.ImportErrorCallback != nil {
+						p.config.ImportErrorCallback(p.config.FeedbackColumn, feedbackKeysArray, err, p.config.CallbackResource)
+					} else {
+						feedbackKeysString := fmt.Sprintf("failed %s is [%s].", p.config.FeedbackColumn, strings.Join(feedbackKeysArray, ","))
+						log.Printf("Batch import failed with no callback: %s", feedbackKeysString)
+					}
+					p.fileManager.fileOperationsMutex.Unlock()
+					continue
+				}
+			} else {
+				p.fileManager.fileOperationsMutex.Unlock()
+			}
+			atomic.AddInt32(&p.recordsNum, -1)
+		}
+	}
+}
+
 // Flush flushes all pending data and waits for import to complete
 func (p *BulkProcessor) Flush() error {
-	// Check for import errors first
-	if err := p.checkImportError(); err != nil {
-		return errors.Wrap(err, "previous import operation failed")
-	}
-
 	p.mutex.Lock()
 	if p.isShutdown {
 		p.mutex.Unlock()
 		return ErrProcessorClosed
 	}
-
-	if p.isFlushing {
-		p.mutex.Unlock()
-		return errors.New("already flushing")
-	}
-
-	p.isFlushing = true
 	p.mutex.Unlock()
 
-	defer func() {
-		p.mutex.Lock()
-		p.isFlushing = false
-		p.mutex.Unlock()
-	}()
+	p.flushMutex.Lock()
+	defer p.flushMutex.Unlock()
 
+	// check recordsNum
+	for {
+		if atomic.LoadInt32(&p.recordsNum) == 0 {
+			break
+		}
+		log.Printf("Flush wait for recordsNum to be 0, current recordsNum: %d", atomic.LoadInt32(&p.recordsNum))
+		time.Sleep(time.Duration(1) * time.Second)
+	}
+
+	p.fileManager.fileOperationsMutex.Lock()
 	// Flush current file if it has records
 	currentFile := p.fileManager.GetCurrentFile()
 	if currentFile != nil && currentFile.State == FileStateOpen && currentFile.NumRecords > 0 {
+		log.Printf("Flushing current file: %s", currentFile.S3Key)
 		if err := currentFile.Flush(); err != nil {
+			p.fileManager.fileOperationsMutex.Unlock()
 			return err
 		}
 
 		// Close the file to finalize the S3 upload
 		if err := currentFile.Close(); err != nil {
+			p.fileManager.fileOperationsMutex.Unlock()
 			return err
 		}
 
@@ -474,27 +519,38 @@ func (p *BulkProcessor) Flush() error {
 		// Update file state to frozen
 		p.fileManager.UpdateFileState(currentFile.ID, FileStateFrozen)
 
-		// Queue file for import
-		p.fileQueue <- currentFile.ID
+		if err := p.AddFileToPendingBatchFiles(currentFile); err != nil {
+			p.fileManager.fileOperationsMutex.Unlock()
+			return err
+		}
+	}
+	p.fileManager.fileOperationsMutex.Unlock()
+
+	batchDir := ""
+	sendDirectory := false
+
+	// flush all pendingBatchFiles
+	p.pendingBatchMutex.Lock()
+	for dir, count := range p.pendingBatchFiles {
+		if count > 0 {
+			sendDirectory = true
+			log.Printf("Queuing batch directory for import: %s with %d files", dir, count)
+			batchDir = dir
+			p.batchQueue <- dir
+		}
+		delete(p.pendingBatchFiles, dir)
+	}
+	p.lastFlushTime = time.Now()
+	p.pendingBatchMutex.Unlock()
+
+	// if no directory send to import, return ASAP
+	if sendDirectory == false {
+		log.Printf("flush without any directory")
+		return nil
 	}
 
 	// Wait for all files to be imported or an error to occur
 	for {
-		// Check for import errors
-		if err := p.checkImportError(); err != nil {
-			return err
-		}
-
-		// flush all pendingBatchFiles
-		p.pendingBatchMutex.Lock()
-		for batchDir, count := range p.pendingBatchFiles {
-			if count > 0 {
-				p.batchQueue <- batchDir
-			}
-			delete(p.pendingBatchFiles, batchDir)
-		}
-		p.pendingBatchMutex.Unlock()
-
 		// Check for context cancellation
 		select {
 		case <-p.ctx.Done():
@@ -512,14 +568,26 @@ func (p *BulkProcessor) Flush() error {
 			// Not canceled
 		}
 
-		// Check if all files are imported
-		frozenFiles := p.fileManager.GetFilesByState(FileStateFrozen)
-		importingFiles := p.fileManager.GetFilesByState(FileStateImporting)
-		errorFiles := p.fileManager.GetFilesByState(FileStateError)
+		// Check if all files are imported under the given directory
+		frozenFiles := p.fileManager.GetFilesByStateAndDirectory(FileStateFrozen, batchDir)
+		importingFiles := p.fileManager.GetFilesByStateAndDirectory(FileStateImporting, batchDir)
+		errorFiles := p.fileManager.GetFilesByStateAndDirectory(FileStateError, batchDir)
 
 		// If we have error files but no error from channel, check if context was canceled
 		if len(errorFiles) > 0 {
-			return errors.New("import failed, found error files but no error reported")
+			// check import error 
+			// sleep at least 100ms because there are two updates to checkpoint 
+			// between setError and send importErrorChan
+			sleepTime := p.config.FlushSleepTime
+			if sleepTime <= 1000 {
+				sleepTime = 1000 
+			}
+			time.Sleep(time.Duration(sleepTime) * time.Millisecond)
+			if err := p.checkImportError(); err != nil {
+				return errors.Wrap(err, "import failed with error: ")
+			} else {
+				return errors.New("import failed, found error files but no error reported")
+			}
 		}
 
 		// If no files are pending, we're done
@@ -533,15 +601,17 @@ func (p *BulkProcessor) Flush() error {
 }
 
 // importerThread processes files from the queue
-func (p *BulkProcessor) importerThread() {
+func (p *BulkProcessor) ImporterThread() {
 	defer p.importerWg.Done()
 
 	for {
 		select {
 		case <-p.ctx.Done():
+			log.Println("Importer thread context canceled, exiting...")
 			return
 
 		case batchDir := <-p.batchQueue:
+			log.Printf("Geting batch directory for import: %s", batchDir)
 			// Process a whole batch directory
 			if batchDir == "" {
 				continue
@@ -553,102 +623,97 @@ func (p *BulkProcessor) importerThread() {
 				continue
 			}
 
+			feedbackKeysArray := p.getFeedbackValues()
+
 			// Update state of all files to importing
 			for _, file := range files {
 				// Skip if not in frozen state
 				if file.State != FileStateFrozen {
 					continue
 				}
-
 				// Update state to importing
 				p.fileManager.UpdateFileState(file.ID, FileStateImporting)
-
-				// Update checkpoint with importing file
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				if err := p.pgClient.UpdateCheckpointFile(ctx, p.processId, file.ToCheckpointInfo()); err != nil {
-					fmt.Fprintf(os.Stderr, "Failed to update checkpoint for importing file: %v\n", err)
-				}
-				cancel()
 			}
 
 			// Import the entire batch directory
-			err := p.importBatchDirectory(batchDir)
-			if err != nil {
-				// Mark all files as error
-				for _, file := range files {
-					file.SetError(fmt.Sprintf("failed to load batch: %v", err))
+			isFailed := false
+			maxLoopNum := p.config.ImportTimeout / p.config.ImportErrorSleepTime
+			for i := 0; i < maxLoopNum; i++ {
+				err := p.importBatchDirectory(batchDir)
+				if err != nil {
+					var filepaths []string
+					for _, file := range files {
+						filepaths = append(filepaths, file.S3Key)
+					}
 
-					// Update checkpoint with error file
+					// Update checkpoint with all error file
 					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-					if err2 := p.pgClient.UpdateCheckpointFile(ctx, p.processId, file.ToCheckpointInfo()); err2 != nil {
+					if err2 := p.pgClient.UpdateDeltaCheckpointStatus(ctx, p.processId, filepaths, CheckpointStatusFailed, -1, err.Error()); err2 != nil {
 						fmt.Fprintf(os.Stderr, "Failed to update checkpoint for error file: %v\n", err2)
 					}
 					cancel()
+
+					// all the errors without parsing error are not expected, we will retry, parsing error just call 
+					// the callback and continue to next batch
+					if !strings.Contains(err.Error(), "Bad literal") && !strings.Contains(err.Error(), "Dimensions") {
+						time.Sleep(time.Duration(p.config.ImportErrorSleepTime) * time.Second)
+						continue
+					}
+
+					// Mark all files as error
+					for _, file := range files {
+						file.SetError(fmt.Sprintf("failed to load batch: %v", err))
+					}
+
+					feedbackKeysString := fmt.Sprintf("failed %s is [%s].", p.config.FeedbackColumn, strings.Join(feedbackKeysArray, ","))
+
+					// Send error to import error channel and ensure it's received
+					p.importErrorChan <- errors.Wrap(err, feedbackKeysString)
+
+					if p.config.ImportErrorCallback != nil {
+						log.Printf("Batch import failed before callback: %s", feedbackKeysString)
+						p.config.ImportErrorCallback(p.config.FeedbackColumn, feedbackKeysArray, err, p.config.CallbackResource)
+					} else {
+						log.Printf("Batch import failed with no callback: %s", feedbackKeysString)
+					}
+
+					// continue to next batch, it is more reasonable to continue processing if upper-level
+					// does not exit in the callback.
+					isFailed = true
+					break
+				} else {
+					isFailed = false
+					break
 				}
+			}
 
-				// Update checkpoint status to failed
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				errMsg := fmt.Sprintf("Batch import failed: %v", err)
-				if err3 := p.pgClient.UpdateCheckpointStatus(ctx, p.processId, CheckpointStatusFailed, errMsg); err3 != nil {
-					fmt.Fprintf(os.Stderr, "Failed to update checkpoint status to failed: %v\n", err3)
-				}
-				cancel()
-
-				// Send error to import error channel and ensure it's received
-				p.importErrorChan <- err
-
-				// Cancel context to signal other operations to stop
-				p.cancel()
-
-				// Exit the importer thread after an error
-				return
+			//超时未成功导入，还需要调用失败的回调。
+			if isFailed {
+				continue
 			}
 
 			// Update all files to imported state
+			var filepaths []string
 			for _, file := range files {
 				// Update state to imported and record import time
 				file.ImportedAt = time.Now()
-				p.fileManager.UpdateFileState(file.ID, FileStateImported)
+				log.Printf("File imported: %s", file.S3Key)
 
-				// Update checkpoint with imported file
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				if err := p.pgClient.UpdateCheckpointFile(ctx, p.processId, file.ToCheckpointInfo()); err != nil {
-					fmt.Fprintf(os.Stderr, "Failed to update checkpoint for imported file: %v\n", err)
-				}
-				cancel()
+				p.fileManager.UpdateFileState(file.ID, FileStateImported)
 
 				// Cleanup file
 				if err := file.CleanupFile(); err != nil {
 					fmt.Fprintf(os.Stderr, "Failed to cleanup file: %v\n", err)
 				}
+				filepaths = append(filepaths, file.S3Key)
 			}
 
-		case fileID := <-p.fileQueue:
-			file := p.fileManager.GetFile(fileID)
-			if file == nil {
-				continue
+			// Update checkpoint with all imported file
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := p.pgClient.UpdateDeltaCheckpointStatus(ctx, p.processId, filepaths, CheckpointStatusCompleted, 0, ""); err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to update checkpoint for imported file: %v\n", err)
 			}
-
-			// Skip if not in frozen state
-			if file.State != FileStateFrozen {
-				continue
-			}
-
-			batchDir := file.BatchDir
-
-			// Add to pending batch files
-			p.pendingBatchMutex.Lock()
-			p.pendingBatchFiles[batchDir]++
-			pendingCount := p.pendingBatchFiles[batchDir]
-
-			// If we have collected all files for this batch, queue the batch for import
-			if pendingCount >= p.config.BatchImportSize {
-				delete(p.pendingBatchFiles, batchDir) // Clear the counter
-
-				// Queue the batch for import
-				p.batchQueue <- batchDir
-			}
-			p.pendingBatchMutex.Unlock()
+			cancel()
 		}
 	}
 }
@@ -668,34 +733,134 @@ func (p *BulkProcessor) importBatchDirectory(batchDir string) error {
 	// Generate a unique table name for the external table
 	externalTableName := fmt.Sprintf("ext_%s_%s",
 		strings.ReplaceAll(p.config.PostgreSQL.Table, ".", "_"),
-		strings.ReplaceAll(uuid.New().String(), "-", ""))
+		batchDir)
 
 	// Get column names from fields
 	columnNames := GetColumnNames(p.fields)
 
 	// Get fresh S3 config from database for the import
-	s3Config, err := p.pgClient.GetS3ConfigFromDB(ctx)
+	s3Config, err := p.pgClient.GetLoadConfigFromDB(ctx, &p.config)
 	if err != nil {
-		return errors.Wrap(err, "failed to get S3 configuration from database for batch import")
+		return errors.Wrap(err, "failed to get loader configuration from database for batch import")
 	}
 	// Create external table with column names (types will be taken from target table)
 	// Note: Using directory URL instead of single file URL
+    // Drop external table, becuase we have a retry mechanism in the import process
+	err = p.pgClient.DropExternalTable(ctx, externalTableName)
+	if err != nil {
+		return err
+	}
+
 	err = p.pgClient.CreateExternalTable(ctx, dirURL, externalTableName, columnNames, *s3Config)
 	if err != nil {
-		return errors.Wrap(err, "failed to create external table for batch import")
+		return err
 	}
 
 	// Import data from external table
 	err = p.pgClient.ImportFromExternalTable(ctx, externalTableName, columnNames, p.config.UpdateOnConflict)
 	if err != nil {
-		return errors.Wrap(err, "failed to load data from external table for batch import")
+		return err
 	}
 
 	// Drop external table
 	err = p.pgClient.DropExternalTable(ctx, externalTableName)
 	if err != nil {
-		return errors.Wrap(err, "failed to drop external table for batch import")
+		return err
 	}
 
+	return nil
+}
+
+func (p *BulkProcessor) AutoFlushThread() {
+	defer p.importerWg.Done()
+
+	for {
+		select {
+		case <-p.ctx.Done():
+			log.Println("AutoFlush thread context canceled, exiting...")
+			return
+		default:
+			// Not canceled
+		}
+		fileTimeoutDuration := time.Duration(p.config.FileWriteTimeout) * time.Second
+		log.Printf("AutoFlush thread checking autoflush, last flush time: %v, timeout: %v", p.lastFlushTime, fileTimeoutDuration)
+		if time.Since(p.lastFlushTime) >= fileTimeoutDuration {
+			log.Printf("AutoFlush thread doing flush")
+			p.Flush()
+		} else {
+			timeSleep := fileTimeoutDuration - time.Since(p.lastFlushTime)
+			log.Printf("AutoFlush thread waiting for autoflush, sleep %v seconds", timeSleep)
+			time.Sleep(time.Duration(timeSleep))
+		}
+	}
+}
+
+func (p *BulkProcessor) GCThread() {
+	defer p.importerWg.Done()
+
+	for {
+		select {
+		case <-p.ctx.Done():
+			log.Println("GC thread context canceled, exiting...")
+			return
+		default:
+			// Not canceled
+		}
+		
+		importedFilepaths := p.fileManager.RecycleFiles()
+		if len(importedFilepaths) > 0 {
+			log.Printf("GC thread recycling files: %v", importedFilepaths)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := p.pgClient.DeleteDeltaCheckpointByProcessIdAndFilepaths(ctx, p.processId, importedFilepaths); err != nil {
+				log.Printf("Failed to delete delta checkpoint for recycled file: %v\n", err)
+			}
+			cancel()
+		}
+		time.Sleep(time.Duration(p.config.GCInterval) * time.Second);
+	}
+}
+
+func (p *BulkProcessor) getFeedbackValues() []string {
+	// scan the feedbackKeys map to get all the column values
+	// concate the column values with a comma and send it to the import error channel
+	var feedbackKeysArray []string
+	p.feedbackKeysMutex.Lock()
+	for key := range p.feedbackKeys {
+		feedbackKeysArray = append(feedbackKeysArray, key)
+	}
+
+	// clear the feedbackKeys map
+	p.feedbackKeys = make(map[string]bool)
+	p.feedbackKeysMutex.Unlock()
+	
+	return feedbackKeysArray
+}
+
+// add file to pendingBatchFiles
+func (p *BulkProcessor) AddFileToPendingBatchFiles(file *File) error {
+	// Skip if not in frozen state
+	if file.State != FileStateFrozen {
+		return errors.New("file is not in frozen state")
+	}
+
+	batchDir := file.BatchDir
+
+	// Add to pending batch files
+	p.pendingBatchMutex.Lock()
+	p.pendingBatchFiles[batchDir]++
+	pendingCount := p.pendingBatchFiles[batchDir]
+
+	log.Printf("File %s added to pending batch directory %s, current count: %d", file.S3Key, batchDir, pendingCount)
+
+	// If we have collected all files for this batch, queue the batch for import
+	if pendingCount >= p.config.BatchImportSize {
+		delete(p.pendingBatchFiles, batchDir) // Clear the counter
+		log.Printf("Queuing batch directory for import: %s with %d files", batchDir, pendingCount)
+		// Queue the batch for import
+		p.batchQueue <- batchDir
+		p.lastFlushTime = time.Now()
+	}
+
+	p.pendingBatchMutex.Unlock()
 	return nil
 }
