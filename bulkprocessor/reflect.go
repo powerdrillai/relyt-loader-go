@@ -34,8 +34,8 @@ func GetStructFields(structType reflect.Type) ([]FieldInfo, error) {
 			continue
 		}
 
-		// Get JSON tag
-		jsonTag := field.Tag.Get("json")
+		// Get tag
+		jsonTag := field.Tag.Get("relyt")
 		if jsonTag == "" || jsonTag == "-" {
 			continue
 		}

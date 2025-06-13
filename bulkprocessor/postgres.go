@@ -12,6 +12,11 @@ import (
 	"github.com/pkg/errors"
 )
 
+const (
+	routingTableSuffix = "_relyt_routing"
+	auxTableSuffix     = "_relyt_massive"
+)
+
 // PostgreSQLClient handles interactions with PostgreSQL
 type PostgreSQLClient struct {
 	pool   *pgxpool.Pool
@@ -236,6 +241,43 @@ func (c *PostgreSQLClient) GetLoadConfigFromDB(ctx context.Context, config *Conf
 	return &s3Config, nil
 }
 
+func (c *PostgreSQLClient) HasRoutingTable(ctx context.Context, routingTableName string) (bool, error) {
+	sqlStatement := fmt.Sprintf(`SELECT COUNT(*) FROM pg_tables WHERE tablename = '%s' and schemaname = 'relyt_sys'`, routingTableName)
+
+	var count int64
+	err := c.pool.QueryRow(ctx, sqlStatement).Scan(&count)
+	if err != nil {
+		return false, errors.Wrap(err, "failed to check if routing table exists")
+	}
+
+	return count > 0, nil
+}
+
+func (c *PostgreSQLClient) RefreshRoutingTable(ctx context.Context, routingTableName string, routingField string) (map[string]struct{}, error) {
+	sqlStatement := fmt.Sprintf(`SELECT %s FROM relyt_sys.%s`, routingField, routingTableName)
+
+	rows, err := c.pool.Query(ctx, sqlStatement)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to query routing table")
+	}
+	defer rows.Close()
+
+	routingMap := make(map[string]struct{})
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, errors.Wrap(err, "failed to scan routing table row")
+		}
+		routingMap[id] = struct{}{}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, errors.Wrap(err, "error iterating routing table rows")
+	}
+
+	return routingMap, nil
+}
+
 // ConvertDBConfigToS3Config is no longer needed and removed
 
 // CreateExternalTable creates an S3 external table in PostgreSQL
@@ -328,11 +370,17 @@ func (c *PostgreSQLClient) GetTablePrimaryKeys(ctx context.Context) ([]string, e
 }
 
 // ImportFromExternalTable imports data from external table to target table
-func (c *PostgreSQLClient) ImportFromExternalTable(ctx context.Context, externalTableName string, columns []string, updateOnConflict bool) error {
+func (c *PostgreSQLClient) ImportFromExternalTable(ctx context.Context, externalTableName string, columns []string, updateOnConflict bool, isAuxFile bool) error {
 	// Get primary key columns to handle conflicts
 	pkColumns, err := c.GetTablePrimaryKeys(ctx)
 	if err != nil {
 		return errors.Wrap(err, "failed to get primary key columns")
+	}
+
+	// Get target table name
+	targetTable := c.config.Table
+	if isAuxFile {
+		targetTable = fmt.Sprintf("%s%s", c.config.Table, auxTableSuffix)
 	}
 
 	// Import data from external table to target table
@@ -380,7 +428,7 @@ func (c *PostgreSQLClient) ImportFromExternalTable(ctx context.Context, external
 				sqlStatement = fmt.Sprintf(`INSERT INTO %s.%s (%s)
 				SELECT %s %s FROM %s.%s %s
 				ON CONFLICT (%s) DO UPDATE SET %s`,
-					c.config.Schema, c.config.Table, columnsList,
+					c.config.Schema, targetTable, columnsList,
 					distinctOnClause, columnsList, c.config.Schema, externalTableName, whereClauseForSelect,
 					conflictColumns, updateSet)
 			} else {
@@ -388,7 +436,7 @@ func (c *PostgreSQLClient) ImportFromExternalTable(ctx context.Context, external
 				sqlStatement = fmt.Sprintf(`INSERT INTO %s.%s (%s)
 				SELECT %s %s FROM %s.%s %s
 				ON CONFLICT (%s) DO NOTHING`,
-					c.config.Schema, c.config.Table, columnsList,
+					c.config.Schema, targetTable, columnsList,
 					distinctOnClause, columnsList, c.config.Schema, externalTableName, whereClauseForSelect,
 					conflictColumns)
 			}
@@ -397,19 +445,18 @@ func (c *PostgreSQLClient) ImportFromExternalTable(ctx context.Context, external
 			sqlStatement = fmt.Sprintf(`INSERT INTO %s.%s (%s)
 			SELECT %s %s FROM %s.%s %s
 			ON CONFLICT (%s) DO NOTHING`,
-				c.config.Schema, c.config.Table, columnsList,
+				c.config.Schema, targetTable, columnsList,
 				distinctOnClause, columnsList, c.config.Schema, externalTableName, whereClauseForSelect,
 				conflictColumns)
 		}
 	} else {
 		// No primary key, use standard INSERT with GROUP BY to avoid duplicates
 		// In this case, we use GROUP BY all columns to eliminate exact duplicates
+		// ERROR: could not identify an equality operator for type vecf16
 		sqlStatement = fmt.Sprintf(`INSERT INTO %s.%s (%s)
-		SELECT %s FROM %s.%s
-		GROUP BY %s`,
-			c.config.Schema, c.config.Table, columnsList,
-			columnsList, c.config.Schema, externalTableName,
-			columnsList)
+		SELECT %s FROM %s.%s`,
+			c.config.Schema, targetTable, columnsList,
+			columnsList, c.config.Schema, externalTableName)
 	}
 
 	_, err = c.pool.Exec(ctx, sqlStatement)
@@ -561,9 +608,9 @@ func (c *PostgreSQLClient) InsertDeltaCheckpoint(ctx context.Context, processId 
 // Update delta checkpoint record
 func (c *PostgreSQLClient) UpdateDeltaCheckpointStatus(ctx context.Context, processId string, filePaths []string, status CheckpointStatus, errorRecords int, errorMessage string) error {
 	var placeholders []string
-    for i := range filePaths {
-        placeholders = append(placeholders, fmt.Sprintf("$%d", i+6)) // $6, $7, ...
-    }
+	for i := range filePaths {
+		placeholders = append(placeholders, fmt.Sprintf("$%d", i+6)) // $6, $7, ...
+	}
 
 	sqlStatement := fmt.Sprintf(`
 	UPDATE relyt_sys.relyt_loader_delta_checkpoint
@@ -592,11 +639,15 @@ func (c *PostgreSQLClient) UpdateDeltaCheckpointStatus(ctx context.Context, proc
 
 // Delete delta checkpoint record
 func (c *PostgreSQLClient) DeleteDeltaCheckpointByProcessIdAndFilepaths(ctx context.Context, processId string, filePaths []string) error {
-	
+
+	if len(filePaths) == 0 {
+		return nil
+	}
+
 	var placeholders []string
-    for i := range filePaths {
-        placeholders = append(placeholders, fmt.Sprintf("$%d", i+2)) // $2, $3, ...
-    }
+	for i := range filePaths {
+		placeholders = append(placeholders, fmt.Sprintf("$%d", i+2)) // $2, $3, ...
+	}
 
 	sqlStatement := fmt.Sprintf(`
 	DELETE FROM relyt_sys.relyt_loader_delta_checkpoint
@@ -605,10 +656,10 @@ func (c *PostgreSQLClient) DeleteDeltaCheckpointByProcessIdAndFilepaths(ctx cont
 
 	args := make([]interface{}, len(filePaths)+1)
 	args[0] = processId
-    for i, filePath := range filePaths {
-        args[i+1] = filePath
-    }
-	
+	for i, filePath := range filePaths {
+		args[i+1] = filePath
+	}
+
 	_, err := c.pool.Exec(ctx, sqlStatement, args...)
 	if err != nil {
 		return errors.Wrap(err, "failed to delete delta checkpoint")
@@ -632,3 +683,35 @@ func (c *PostgreSQLClient) DeleteDeltaCheckpointByProcessId(ctx context.Context,
 	return nil
 }
 
+// CreateRoutingTableTrigger creates a trigger to notify changes in routing table
+func (c *PostgreSQLClient) CreateRoutingTableTrigger(ctx context.Context, routingTable string) error {
+	// Create trigger function
+	createTriggerFunc :=
+		`CREATE OR REPLACE FUNCTION relyt_sys.notify_routing_table_change()
+		 RETURNS trigger AS $$
+		 BEGIN
+		 	PERFORM pg_notify('routing_table_changes', 'routing table changed');
+		 	RETURN NEW;
+		 END;
+		 $$ LANGUAGE plpgsql;`
+
+	// Create trigger
+	createTrigger := fmt.Sprintf(`
+	DROP TRIGGER IF EXISTS routing_table_change_trigger ON relyt_sys.%s;
+	CREATE TRIGGER routing_table_change_trigger
+	AFTER INSERT OR UPDATE OR DELETE ON relyt_sys.%s
+	FOR EACH ROW EXECUTE FUNCTION relyt_sys.notify_routing_table_change();
+	`, routingTable, routingTable)
+
+	// Execute create trigger function
+	if _, err := c.pool.Exec(ctx, createTriggerFunc); err != nil {
+		return errors.Wrap(err, "failed to create trigger function")
+	}
+
+	// Execute create trigger
+	if _, err := c.pool.Exec(ctx, createTrigger); err != nil {
+		return errors.Wrap(err, "failed to create trigger")
+	}
+
+	return nil
+}

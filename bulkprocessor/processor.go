@@ -30,28 +30,33 @@ type BulkProcessor struct {
 	ctx               context.Context
 	cancel            context.CancelFunc
 	isStarted         bool
-	flushMutex       sync.RWMutex
+	flushMutex        sync.RWMutex
 	isShutdown        bool
 	importErrorChan   chan error
 	fileQueue         chan string    // Queue of file IDs to be imported
 	batchQueue        chan string    // Queue of batch directories to be imported
+	routingQueue      chan bool      // channel to notify the routing table is updated
 	pendingBatchFiles map[string]int // Map of batch directory to count of pending files
 	pendingBatchMutex sync.RWMutex
 
-	recordsQueue      chan []string // Channel to write records, support one processor used by multiple goroutines
-	recordsNum        int32 // Number of records in the recordsQueue
+	recordsQueue chan []string // Channel to write records, support one processor used by multiple goroutines
+	recordsNum   int32         // Number of records in the recordsQueue
 	// this hashmap used to store the column value, return the values to the upper layer
 	// when import failed.
 	// init: new processor, initialize the map.
-	// write: for every insert record, write the specific column value into the map if 
+	// write: for every insert record, write the specific column value into the map if
 	// the value does not existed in the map.
 	// read: when import failed, scan the map to get all the column values.
 	// clear: finish the import, clear the map.
-	feedbackKeys      map[string]bool
-	feedbackKeysMutex sync.RWMutex
+	feedbackKeys        map[string]bool
+	feedbackKeysMutex   sync.RWMutex
 	ImportErrorCallback ImportErrorHandler // Callback function to handle import errors
-	feedFieldIndex    int
-	lastFlushTime     time.Time
+	feedFieldIndex      int
+	lastFlushTime       time.Time
+	hasRoutingTable     bool
+	routingColIndex     int
+	routingMutex        sync.RWMutex
+	routingHashSet      map[string]struct{}
 }
 
 // New creates a new BulkProcessor instance
@@ -105,6 +110,23 @@ func New(config Config) (*BulkProcessor, error) {
 		return nil, errors.Wrap(err, "failed to initialize checkpoint")
 	}
 
+	routingTableName := fmt.Sprintf("%s%s", config.PostgreSQL.Table, routingTableSuffix)
+	hasRoutingTable, err := pgClient.HasRoutingTable(ctx, routingTableName)
+	if err != nil {
+		pgClient.Close()
+		return nil, errors.Wrap(err, "failed to check if routing table exists")
+	}
+
+	// Initialize routing table for this process
+	routingHashSet := make(map[string]struct{})
+	if hasRoutingTable {
+		routingHashSet, err = pgClient.RefreshRoutingTable(ctx, routingTableName, config.RoutingColumn)
+		if err != nil {
+			pgClient.Close()
+			return nil, errors.Wrap(err, "failed to initialize routing table")
+		}
+	}
+
 	ctx, cancel = context.WithCancel(context.Background())
 
 	return &BulkProcessor{
@@ -117,18 +139,30 @@ func New(config Config) (*BulkProcessor, error) {
 		cancel:            cancel,
 		importErrorChan:   make(chan error, 100),   // Buffer for import errors
 		fileQueue:         make(chan string, 1000), // Buffer for file queue
-		batchQueue:        make(chan string, 1000),  // Buffer for batch queue
+		batchQueue:        make(chan string, 1000), // Buffer for batch queue
+		routingQueue:      make(chan bool, 10),     // Buffer for routing table updated
 		pendingBatchFiles: make(map[string]int),    // Tracks files pending in each batch
 		feedbackKeys:      make(map[string]bool),   // Tracks error keys for failed imports
 		recordsQueue:      make(chan []string, 10000),
 		feedFieldIndex:    -1,
 		lastFlushTime:     time.Now(),
+		hasRoutingTable:   hasRoutingTable,
+		routingColIndex:   -1,
+		routingHashSet:    routingHashSet,
 	}, nil
 }
 
 // GetProcessId returns the unique processor ID
 func (p *BulkProcessor) GetProcessId() string {
 	return p.processId
+}
+
+func (p *BulkProcessor) GetRoutingTableName() string {
+	return fmt.Sprintf("%s%s", p.config.PostgreSQL.Table, routingTableSuffix)
+}
+
+func (p *BulkProcessor) GetAuxTableName() string {
+	return fmt.Sprintf("%s%s", p.config.PostgreSQL.Table, auxTableSuffix)
 }
 
 // Start starts the importer thread
@@ -141,6 +175,11 @@ func (p *BulkProcessor) Start() error {
 	}
 
 	p.isStarted = true
+
+	if p.hasRoutingTable {
+		p.importerWg.Add(1)
+		go p.ListenThread()
+	}
 
 	p.importerWg.Add(1)
 	go p.InsertThread()
@@ -342,6 +381,10 @@ func (p *BulkProcessor) Insert(data interface{}) error {
 			p.feedFieldIndex = GetColumnIndex(p.fields, p.config.FeedbackColumn)
 		}
 
+		if p.routingColIndex < 0 && p.config.RoutingColumn != "" {
+			p.routingColIndex = GetColumnIndex(p.fields, p.config.RoutingColumn)
+		}
+
 		p.recordsQueue <- values
 		atomic.AddInt32(&p.recordsNum, 1)
 	}
@@ -353,11 +396,17 @@ func (p *BulkProcessor) Insert(data interface{}) error {
 func (p *BulkProcessor) InsertThread() error {
 	defer p.importerWg.Done()
 
+	var localRoutingHashSet map[string]struct{}
+
 	for {
 		select {
 		case <-p.ctx.Done():
 			log.Println("Insert thread context canceled, exiting...")
 			return nil
+		case <-p.routingQueue:
+			p.routingMutex.Lock()
+			localRoutingHashSet = p.routingHashSet
+			p.routingMutex.Unlock()
 		case values := <-p.recordsQueue:
 			if p.feedFieldIndex >= 0 {
 				index := p.feedFieldIndex
@@ -373,15 +422,22 @@ func (p *BulkProcessor) InsertThread() error {
 				p.feedbackKeysMutex.Unlock()
 			}
 
+			toAuxFile := false
+			if p.routingColIndex >= 0 {
+				if _, exists := localRoutingHashSet[values[p.routingColIndex]]; exists {
+					toAuxFile = true
+				}
+			}
+
 			p.fileManager.fileOperationsMutex.Lock()
 
-			currentFile := p.fileManager.GetCurrentFile()
+			currentFile := p.fileManager.GetCurrentFile(toAuxFile)
 			if currentFile == nil || currentFile.State != FileStateOpen {
-				log.Printf("InsertThread Current file is nil or not open, creating a new file")
+				log.Printf("InsertThread Current file is nil or not open, creating a new file, toAuxFile: %v", toAuxFile)
 				// Create a new file
 				columnNames := GetColumnNames(p.fields)
 				var err error
-				currentFile, err = p.fileManager.CreateFile(columnNames)
+				currentFile, err = p.fileManager.CreateFile(columnNames, toAuxFile)
 				if err != nil {
 					feedbackKeysArray := p.getFeedbackValues()
 					if p.config.ImportErrorCallback != nil {
@@ -393,14 +449,18 @@ func (p *BulkProcessor) InsertThread() error {
 					p.fileManager.fileOperationsMutex.Unlock()
 					continue
 				}
-				p.fileManager.SetCurrentFile(currentFile)
+				p.fileManager.SetCurrentFile(currentFile, toAuxFile)
 				log.Printf("InsertThread Current file created: %s", currentFile.S3Key)
 
 				// Update checkpoint with new file
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
 
-				pgTable := fmt.Sprintf("%s.%s", p.config.PostgreSQL.Schema, p.config.PostgreSQL.Table)
+				targetTable := p.config.PostgreSQL.Table
+				if toAuxFile {
+					targetTable = p.GetAuxTableName()
+				}
+				pgTable := fmt.Sprintf("%s.%s", p.config.PostgreSQL.Schema, targetTable)
 
 				if err := p.pgClient.InsertDeltaCheckpoint(ctx, p.processId, pgTable, currentFile.S3Key); err != nil {
 					fmt.Fprintf(os.Stderr, "Failed to insert delta checkpoint with new file: %v\n", err)
@@ -456,7 +516,7 @@ func (p *BulkProcessor) InsertThread() error {
 
 				// Update file state to frozen
 				p.fileManager.UpdateFileState(currentFile.ID, FileStateFrozen)
-				
+
 				if err := p.AddFileToPendingBatchFiles(currentFile); err != nil {
 					feedbackKeysArray := p.getFeedbackValues()
 					if p.config.ImportErrorCallback != nil {
@@ -498,30 +558,32 @@ func (p *BulkProcessor) Flush() error {
 	}
 
 	p.fileManager.fileOperationsMutex.Lock()
-	// Flush current file if it has records
-	currentFile := p.fileManager.GetCurrentFile()
-	if currentFile != nil && currentFile.State == FileStateOpen && currentFile.NumRecords > 0 {
-		log.Printf("Flushing current file: %s", currentFile.S3Key)
-		if err := currentFile.Flush(); err != nil {
-			p.fileManager.fileOperationsMutex.Unlock()
-			return err
-		}
+	for _, isAux := range []bool{false, true} {
+		// Flush current file if it has records
+		currentFile := p.fileManager.GetCurrentFile(isAux)
+		if currentFile != nil && currentFile.State == FileStateOpen && currentFile.NumRecords > 0 {
+			log.Printf("Flushing current file: %s", currentFile.S3Key)
+			if err := currentFile.Flush(); err != nil {
+				p.fileManager.fileOperationsMutex.Unlock()
+				return err
+			}
 
-		// Close the file to finalize the S3 upload
-		if err := currentFile.Close(); err != nil {
-			p.fileManager.fileOperationsMutex.Unlock()
-			return err
-		}
+			// Close the file to finalize the S3 upload
+			if err := currentFile.Close(); err != nil {
+				p.fileManager.fileOperationsMutex.Unlock()
+				return err
+			}
 
-		// Set S3 URL
-		currentFile.S3URL = p.s3Client.GetS3URL(currentFile.S3Key)
+			// Set S3 URL
+			currentFile.S3URL = p.s3Client.GetS3URL(currentFile.S3Key)
 
-		// Update file state to frozen
-		p.fileManager.UpdateFileState(currentFile.ID, FileStateFrozen)
+			// Update file state to frozen
+			p.fileManager.UpdateFileState(currentFile.ID, FileStateFrozen)
 
-		if err := p.AddFileToPendingBatchFiles(currentFile); err != nil {
-			p.fileManager.fileOperationsMutex.Unlock()
-			return err
+			if err := p.AddFileToPendingBatchFiles(currentFile); err != nil {
+				p.fileManager.fileOperationsMutex.Unlock()
+				return err
+			}
 		}
 	}
 	p.fileManager.fileOperationsMutex.Unlock()
@@ -544,7 +606,7 @@ func (p *BulkProcessor) Flush() error {
 	p.pendingBatchMutex.Unlock()
 
 	// if no directory send to import, return ASAP
-	if sendDirectory == false {
+	if !sendDirectory {
 		log.Printf("flush without any directory")
 		return nil
 	}
@@ -575,12 +637,12 @@ func (p *BulkProcessor) Flush() error {
 
 		// If we have error files but no error from channel, check if context was canceled
 		if len(errorFiles) > 0 {
-			// check import error 
-			// sleep at least 100ms because there are two updates to checkpoint 
+			// check import error
+			// sleep at least 100ms because there are two updates to checkpoint
 			// between setError and send importErrorChan
 			sleepTime := p.config.FlushSleepTime
 			if sleepTime <= 1000 {
-				sleepTime = 1000 
+				sleepTime = 1000
 			}
 			time.Sleep(time.Duration(sleepTime) * time.Millisecond)
 			if err := p.checkImportError(); err != nil {
@@ -635,11 +697,13 @@ func (p *BulkProcessor) ImporterThread() {
 				p.fileManager.UpdateFileState(file.ID, FileStateImporting)
 			}
 
+			isAuxFile := strings.Contains(batchDir, BatchPrefixAux)
 			// Import the entire batch directory
-			isFailed := false
+			isFailed := true
 			maxLoopNum := p.config.ImportTimeout / p.config.ImportErrorSleepTime
+			err := errors.New("import batch directory timeout")
 			for i := 0; i < maxLoopNum; i++ {
-				err := p.importBatchDirectory(batchDir)
+				err = p.importBatchDirectory(batchDir, isAuxFile)
 				if err != nil {
 					var filepaths []string
 					for _, file := range files {
@@ -653,7 +717,7 @@ func (p *BulkProcessor) ImporterThread() {
 					}
 					cancel()
 
-					// all the errors without parsing error are not expected, we will retry, parsing error just call 
+					// all the errors without parsing error are not expected, we will retry, parsing error just call
 					// the callback and continue to next batch
 					if !strings.Contains(err.Error(), "Bad literal") && !strings.Contains(err.Error(), "Dimensions") {
 						time.Sleep(time.Duration(p.config.ImportErrorSleepTime) * time.Second)
@@ -687,8 +751,8 @@ func (p *BulkProcessor) ImporterThread() {
 				}
 			}
 
-			//超时未成功导入，还需要调用失败的回调。
 			if isFailed {
+				p.config.ImportErrorCallback(p.config.FeedbackColumn, feedbackKeysArray, err, p.config.CallbackResource)
 				continue
 			}
 
@@ -719,7 +783,7 @@ func (p *BulkProcessor) ImporterThread() {
 }
 
 // importBatchDirectory imports all files in a batch directory with a single operation
-func (p *BulkProcessor) importBatchDirectory(batchDir string) error {
+func (p *BulkProcessor) importBatchDirectory(batchDir string, isAuxFile bool) error {
 	ctx, cancel := context.WithTimeout(p.ctx, 60*time.Minute) // Longer timeout for batch imports
 	defer cancel()
 
@@ -745,7 +809,7 @@ func (p *BulkProcessor) importBatchDirectory(batchDir string) error {
 	}
 	// Create external table with column names (types will be taken from target table)
 	// Note: Using directory URL instead of single file URL
-    // Drop external table, becuase we have a retry mechanism in the import process
+	// Drop external table, becuase we have a retry mechanism in the import process
 	err = p.pgClient.DropExternalTable(ctx, externalTableName)
 	if err != nil {
 		return err
@@ -757,7 +821,7 @@ func (p *BulkProcessor) importBatchDirectory(batchDir string) error {
 	}
 
 	// Import data from external table
-	err = p.pgClient.ImportFromExternalTable(ctx, externalTableName, columnNames, p.config.UpdateOnConflict)
+	err = p.pgClient.ImportFromExternalTable(ctx, externalTableName, columnNames, p.config.UpdateOnConflict, isAuxFile)
 	if err != nil {
 		return err
 	}
@@ -806,7 +870,7 @@ func (p *BulkProcessor) GCThread() {
 		default:
 			// Not canceled
 		}
-		
+
 		importedFilepaths := p.fileManager.RecycleFiles()
 		if len(importedFilepaths) > 0 {
 			log.Printf("GC thread recycling files: %v", importedFilepaths)
@@ -816,7 +880,7 @@ func (p *BulkProcessor) GCThread() {
 			}
 			cancel()
 		}
-		time.Sleep(time.Duration(p.config.GCInterval) * time.Second);
+		time.Sleep(time.Duration(p.config.GCInterval) * time.Second)
 	}
 }
 
@@ -832,7 +896,7 @@ func (p *BulkProcessor) getFeedbackValues() []string {
 	// clear the feedbackKeys map
 	p.feedbackKeys = make(map[string]bool)
 	p.feedbackKeysMutex.Unlock()
-	
+
 	return feedbackKeysArray
 }
 
@@ -863,4 +927,82 @@ func (p *BulkProcessor) AddFileToPendingBatchFiles(file *File) error {
 
 	p.pendingBatchMutex.Unlock()
 	return nil
+}
+
+func (p *BulkProcessor) ListenThread() {
+	defer p.importerWg.Done()
+
+	// Create trigger
+	if err := p.pgClient.CreateRoutingTableTrigger(p.ctx, p.GetRoutingTableName()); err != nil {
+		log.Printf("Failed to create trigger: %v", err)
+		return
+	}
+
+	for {
+		select {
+		case <-p.ctx.Done():
+			log.Println("Listener thread context canceled, exiting...")
+			return
+		default:
+			conn, err := p.pgClient.pool.Acquire(p.ctx)
+			if err != nil {
+				log.Printf("Error acquiring connection: %v", err)
+				time.Sleep(5 * time.Second)
+				continue
+			}
+
+			// Start listening for notifications
+			_, err = conn.Exec(p.ctx, "LISTEN routing_table_changes")
+			if err != nil {
+				conn.Release()
+				log.Printf("Error listening to routing table changes: %v", err)
+				time.Sleep(5 * time.Second)
+				continue
+			}
+
+			// Continuously listen for notifications
+			for {
+				select {
+				case <-p.ctx.Done():
+					conn.Release()
+					log.Println("Listener thread context canceled, exiting...")
+					return
+				default:
+					// Wait for notification
+					_, err := conn.Conn().WaitForNotification(p.ctx)
+					if err != nil {
+						if err == context.Canceled {
+							conn.Release()
+							log.Println("Listener thread context canceled, exiting...")
+							return
+						}
+						// Connection error, release current connection and break inner loop to reconnect
+						log.Printf("Listener Connection error, will reconnect: %v", err)
+						time.Sleep(1 * time.Second)
+						conn.Release()
+						goto reconnect // 使用goto跳转到外层循环的开始
+					}
+
+					// Get updated routing table data after receiving notification
+					newRoutingHashSet, err := p.pgClient.RefreshRoutingTable(p.ctx, p.GetRoutingTableName(), p.config.RoutingColumn)
+					if err != nil {
+						log.Printf("Error getting updated routing table: %v", err)
+						continue
+					}
+
+					// Update routing table using callback function
+					p.routingMutex.Lock()
+					oldsize := len(p.routingHashSet)
+					newsize := len(newRoutingHashSet)
+					p.routingHashSet = newRoutingHashSet
+					p.routingMutex.Unlock()
+					p.routingQueue <- true
+					log.Printf("Routing table updated, old size is: %d, new size is: %d, and exec force flush", oldsize, newsize)
+					p.Flush()
+				}
+			}
+		}
+	reconnect:
+		continue
+	}
 }
