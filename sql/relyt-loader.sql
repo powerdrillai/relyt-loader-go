@@ -89,3 +89,11 @@ CREATE TABLE IF NOT EXISTS relyt_sys.relyt_loader_delta_checkpoint (
     PRIMARY KEY (process_id, filepath)
 ) using heap;
 GRANT SELECT,INSERT ON relyt_sys.relyt_loader_delta_checkpoint TO public;
+
+-- create a table to store the routing table
+--
+-- CREATE TABLE IF NOT EXISTS relyt_sys.XXXX_routing (
+--     group_id bigint PRIMARY KEY,
+--     store_table_name TEXT NOT NULL
+-- ) USING heap DISTRIBUTED NONE;
+-- GRANT SELECT,INSERT ON relyt_sys.XXXX_routing TO public;

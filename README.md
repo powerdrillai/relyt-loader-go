@@ -219,4 +219,52 @@ The default value for `MaxErrorRecords` is 0, which means no errors are tolerate
 - PostgreSQL must have access to the S3 storage
 - The `relyt_sys.LOADER_CONFIG()` function must be created in your database
 - The `relyt_sys.relyt_loader_checkpoint` table must be created in your database
-- Structs must use `json:"column_name"` tags to specify column names
+- Structs must use `relyt:"column_name"` tags to specify column names
+
+## Magrate data from main table to aux table
+
+### requirements
+
+**create aux table and routing table**
+1. aux table with suffix **_relyt_massive**
+2. routing table with suffix **_relyt_routing** and **DISTRIBUTED NONE**
+
+```sql
+-- create a aux table to store the data, must have the same columns as the main table
+-- example:
+-- main table:
+CREATE TABLE IF NOT EXISTS public.table_name (
+    id INT PRIMARY KEY,
+    group_id INT NOT NULL,
+    ext text,
+    vector vecf16(3) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE
+);
+-- aux table: must with suffix _relyt_massive
+CREATE TABLE IF NOT EXISTS public.table_name_relyt_massive (
+    id INT PRIMARY KEY,
+    group_id INT NOT NULL,
+    ext text,
+    vector vecf16(3) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE
+);
+-- routing table: must with suffix _relyt_routing, and DISTRIBUTED NONE
+CREATE TABLE IF NOT EXISTS relyt_sys.table_name_relyt_routing (
+    group_id INT PRIMARY KEY,
+    store_table_name TEXT NOT NULL
+) USING heap DISTRIBUTED NONE;
+```
+
+### usage, set routing column and table name
+```go
+config.RoutingColumn = "group_id"
+config.PostgreSQL.Table = "test_routing_data"
+```
+data will be inserted into `test_routing_data` or `test_routing_data_relyt_massive` according to the routing table.
+
+### migrate data
+routing table will be auto updated when data is inserted into the aux table.
+```bash
+python3 migrate/migrate_data.py --tables public.table_name --threshold 100
+```
+

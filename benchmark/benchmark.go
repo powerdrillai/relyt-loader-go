@@ -1,33 +1,34 @@
 package main
 
 import (
+	"encoding/csv"
 	"fmt"
+	"io"
 	"log"
 	"os"
-	"strings"
-	"encoding/csv"
-	"io"
 	"strconv"
+	"strings"
 	"sync"
 
 	"database/sql"
+
 	_ "github.com/lib/pq" // PostgreSQL driver
 	"github.com/powerdrillai/relyt-loader-go/bulkprocessor"
 )
 
 type TestData struct {
-	ID     int    `json:"id"`
-	Ext    string `json:"ext"`
-	Vector string `json:"vector"`
+	ID     int    `relyt:"id"`
+	Ext    string `relyt:"ext"`
+	Vector string `relyt:"vector"`
 }
 
 // 定义一个结构体，包含数据库连接信息
 type DatabaseConfig struct {
-    Host     string
-    Port     int
-    Username string
-    Password string
-    Database string
+	Host     string
+	Port     int
+	Username string
+	Password string
+	Database string
 }
 
 // define a struct to hold error handler resources
@@ -37,7 +38,7 @@ type ErrorHandlerResources struct {
 }
 
 func WriteErrorsToFiles(fieldname string, values []string, err error, resources interface{}) {
-    res := resources.(*ErrorHandlerResources)
+	res := resources.(*ErrorHandlerResources)
 	feedbackKeysString := fmt.Sprintf("failed %s is [%s] with error: %v.", fieldname, strings.Join(values, ","), err)
 	res.LogFile.WriteString("Error: " + feedbackKeysString + "\n")
 	log.Printf("Error: %s", feedbackKeysString)
@@ -45,15 +46,15 @@ func WriteErrorsToFiles(fieldname string, values []string, err error, resources 
 
 func NewProcessor(dbconfig DatabaseConfig, fileTimeout int) *bulkprocessor.BulkProcessor {
 	// open a error.log
-    logFile, err := os.OpenFile("/tmp/error.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-    if err != nil {
-        log.Fatalf("Failed to open log file: %v", err)
-    }
+	logFile, err := os.OpenFile("/tmp/error.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		log.Fatalf("Failed to open log file: %v", err)
+	}
 
-    // 创建用户定义的资源结构体
-    resources := &ErrorHandlerResources{
-        LogFile: logFile,
-    }
+	// 创建用户定义的资源结构体
+	resources := &ErrorHandlerResources{
+		LogFile: logFile,
+	}
 
 	// initialize config
 	config := bulkprocessor.Config{
@@ -67,12 +68,12 @@ func NewProcessor(dbconfig DatabaseConfig, fileTimeout int) *bulkprocessor.BulkP
 			Table:    "relyt_bulk_insert_benchmark",
 			Schema:   "public",
 		},
-		BatchSize:       100000, // number of records per file
-		BatchImportSize: 3,
+		BatchSize:           100000, // number of records per file
+		BatchImportSize:     3,
 		FeedbackColumn:      "id", // column name for error messages
 		ImportErrorCallback: WriteErrorsToFiles,
-		CallbackResource: resources,
-		FileWriteTimeout: fileTimeout, // set file write timeout
+		CallbackResource:    resources,
+		FileWriteTimeout:    fileTimeout, // set file write timeout
 	}
 
 	// create processor
@@ -160,7 +161,6 @@ func GetCountFromTestDataTable(db *sql.DB) (int, error) {
 }
 
 func InsertData(db *sql.DB, processor *bulkprocessor.BulkProcessor, filePath string, batchSize int, wg *sync.WaitGroup) error {
-	wg.Add(1)
 	defer wg.Done()
 
 	var tests []TestData
@@ -175,7 +175,6 @@ func InsertData(db *sql.DB, processor *bulkprocessor.BulkProcessor, filePath str
 	csvReader.FieldsPerRecord = -1
 	csvReader.Comma = '\t'
 	csvReader.ReuseRecord = true
-
 
 	i := 0
 	for {
@@ -205,7 +204,7 @@ func InsertData(db *sql.DB, processor *bulkprocessor.BulkProcessor, filePath str
 		i++
 
 		// insert batch
-		if i % batchSize == 0 {
+		if i%batchSize == 0 {
 			err := processor.Insert(tests)
 			if err != nil {
 				log.Fatalf("failed to insert data: %v", err)
@@ -258,10 +257,11 @@ func main() {
 	batchSize := 10000
 	for i := 0; i < 10; i++ {
 		filePath = fmt.Sprintf("./benchmark_test_a%c", 'a'+i)
+		writeWg.Add(1)
 		go InsertData(db, processor, filePath, batchSize, &writeWg)
 	}
 	writeWg.Wait()
-	
+
 	processor.Flush()
 	processor.Shutdown()
 }
