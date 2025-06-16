@@ -19,7 +19,7 @@ TOTAL_LINES=10000000
 SPLIT_LINE=1000000
 
 # 定义分割后的文件名前缀
-SPLIT_PREFIX="bench_test"
+SPLIT_PREFIX="benchmark_test"
 
 # 使用 awk 生成数据
 awk -v total_lines="$TOTAL_LINES" -v initial_value="$INITIAL_VALUE" -v increment="$INCREMENT" -v vector_length="$VECTOR_LENGTH" '

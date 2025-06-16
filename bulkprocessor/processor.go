@@ -121,6 +121,7 @@ func New(config Config) (*BulkProcessor, error) {
 	routingHashSet := make(map[string]struct{})
 	if hasRoutingTable {
 		routingHashSet, err = pgClient.RefreshRoutingTable(ctx, routingTableName, config.RoutingColumn)
+		log.Printf("Init: routingHashSet size: %d", len(routingHashSet))
 		if err != nil {
 			pgClient.Close()
 			return nil, errors.Wrap(err, "failed to initialize routing table")
@@ -396,6 +397,7 @@ func (p *BulkProcessor) Insert(data interface{}) error {
 func (p *BulkProcessor) InsertThread() error {
 	defer p.importerWg.Done()
 
+	var localRoutingInited = false
 	var localRoutingHashSet map[string]struct{}
 
 	for {
@@ -406,6 +408,7 @@ func (p *BulkProcessor) InsertThread() error {
 		case <-p.routingQueue:
 			p.routingMutex.Lock()
 			localRoutingHashSet = p.routingHashSet
+			localRoutingInited = true
 			p.routingMutex.Unlock()
 		case values := <-p.recordsQueue:
 			if p.feedFieldIndex >= 0 {
@@ -424,6 +427,13 @@ func (p *BulkProcessor) InsertThread() error {
 
 			toAuxFile := false
 			if p.routingColIndex >= 0 {
+				if !localRoutingInited {
+					p.routingMutex.Lock()
+					localRoutingHashSet = p.routingHashSet
+					localRoutingInited = true
+					p.routingMutex.Unlock()
+					log.Printf("Init localRoutingHashSet, size is: %d", len(localRoutingHashSet))
+				}
 				if _, exists := localRoutingHashSet[values[p.routingColIndex]]; exists {
 					toAuxFile = true
 				}
@@ -752,7 +762,11 @@ func (p *BulkProcessor) ImporterThread() {
 			}
 
 			if isFailed {
-				p.config.ImportErrorCallback(p.config.FeedbackColumn, feedbackKeysArray, err, p.config.CallbackResource)
+				feedbackKeysString := fmt.Sprintf("failed %s is [%s].", p.config.FeedbackColumn, strings.Join(feedbackKeysArray, ","))
+				log.Printf("Import batch directory timeout: %s", feedbackKeysString)
+				if p.config.ImportErrorCallback != nil {
+					p.config.ImportErrorCallback(p.config.FeedbackColumn, feedbackKeysArray, err, p.config.CallbackResource)
+				}
 				continue
 			}
 
