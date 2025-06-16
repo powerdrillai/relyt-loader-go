@@ -1,9 +1,11 @@
 package bulkprocessor
 
 import (
+	"context"
 	"encoding/csv"
 	"fmt"
 	"io"
+	"log"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -29,6 +31,11 @@ const (
 	FileStateError
 )
 
+const (
+	BatchPrefixNormal = "batch"     // main table batch prefix
+	BatchPrefixAux    = "aux_batch" // aux table batch prefix
+)
+
 // File represents a file being processed
 type File struct {
 	ID          string    // Unique ID for the file
@@ -47,47 +54,64 @@ type File struct {
 	headers     []string // CSV headers
 }
 
+type FileInfo struct {
+	currentFile     *File  // Current file being written to
+	currentBatchDir string // Current batch directory (changes every batchImportSize files)
+	batchCounter    int    // Counter for files in the current batch
+	batchImportSize int    // Number of files per batch (from config)
+}
+
 // FileManager manages files being processed
 type FileManager struct {
-	files           map[string]*File // Map of file ID to file
-	mutex           sync.RWMutex
-	s3Client        *S3Client // S3 client for streaming writes
-	filePrefix      string    // Prefix for file names
-	maxRecords      int       // Maximum number of records per file
-	currentFile     *File     // Current file being written to
-	processId       string    // Unique process ID for distinguishing task files
-	currentBatchDir string    // Current batch directory (changes every batchImportSize files)
-	batchCounter    int       // Counter for files in the current batch
-	batchImportSize int       // Number of files per batch (from config)
+	files       map[string]*File // Map of file ID to file
+	mutex       sync.RWMutex
+	s3Client    *S3Client // S3 client for streaming writes
+	filePrefix  string    // Prefix for file names
+	maxRecords  int       // Maximum number of records per file
+	processId   string    // Unique process ID for distinguishing task files
+	fileInfo    FileInfo  // List of file info
+	auxFileInfo FileInfo  // List of aux file info
+	// Mutex for files operations, different from the file mutex is this mutex
+	// will protect a continuous operations on files.
+	fileOperationsMutex sync.Mutex
 }
 
 // NewFileManager creates a new file manager
 func NewFileManager(s3Client *S3Client, filePrefix string, maxRecords int, processId string, batchImportSize int) (*FileManager, error) {
 	// Create a unique batch directory identifier
-	batchDir := fmt.Sprintf("batch_%s", uuid.New().String()[:8])
+	batchDir := fmt.Sprintf("%s_%s", BatchPrefixNormal, uuid.New().String()[:8])
+	auxBatchDir := fmt.Sprintf("%s_%s", BatchPrefixAux, uuid.New().String()[:8])
 
 	return &FileManager{
-		files:           make(map[string]*File),
-		s3Client:        s3Client,
-		filePrefix:      filePrefix,
-		maxRecords:      maxRecords,
-		processId:       processId,
-		currentBatchDir: batchDir,
-		batchCounter:    0,
-		batchImportSize: batchImportSize,
+		files:       make(map[string]*File),
+		s3Client:    s3Client,
+		filePrefix:  filePrefix,
+		maxRecords:  maxRecords,
+		processId:   processId,
+		fileInfo:    FileInfo{currentFile: nil, currentBatchDir: batchDir, batchCounter: 0, batchImportSize: batchImportSize},
+		auxFileInfo: FileInfo{currentFile: nil, currentBatchDir: auxBatchDir, batchCounter: 0, batchImportSize: batchImportSize},
 	}, nil
 }
 
 // CreateFile creates a new file
-func (m *FileManager) CreateFile(headers []string) (*File, error) {
+func (m *FileManager) CreateFile(headers []string, toAuxFile bool) (*File, error) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
+	currentFileInfo := &m.fileInfo
+	if toAuxFile {
+		currentFileInfo = &m.auxFileInfo
+	}
+
 	// Check if we need to create a new batch directory
-	if m.batchCounter >= m.batchImportSize {
+	if currentFileInfo.batchCounter >= currentFileInfo.batchImportSize {
 		// Create a new batch directory for the next set of files
-		m.currentBatchDir = fmt.Sprintf("batch_%s", uuid.New().String()[:8])
-		m.batchCounter = 0
+		batchPrefix := BatchPrefixNormal
+		if toAuxFile {
+			batchPrefix = BatchPrefixAux
+		}
+		currentFileInfo.currentBatchDir = fmt.Sprintf("%s_%s", batchPrefix, uuid.New().String()[:8])
+		currentFileInfo.batchCounter = 0
 	}
 
 	fileID := uuid.New().String()
@@ -96,7 +120,7 @@ func (m *FileManager) CreateFile(headers []string) (*File, error) {
 	// Include process ID and batch directory in S3 key path
 	datePath := time.Now().Format("2006-01-02")
 
-	s3Key := filepath.Join(datePath, m.processId, m.currentBatchDir, fileName)
+	s3Key := filepath.Join(datePath, m.processId, currentFileInfo.currentBatchDir, fileName)
 
 	// Create S3 streaming writer
 	s3Writer, err := m.s3Client.NewStreamingWriter(s3Key)
@@ -110,7 +134,7 @@ func (m *FileManager) CreateFile(headers []string) (*File, error) {
 	f := &File{
 		ID:         fileID,
 		S3Key:      s3Key,
-		BatchDir:   m.currentBatchDir,
+		BatchDir:   currentFileInfo.currentBatchDir,
 		NumRecords: 0,
 		CreatedAt:  time.Now(),
 		State:      FileStateOpen,
@@ -120,23 +144,30 @@ func (m *FileManager) CreateFile(headers []string) (*File, error) {
 	}
 
 	m.files[fileID] = f
-	m.batchCounter++
+	currentFileInfo.batchCounter++
 
 	return f, nil
 }
 
 // GetCurrentFile returns the current file being written to
-func (m *FileManager) GetCurrentFile() *File {
+func (m *FileManager) GetCurrentFile(aux bool) *File {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
-	return m.currentFile
+	if aux {
+		return m.auxFileInfo.currentFile
+	}
+	return m.fileInfo.currentFile
 }
 
 // SetCurrentFile sets the current file being written to
-func (m *FileManager) SetCurrentFile(file *File) {
+func (m *FileManager) SetCurrentFile(file *File, aux bool) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
-	m.currentFile = file
+	if aux {
+		m.auxFileInfo.currentFile = file
+	} else {
+		m.fileInfo.currentFile = file
+	}
 }
 
 // GetFile returns a file by ID
@@ -169,8 +200,8 @@ func (m *FileManager) GetFilesByState(state FileState) []*File {
 
 // UpdateFileState updates the state of a file
 func (m *FileManager) UpdateFileState(fileID string, state FileState) {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
 
 	if file, ok := m.files[fileID]; ok {
 		file.mutex.Lock()
@@ -185,6 +216,21 @@ func (m *FileManager) UpdateFileState(fileID string, state FileState) {
 			file.ImportedAt = time.Now()
 		}
 	}
+}
+
+// GetFilesByStateAndDirectory returns files by state
+func (m *FileManager) GetFilesByStateAndDirectory(state FileState, directory string) []*File {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+
+	var files []*File
+	for _, file := range m.files {
+		if file.State == state && file.BatchDir == directory {
+			files = append(files, file)
+		}
+	}
+
+	return files
 }
 
 // WriteRecord writes a record to a file
@@ -242,6 +288,11 @@ func (f *File) IsFull(maxRecords int) bool {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
 	return f.NumRecords >= maxRecords
+}
+
+func (f *File) IsTimeout(fileTimeout int) bool {
+	fileTimeoutDuration := time.Duration(fileTimeout) * time.Second
+	return time.Since(f.CreatedAt) >= fileTimeoutDuration
 }
 
 // SetError sets the error state and reason
@@ -313,7 +364,7 @@ func (m *FileManager) GetBatchDirectoryPath() string {
 	defer m.mutex.RUnlock()
 
 	datePath := time.Now().Format("2006-01-02")
-	return filepath.Join(datePath, m.processId, m.currentBatchDir)
+	return filepath.Join(datePath, m.processId, m.fileInfo.currentBatchDir)
 }
 
 // GetFileBatchDirectory returns the batch directory a file belongs to
@@ -357,4 +408,53 @@ func (m *FileManager) IsInSameBatch(file1 *File, file2 *File) bool {
 	}
 
 	return m.GetFileBatchDirectory(file1) == m.GetFileBatchDirectory(file2)
+}
+
+// delete the files that are imported or error from memory and S3, and return the file paths
+// with status imported which are used to delete the delta checkpoint, we want to keep the
+// file paths with status error in the table relyt_loader_delta_checkpoint, after we check the reason
+// of the error, we can delete the file paths from the table relyt_loader_delta_checkpoint manually.
+func (m *FileManager) RecycleFiles() []string {
+	// Create a list of all files that need to be cleaned up from S3
+	allFiles := append(
+		m.GetFilesByState(FileStateImported),
+		m.GetFilesByState(FileStateError)...,
+	)
+
+	// Cleanup files from local filesystem
+	for _, file := range allFiles {
+		if err := file.CleanupFile(); err != nil {
+			log.Printf("Failed to cleanup local file: %v\n", err)
+		}
+	}
+
+	// Cleanup S3 files
+	// First gather all S3 keys that need to be deleted
+	var s3Keys []string
+	var importedFilepaths []string
+	m.mutex.Lock()
+	for _, file := range allFiles {
+		if file.S3Key != "" {
+			// remove the error file from memory, keep the Error file in S3 and relyt_loader_delta_checkpoint
+			// for further check, this files will be deleted from S3 with a expired time
+			// and be deleted from relyt_loader_delta_checkpoint manually.
+			delete(m.files, file.ID)
+			if file.State != FileStateError {
+				importedFilepaths = append(importedFilepaths, file.S3Key)
+				s3Keys = append(s3Keys, file.S3Key)
+			}
+		}
+	}
+	m.mutex.Unlock()
+
+	// Delete files from S3 if there are any
+	if len(s3Keys) > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := m.s3Client.DeleteObjects(ctx, s3Keys); err != nil {
+			log.Printf("Failed to delete S3 objects during shutdown: %v\n", err)
+		}
+		cancel()
+	}
+
+	return importedFilepaths
 }
