@@ -25,10 +25,10 @@ type TestData struct {
 }
 
 type TestDataWithAux struct {
-	ID      int    `relyt:"id"`
-	GroupID int    `relyt:"group_id"`
-	Ext     string `relyt:"ext"`
-	Vector  string `relyt:"vector"`
+	ID        int    `relyt:"id"`
+	RoutingID int    `relyt:"routing_id"`
+	Ext       string `relyt:"ext"`
+	Vector    string `relyt:"vector"`
 }
 
 // 定义一个结构体，包含数据库连接信息
@@ -87,7 +87,6 @@ func NewProcessor(dbconfig DatabaseConfig, fileTimeout int, extinfo string) *Bul
 	}
 
 	if extinfo == "auxtest" {
-		config.RoutingColumn = "group_id"
 		config.PostgreSQL.Table = "test_routing_data"
 	} else if extinfo == "importtimeout" {
 		config.ImportTimeout = 5
@@ -187,18 +186,18 @@ func CreateTestDataTaleWithAux(db *sql.DB) error {
 	query := `
 	CREATE TABLE IF NOT EXISTS test_routing_data (
 		id bigint NOT NULL PRIMARY KEY,
-		group_id bigint NOT NULL,
+		routing_id bigint NOT NULL,
 		ext text,
 		vector vecf16(3) NOT NULL
 	);
-	CREATE TABLE IF NOT EXISTS test_routing_data_relyt_massive (
+	CREATE TABLE IF NOT EXISTS test_routing_data_relyt_massive_group (
 		id bigint NOT NULL PRIMARY KEY,
-		group_id bigint NOT NULL,
+		routing_id bigint NOT NULL,
 		ext text,
 		vector vecf16(3) NOT NULL
 	);
 	CREATE TABLE IF NOT EXISTS relyt_sys.test_routing_data_relyt_routing (
-		group_id bigint PRIMARY KEY,
+		routing_id text PRIMARY KEY,
 		store_table_name TEXT NOT NULL
 	) USING heap DISTRIBUTED NONE;
 	`
@@ -216,7 +215,7 @@ func TruncateTestDataTableWithAux(db *sql.DB) error {
 	log.Println("Truncating test tables in PostgreSQL...")
 	query := `
 	TRUNCATE TABLE test_routing_data;
-	TRUNCATE TABLE test_routing_data_relyt_massive;
+	TRUNCATE TABLE test_routing_data_relyt_massive_group;
 	TRUNCATE TABLE relyt_sys.test_routing_data_relyt_routing;
 	`
 	_, err := db.Exec(query)
@@ -228,44 +227,44 @@ func TruncateTestDataTableWithAux(db *sql.DB) error {
 }
 
 // InitTestDataTableWithAux:
-// group_id 100 and 110 each insert 100 records
-// group_id 120, 130, 140 each insert 10 records
+// routing_id 100 and 110 each insert 100 records
+// routing_id 120, 130, 140 each insert 10 records
 func InitTestDataTableWithAux(db *sql.DB) error {
 	log.Println("Initializing test data in PostgreSQL...")
 
 	// insert data to test_routing_data
 	query := `
-	INSERT INTO test_routing_data (id, group_id, ext, vector)
+	INSERT INTO test_routing_data (id, routing_id, ext, vector)
 	VALUES ($1, $2, $3, $4);
 	`
 
 	// create random number generator for vector values
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 
-	// insert 100 records for group_id 100 and 110
+	// insert 100 records for routing_id 100 and 110
 	id := 0
-	for _, groupID := range []int{100, 110} {
+	for _, routingID := range []int{100, 110} {
 		for i := 0; i < 100; i++ {
 			ext := fmt.Sprintf("ext_%d", id)
 			vector := fmt.Sprintf("[%f,%f,%f]", r.Float32(), r.Float32(), r.Float32())
 
-			_, err := db.Exec(query, id, groupID, ext, vector)
+			_, err := db.Exec(query, id, routingID, ext, vector)
 			if err != nil {
-				return fmt.Errorf("failed to insert data for group_id %d: %w", groupID, err)
+				return fmt.Errorf("failed to insert data for routing_id %d: %w", routingID, err)
 			}
 			id++
 		}
 	}
 
-	// insert 10 records for group_id 120, 130, 140
-	for _, groupID := range []int{120, 130, 140} {
+	// insert 10 records for routing_id 120, 130, 140
+	for _, routingID := range []int{120, 130, 140} {
 		for i := 0; i < 10; i++ {
 			ext := fmt.Sprintf("ext_%d", id)
 			vector := fmt.Sprintf("[%f,%f,%f]", r.Float32(), r.Float32(), r.Float32())
 
-			_, err := db.Exec(query, id, groupID, ext, vector)
+			_, err := db.Exec(query, id, routingID, ext, vector)
 			if err != nil {
-				return fmt.Errorf("failed to insert data for group_id %d: %w", groupID, err)
+				return fmt.Errorf("failed to insert data for routing_id %d: %w", routingID, err)
 			}
 			id++
 		}
@@ -280,7 +279,7 @@ func GetCountFromTestDataTableWithAux(db *sql.DB, auxtable bool) (int, error) {
 	log.Println("Counting records in test tables...")
 	table := "test_routing_data"
 	if auxtable {
-		table = "test_routing_data_relyt_massive"
+		table = "test_routing_data_relyt_massive_group"
 	}
 	query := fmt.Sprintf(`SELECT COUNT(*) FROM %s`, table)
 
@@ -878,22 +877,22 @@ func TestInsertWithMigration(t *testing.T) {
 		if err != nil {
 			t.Errorf("failed to parse id: %v", err)
 		}
-		groupID, err := strconv.Atoi(record[1])
+		routingID, err := strconv.Atoi(record[1])
 		if err != nil {
-			t.Errorf("failed to parse group_id: %v", err)
+			t.Errorf("failed to parse routing_id: %v", err)
 		}
 		if len(record) < 4 {
 			t.Errorf("record does not contain enough fields: %v", record)
 		} else {
-			log.Printf("record %d: id=%d, group_id=%d, ext=%s, vector=%s", i, id, groupID, record[2], record[3])
+			log.Printf("record %d: id=%d, routing_id=%d, ext=%s, vector=%s", i, id, routingID, record[2], record[3])
 		}
 		ext := record[2]
 		vector := record[3]
 		tests = append(tests, TestDataWithAux{
-			ID:      id,
-			GroupID: groupID,
-			Ext:     ext,
-			Vector:  vector,
+			ID:        id,
+			RoutingID: routingID,
+			Ext:       ext,
+			Vector:    vector,
 		})
 		i++
 
@@ -927,7 +926,7 @@ func TestInsertWithMigration(t *testing.T) {
 				}
 			}
 
-			// ref test_migration.csv, top 26 records are group_id=100 and group_id=110, here we wait for the data to be migrated.
+			// ref test_migration.csv, top 26 records are routing_id=100 and routing_id=110, here we wait for the data to be migrated.
 			if i == 26 {
 				time.Sleep(time.Duration(fileTimeout) * time.Second)
 				auxCount, err := GetCountFromTestDataTableWithAux(db, true)

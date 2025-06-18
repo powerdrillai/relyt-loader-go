@@ -21,7 +21,7 @@ def parse_args():
     parser.add_argument('--tables', nargs='+', required=True,
                       help='需要检查的表名列表，格式为 schema.table_name')
     parser.add_argument('--threshold', type=int, required=True,
-                      help='迁移阈值, 当group_id对应的记录数超过此值时进行迁移')
+                      help='迁移阈值, 当routing_id对应的记录数超过此值时进行迁移')
     parser.add_argument('--conflict-mode', choices=['update', 'nothing'], default='update',
                       help='冲突处理模式: update-更新已存在的记录, nothing-忽略冲突')
     parser.add_argument('--wait-time', type=int, default=5,
@@ -111,7 +111,7 @@ ORDER BY a.attnum;""")
     return non_primary_key_column_flat
 
 # 从主表读取数据并写入附表,这里需要处理一下主键冲突的场景
-def migrate_data(cursor, table, group_id):
+def migrate_data(cursor, table, routing_id):
     primary_key_columns = get_primary_key(cursor, table)
     conflict_columns = ",".join(map(str, primary_key_columns))
     print(f"migrate_data: conflict_columns is {conflict_columns}")
@@ -122,25 +122,25 @@ def migrate_data(cursor, table, group_id):
         updateSetParts.append(f"{non_primary_key_column} = excluded.{non_primary_key_column}")
 
     updateSet = ",".join(updateSetParts)
-    aux_table = table + "_relyt_massive"
+    aux_table = table + "_relyt_massive_group"
     sql = ""
     if len(conflict_columns) == 0:
-        sql = f"INSERT INTO {aux_table} SELECT * FROM {table} WHERE group_id = {group_id};"
+        sql = f"INSERT INTO {aux_table} SELECT * FROM {table} WHERE routing_id = {routing_id};"
     elif ON_CONFLICT_MODE == 'update':
-        sql = f"INSERT INTO {aux_table} SELECT * FROM {table} WHERE group_id = {group_id} on conflict ({conflict_columns}) do update set {updateSet};"
+        sql = f"INSERT INTO {aux_table} SELECT * FROM {table} WHERE routing_id = {routing_id} on conflict ({conflict_columns}) do update set {updateSet};"
     else:
-        sql = f"INSERT INTO {aux_table} SELECT * FROM {table} WHERE group_id = {group_id} on conflict ({conflict_columns}) do nothing;"
+        sql = f"INSERT INTO {aux_table} SELECT * FROM {table} WHERE routing_id = {routing_id} on conflict ({conflict_columns}) do nothing;"
     print(f"migrate sql is {sql}")
     cursor.execute(sql)
-    print(f"Data migrated from {table} to {aux_table} for group id {group_id}.")
+    print(f"Data migrated from {table} to {aux_table} for group id {routing_id}.")
 
-# 从主表删除指定 group_id 的数据
-def delete_data(cursor, table, group_id):
-    cursor.execute(f"DELETE FROM {table} WHERE group_id = %s;", (group_id,))
-    print(f"Data with group_id {group_id} deleted from {table}.")
+# 从主表删除指定 routing_id 的数据
+def delete_data(cursor, table, routing_id):
+    cursor.execute(f"DELETE FROM {table} WHERE routing_id = %s;", (routing_id,))
+    print(f"Data with routing_id {routing_id} deleted from {table}.")
 
 # 修改 routing 表
-def update_routing_table(table, group_id):
+def update_routing_table(table, routing_id):
     conn = connect_db()
     cursor = conn.cursor()
     if '.' in table:
@@ -148,12 +148,12 @@ def update_routing_table(table, group_id):
         routing_table = "relyt_sys."+ table_name + "_relyt_routing"
     else:
         routing_table = "relyt_sys."+ table + "_relyt_routing"
-    aux_table = table + "_relyt_massive"
-    cursor.execute(f"INSERT INTO {routing_table} (group_id, store_table_name) VALUES (%s, %s) on conflict (group_id) do nothing;", (group_id, aux_table))
+    aux_table = table + "_relyt_massive_group"
+    cursor.execute(f"INSERT INTO {routing_table} (routing_id, store_table_name) VALUES (%s, %s) on conflict (routing_id) do nothing;", (routing_id, aux_table))
     conn.commit()
     cursor.close()
     conn.close()
-    print(f"Routing table updated for group_id {group_id}.")
+    print(f"Routing table updated for routing_id {routing_id}.")
 
 # 等待客户端更新 routing
 def wait_for_client_update():
@@ -172,41 +172,41 @@ def start_autovacuum():
     print("Autovacuum started.")
 
 
-# 从指定的表里面根据筛选group数据大于migrate_records_threshold的group_id
-def get_migrate_group_id(table, group_num_threshold):
+# 从指定的表里面根据筛选group数据大于migrate_records_threshold的routing_id
+def get_migrate_routing_id(table, group_num_threshold):
     conn = connect_db()
     cursor = conn.cursor()
-    cursor.execute(f"SELECT group_id FROM {table} GROUP BY group_id HAVING COUNT(*) >= {group_num_threshold}")
-    group_ids = cursor.fetchall()
+    cursor.execute(f"SELECT routing_id FROM {table} GROUP BY routing_id HAVING COUNT(*) >= {group_num_threshold}")
+    routing_ids = cursor.fetchall()
     cursor.close()
     conn.close()
-    group_ids_flat = tuple(item[0] for item in group_ids)
-    return group_ids_flat
+    routing_ids_flat = tuple(item[0] for item in routing_ids)
+    return routing_ids_flat
 
-def migrate_data_for_group(table, group_id):
+def migrate_data_for_group(table, routing_id):
     try:
         # 1. 开始事务
         conn, cursor = start_transaction()
 
         # 1.1 从主表读取数据并写入附表
-        migrate_data(cursor, table, group_id)
+        migrate_data(cursor, table, routing_id)
 
-        # 1.2 从主表删除指定 group_id 的数据
-        delete_data(cursor, table, group_id)
+        # 1.2 从主表删除指定 routing_id 的数据
+        delete_data(cursor, table, routing_id)
 
         # 1.3 提交事务
         commit_transaction(conn)
 
         # 2. 修改 routing 表
-        update_routing_table(table, group_id)
+        update_routing_table(table, routing_id)
 
         # 3. 等待客户端更新 routing
         wait_for_client_update()
 
         # 4. 重复步骤 1
         conn, cursor = start_transaction()
-        migrate_data(cursor, table, group_id)
-        delete_data(cursor, table, group_id)
+        migrate_data(cursor, table, routing_id)
+        delete_data(cursor, table, routing_id)
         commit_transaction(conn)
 
     except Exception as e:
@@ -216,15 +216,15 @@ def migrate_data_for_group(table, group_id):
 
 # main 函数，检查所有的表，看表当中的group id对应的数据是不是超过1000万条，对于超过1000万条的数据，进行迁移
 def main():
-    # 首先获取那些需要迁移数据的表和对应的groupid，因为前面的这一步很耗时，所以先将这个数据存储在map当中,
+    # 首先获取那些需要迁移数据的表和对应的goutingid，因为前面的这一步很耗时，所以先将这个数据存储在map当中,
     # 然后再进行迁移。
-    table_groupids = {}
+    table_goutingids = {}
     for table in check_tables:
-        group_ids = get_migrate_group_id(table, migrate_group_num_threshold)
-        if group_ids is None or len(group_ids) == 0:
+        routing_ids = get_migrate_routing_id(table, migrate_group_num_threshold)
+        if routing_ids is None or len(routing_ids) == 0:
             continue
-        print(f"get_migrate_group_id: table {table} group ids is {group_ids}")
-        table_groupids[table] = group_ids
+        print(f"get_migrate_routing_id: table {table} group ids is {routing_ids}")
+        table_goutingids[table] = routing_ids
 
     # 统计一下任务的总时间
     start_time = time.time()
@@ -233,10 +233,10 @@ def main():
     stop_autovacuum()
 
     # 2. 然后进行迁移
-    for table, group_ids in table_groupids.items():
-        for group_id in group_ids:
-            print(f"Migrating data for table {table} and group id {group_id}...")
-            migrate_data_for_group(table, group_id)
+    for table, routing_ids in table_goutingids.items():
+        for routing_id in routing_ids:
+            print(f"Migrating data for table {table} and group id {routing_id}...")
+            migrate_data_for_group(table, routing_id)
     
     # 3. 打开autovacuum
     start_autovacuum()
