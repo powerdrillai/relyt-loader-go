@@ -226,7 +226,7 @@ The default value for `MaxErrorRecords` is 0, which means no errors are tolerate
 ### requirements
 
 **create aux table and routing table**
-1. aux table with suffix **_relyt_massive**
+1. aux table with suffix **_relyt_massive_group**
 2. routing table with suffix **_relyt_routing** and **DISTRIBUTED NONE**
 
 ```sql
@@ -235,32 +235,31 @@ The default value for `MaxErrorRecords` is 0, which means no errors are tolerate
 -- main table:
 CREATE TABLE IF NOT EXISTS public.table_name (
     id INT PRIMARY KEY,
-    group_id INT NOT NULL,
+    routing_id INT NOT NULL,
     ext text,
     vector vecf16(3) NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE
 );
--- aux table: must with suffix _relyt_massive
-CREATE TABLE IF NOT EXISTS public.table_name_relyt_massive (
+-- aux table: must with suffix _relyt_massive_group
+CREATE TABLE IF NOT EXISTS public.table_name_relyt_massive_group (
     id INT PRIMARY KEY,
-    group_id INT NOT NULL,
+    routing_id INT NOT NULL,
     ext text,
     vector vecf16(3) NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE
 );
 -- routing table: must with suffix _relyt_routing, and DISTRIBUTED NONE
 CREATE TABLE IF NOT EXISTS relyt_sys.table_name_relyt_routing (
-    group_id INT PRIMARY KEY,
+    routing_id INT PRIMARY KEY,
     store_table_name TEXT NOT NULL
 ) USING heap DISTRIBUTED NONE;
 ```
 
-### usage, set routing column and table name
+### usage, just set table name
 ```go
-config.RoutingColumn = "group_id"
 config.PostgreSQL.Table = "test_routing_data"
 ```
-data will be inserted into `test_routing_data` or `test_routing_data_relyt_massive` according to the routing table.
+data will be inserted into `test_routing_data` or `test_routing_data_relyt_massive_group` according to the routing table.
 
 ### migrate data
 routing table will be auto updated when data is inserted into the aux table.

@@ -120,7 +120,7 @@ func New(config Config) (*BulkProcessor, error) {
 	// Initialize routing table for this process
 	routingHashSet := make(map[string]struct{})
 	if hasRoutingTable {
-		routingHashSet, err = pgClient.RefreshRoutingTable(ctx, routingTableName, config.RoutingColumn)
+		routingHashSet, err = pgClient.RefreshRoutingTable(ctx, routingTableName)
 		log.Printf("Init: routingHashSet size: %d", len(routingHashSet))
 		if err != nil {
 			pgClient.Close()
@@ -160,6 +160,10 @@ func (p *BulkProcessor) GetProcessId() string {
 
 func (p *BulkProcessor) GetRoutingTableName() string {
 	return fmt.Sprintf("%s%s", p.config.PostgreSQL.Table, routingTableSuffix)
+}
+
+func (p *BulkProcessor) GetRoutingChannelName() string {
+	return fmt.Sprintf("%s_channel", p.GetRoutingTableName())
 }
 
 func (p *BulkProcessor) GetAuxTableName() string {
@@ -382,8 +386,8 @@ func (p *BulkProcessor) Insert(data interface{}) error {
 			p.feedFieldIndex = GetColumnIndex(p.fields, p.config.FeedbackColumn)
 		}
 
-		if p.routingColIndex < 0 && p.config.RoutingColumn != "" {
-			p.routingColIndex = GetColumnIndex(p.fields, p.config.RoutingColumn)
+		if p.routingColIndex < 0 {
+			p.routingColIndex = GetColumnIndex(p.fields, "routing_id")
 		}
 
 		p.recordsQueue <- values
@@ -946,8 +950,10 @@ func (p *BulkProcessor) AddFileToPendingBatchFiles(file *File) error {
 func (p *BulkProcessor) ListenThread() {
 	defer p.importerWg.Done()
 
+	listenChannelName := fmt.Sprintf("LISTEN %s", p.GetRoutingChannelName())
+
 	// Create trigger
-	if err := p.pgClient.CreateRoutingTableTrigger(p.ctx, p.GetRoutingTableName()); err != nil {
+	if err := p.pgClient.CreateRoutingTableTrigger(p.ctx, p.GetRoutingTableName(), p.GetRoutingChannelName()); err != nil {
 		log.Printf("Failed to create trigger: %v", err)
 		return
 	}
@@ -966,7 +972,7 @@ func (p *BulkProcessor) ListenThread() {
 			}
 
 			// Start listening for notifications
-			_, err = conn.Exec(p.ctx, "LISTEN routing_table_changes")
+			_, err = conn.Exec(p.ctx, listenChannelName)
 			if err != nil {
 				conn.Release()
 				log.Printf("Error listening to routing table changes: %v", err)
@@ -994,11 +1000,11 @@ func (p *BulkProcessor) ListenThread() {
 						log.Printf("Listener Connection error, will reconnect: %v", err)
 						time.Sleep(1 * time.Second)
 						conn.Release()
-						goto reconnect // 使用goto跳转到外层循环的开始
+						goto reconnect
 					}
 
 					// Get updated routing table data after receiving notification
-					newRoutingHashSet, err := p.pgClient.RefreshRoutingTable(p.ctx, p.GetRoutingTableName(), p.config.RoutingColumn)
+					newRoutingHashSet, err := p.pgClient.RefreshRoutingTable(p.ctx, p.GetRoutingTableName())
 					if err != nil {
 						log.Printf("Error getting updated routing table: %v", err)
 						continue

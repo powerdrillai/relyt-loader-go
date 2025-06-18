@@ -37,11 +37,10 @@ type Config struct {
 	FeedbackColumn       string           // Column name for error messages (default: "") when import failed
 	ImportErrorCallback  ImportErrorHandler
 	CallbackResource     interface{}
-	FileWriteTimeout     int    // a new file opened for a limited time to write, default: 10 seconds
-	GCInterval           int    // GC interval in seconds, default: 60 seconds
-	ImportTimeout        int    // S3 import timeout in seconds
-	ImportErrorSleepTime int    // S3 import error sleep time in seconds
-	RoutingColumn        string // routing column name
+	FileWriteTimeout     int // a new file opened for a limited time to write, default: 10 seconds
+	GCInterval           int // GC interval in seconds, default: 60 seconds
+	ImportTimeout        int // S3 import timeout in seconds
+	ImportErrorSleepTime int // S3 import error sleep time in seconds
 }
 
 // Validate validates the configuration

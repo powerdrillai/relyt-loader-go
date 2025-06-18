@@ -17,10 +17,10 @@ import (
 )
 
 type TestData struct {
-	ID      int    `relyt:"id"`
-	GroupID int    `relyt:"group_id"`
-	Ext     string `relyt:"ext"`
-	Vector  string `relyt:"vector"`
+	ID        int    `relyt:"id"`
+	RoutingID int    `relyt:"routing_id"`
+	Ext       string `relyt:"ext"`
+	Vector    string `relyt:"vector"`
 }
 
 // 定义一个结构体，包含数据库连接信息
@@ -75,7 +75,6 @@ func NewProcessor(dbconfig DatabaseConfig, fileTimeout int) *bulkprocessor.BulkP
 		ImportErrorCallback: WriteErrorsToFiles,
 		CallbackResource:    resources,
 		FileWriteTimeout:    fileTimeout, // set file write timeout
-		RoutingColumn:       "group_id",  // routing column
 	}
 
 	// create processor
@@ -121,20 +120,20 @@ func CreateTestDataTale(db *sql.DB) error {
 	query := `
 	CREATE TABLE IF NOT EXISTS relyt_migrate_insert_benchmark (
 		id bigint NOT NULL PRIMARY KEY,
-		group_id bigint NOT NULL,
+		routing_id bigint NOT NULL,
 		ext text,
 		vector vecf16(3) NOT NULL
 	) using heap;
 
-	CREATE TABLE IF NOT EXISTS relyt_migrate_insert_benchmark_relyt_massive (
+	CREATE TABLE IF NOT EXISTS relyt_migrate_insert_benchmark_relyt_massive_group (
 		id bigint NOT NULL PRIMARY KEY,
-		group_id bigint NOT NULL,
+		routing_id bigint NOT NULL,
 		ext text,
 		vector vecf16(3) NOT NULL
 	) using heap;
 
 	CREATE TABLE IF NOT EXISTS relyt_sys.relyt_migrate_insert_benchmark_relyt_routing (
-		group_id bigint PRIMARY KEY,
+		routing_id text PRIMARY KEY,
 		store_table_name TEXT NOT NULL
 	) USING heap DISTRIBUTED NONE;`
 	_, err := db.Exec(query)
@@ -149,7 +148,7 @@ func TruncateTestDataTable(db *sql.DB) error {
 	log.Println("Truncating tables in PostgreSQL...")
 	query := `
 	TRUNCATE TABLE relyt_migrate_insert_benchmark;
-	TRUNCATE TABLE relyt_migrate_insert_benchmark_relyt_massive;
+	TRUNCATE TABLE relyt_migrate_insert_benchmark_relyt_massive_group;
 	TRUNCATE TABLE relyt_sys.relyt_migrate_insert_benchmark_relyt_routing;`
 	_, err := db.Exec(query)
 	if err != nil {
@@ -162,11 +161,11 @@ func TruncateTestDataTable(db *sql.DB) error {
 func InitRoutingTable(db *sql.DB) error {
 	log.Println("Initializing routing table...")
 	query := `
-	INSERT INTO relyt_sys.relyt_migrate_insert_benchmark_relyt_routing (group_id, store_table_name) 
+	INSERT INTO relyt_sys.relyt_migrate_insert_benchmark_relyt_routing (routing_id, store_table_name) 
 	VALUES 
-		(100, 'relyt_migrate_insert_benchmark_relyt_massive'),
-		(200, 'relyt_migrate_insert_benchmark_relyt_massive'),
-		(300, 'relyt_migrate_insert_benchmark_relyt_massive');`
+		(100, 'relyt_migrate_insert_benchmark_relyt_massive_group'),
+		(200, 'relyt_migrate_insert_benchmark_relyt_massive_group'),
+		(300, 'relyt_migrate_insert_benchmark_relyt_massive_group');`
 	_, err := db.Exec(query)
 	if err != nil {
 		return fmt.Errorf("failed to initialize routing table: %w", err)
@@ -189,15 +188,15 @@ func GetCountFromMainTestDataTable(db *sql.DB) (int, error) {
 }
 
 func GetCountFromAuxTestDataTable(db *sql.DB) (int, error) {
-	// This function retrieves the count of records in the relyt_migrate_insert_benchmark_relyt_massive.
-	log.Println("Counting records in relyt_migrate_insert_benchmark_relyt_massive...")
-	query := `SELECT COUNT(*) FROM relyt_migrate_insert_benchmark_relyt_massive;`
+	// This function retrieves the count of records in the relyt_migrate_insert_benchmark_relyt_massive_group.
+	log.Println("Counting records in relyt_migrate_insert_benchmark_relyt_massive_group...")
+	query := `SELECT COUNT(*) FROM relyt_migrate_insert_benchmark_relyt_massive_group;`
 	var count int
 	err := db.QueryRow(query).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("failed to count records: %w", err)
 	}
-	log.Printf("Counted %d records in relyt_migrate_insert_benchmark_relyt_massive.", count)
+	log.Printf("Counted %d records in relyt_migrate_insert_benchmark_relyt_massive_group.", count)
 	return count, nil
 }
 
@@ -235,19 +234,19 @@ func InsertData(db *sql.DB, processor *bulkprocessor.BulkProcessor, filePath str
 			log.Fatalf("failed to parse id: %v", err)
 		}
 
-		groupID, err := strconv.Atoi(record[1])
+		routingID, err := strconv.Atoi(record[1])
 		if err != nil {
-			log.Fatalf("failed to parse group_id: %v", err)
+			log.Fatalf("failed to parse routing_id: %v", err)
 		}
 
 		ext := record[2]
 		vector := record[3]
 
 		tests = append(tests, TestData{
-			ID:      id,
-			GroupID: groupID,
-			Ext:     ext,
-			Vector:  vector,
+			ID:        id,
+			RoutingID: routingID,
+			Ext:       ext,
+			Vector:    vector,
 		})
 		i++
 

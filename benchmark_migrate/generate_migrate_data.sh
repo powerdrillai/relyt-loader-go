@@ -21,14 +21,14 @@ SPLIT_LINE=1000000
 # 定义分割后的文件名前缀
 SPLIT_PREFIX="benchmark_test"
 
-# 定义group_id配置数组
+# 定义gouting_id配置数组
 declare -A GROUP_LINES=(
     [100]=1000000
     [200]=2000000
     [300]=3000000
 )
 
-# 其他group_id的起始值
+# 其他gouting_id的起始值
 OTHER_GROUP_START=1000
 
 # 使用 awk 生成数据
@@ -45,21 +45,21 @@ BEGIN {
     other_group_count = 0
     
     for (i = 1; i <= total_lines; i++) {
-        # 确定当前行的group_id
+        # 确定当前行的gouting_id
         if (i <= group_100_lines) {
-            group_id = 100
+            routing_id = 100
         } else if (i <= group_100_lines + group_200_lines) {
-            group_id = 200
+            routing_id = 200
         } else if (i <= group_100_lines + group_200_lines + group_300_lines) {
-            group_id = 300
+            routing_id = 300
         } else {
-            # 其他group_id从1000开始递增
-            group_id = other_group_start + int(other_group_count / 1000000)
+            # 其他gouting_id从1000开始递增
+            routing_id = other_group_start + int(other_group_count / 1000000)
             other_group_count++
         }
         
         printf "%d\t", i
-        printf "%d\t", group_id
+        printf "%d\t", routing_id
         printf "ext_%d\t", i
         printf "["
         for (j = 1; j <= vector_length; j++) {

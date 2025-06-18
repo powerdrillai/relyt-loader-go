@@ -14,7 +14,7 @@ import (
 
 const (
 	routingTableSuffix = "_relyt_routing"
-	auxTableSuffix     = "_relyt_massive"
+	auxTableSuffix     = "_relyt_massive_group"
 )
 
 // PostgreSQLClient handles interactions with PostgreSQL
@@ -253,8 +253,8 @@ func (c *PostgreSQLClient) HasRoutingTable(ctx context.Context, routingTableName
 	return count > 0, nil
 }
 
-func (c *PostgreSQLClient) RefreshRoutingTable(ctx context.Context, routingTableName string, routingField string) (map[string]struct{}, error) {
-	sqlStatement := fmt.Sprintf(`SELECT %s FROM relyt_sys.%s`, routingField, routingTableName)
+func (c *PostgreSQLClient) RefreshRoutingTable(ctx context.Context, routingTableName string) (map[string]struct{}, error) {
+	sqlStatement := fmt.Sprintf(`SELECT routing_id FROM relyt_sys.%s`, routingTableName)
 
 	rows, err := c.pool.Query(ctx, sqlStatement)
 	if err != nil {
@@ -684,16 +684,16 @@ func (c *PostgreSQLClient) DeleteDeltaCheckpointByProcessId(ctx context.Context,
 }
 
 // CreateRoutingTableTrigger creates a trigger to notify changes in routing table
-func (c *PostgreSQLClient) CreateRoutingTableTrigger(ctx context.Context, routingTable string) error {
+func (c *PostgreSQLClient) CreateRoutingTableTrigger(ctx context.Context, routingTable string, channelName string) error {
 	// Create trigger function
-	createTriggerFunc :=
+	createTriggerFunc := fmt.Sprintf(
 		`CREATE OR REPLACE FUNCTION relyt_sys.notify_routing_table_change()
 		 RETURNS trigger AS $$
 		 BEGIN
-		 	PERFORM pg_notify('routing_table_changes', 'routing table changed');
+		 	PERFORM pg_notify('%s', 'routing table changed');
 		 	RETURN NEW;
 		 END;
-		 $$ LANGUAGE plpgsql;`
+		 $$ LANGUAGE plpgsql;`, channelName)
 
 	// Create trigger
 	createTrigger := fmt.Sprintf(`
