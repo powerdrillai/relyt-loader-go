@@ -14,6 +14,7 @@ A Go SDK for bulk importing data into PostgreSQL via S3 external tables.
 - **S3 configuration automatically loaded from the database**
 - **Task progress tracking via checkpoint table**
 - **Configurable error tolerance for handling failed records**
+- **Support for data migration between main and auxiliary tables**
 
 ## Usage
 
@@ -45,9 +46,9 @@ defer processor.Shutdown() // Ensure processor is shut down properly
 
 // Insert data
 type MyData struct {
-    ID        int       `json:"id"`        // json tag is used to determine column names
-    Name      string    `json:"name"`
-    CreatedAt time.Time `json:"created_at"`
+    ID        int       `relyt:"id"`        // relyt tag is used to determine column names
+    Name      string    `relyt:"name"`
+    CreatedAt time.Time `relyt:"created_at"`
 }
 
 records := []MyData{
@@ -71,6 +72,22 @@ err = processor.Flush()
 if err != nil {
     log.Fatalf("Failed to flush data: %v", err)
 }
+```
+
+## Testing
+
+The SDK includes comprehensive test cases to verify functionality. You can run the tests using the provided Makefile:
+
+```bash
+# Run all tests
+make test
+
+# Run specific test cases
+make test-errors     # Test error handling
+make test-sleep      # Test intermittent data writing
+make test-recovery   # Test PostgreSQL recovery
+make test-timeout    # Test import timeout
+make test-migration  # Test data migration
 ```
 
 ## S3 Configuration via PostgreSQL
@@ -221,26 +238,27 @@ The default value for `MaxErrorRecords` is 0, which means no errors are tolerate
 - The `relyt_sys.relyt_loader_checkpoint` table must be created in your database
 - Structs must use `relyt:"column_name"` tags to specify column names
 
-## Magrate data from main table to aux table
+## Data Migration
 
-### requirements
+### Requirements
 
-**create aux table and routing table**
-1. aux table with suffix **_relyt_massive_group**
-2. routing table with suffix **_relyt_routing** and **DISTRIBUTED NONE**
+**Create auxiliary table and routing table**
+1. Auxiliary table with suffix **_relyt_massive_group**
+2. Routing table with suffix **_relyt_routing** and **DISTRIBUTED NONE**
 
 ```sql
--- create a aux table to store the data, must have the same columns as the main table
--- example:
--- main table:
+-- Create an auxiliary table to store the data, must have the same columns as the main table
+-- Example:
+-- Main table:
 CREATE TABLE IF NOT EXISTS public.table_name (
     id INT PRIMARY KEY,
-    routing_id INT NOT NULL,
+    group_id INT NOT NULL,
     ext text,
     vector vecf16(3) NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE
 );
--- aux table: must with suffix _relyt_massive_group
+
+-- Auxiliary table: must have suffix _relyt_massive_group
 CREATE TABLE IF NOT EXISTS public.table_name_relyt_massive_group (
     id INT PRIMARY KEY,
     routing_id INT NOT NULL,
@@ -248,22 +266,29 @@ CREATE TABLE IF NOT EXISTS public.table_name_relyt_massive_group (
     vector vecf16(3) NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE
 );
--- routing table: must with suffix _relyt_routing, and DISTRIBUTED NONE
+
+-- Routing table: must have suffix _relyt_routing, and DISTRIBUTED NONE
 CREATE TABLE IF NOT EXISTS relyt_sys.table_name_relyt_routing (
-    routing_id INT PRIMARY KEY,
+    routing_id TEXT PRIMARY KEY,
     store_table_name TEXT NOT NULL
 ) USING heap DISTRIBUTED NONE;
 ```
 
-### usage, just set table name
-```go
-config.PostgreSQL.Table = "test_routing_data"
-```
-data will be inserted into `test_routing_data` or `test_routing_data_relyt_massive_group` according to the routing table.
+### Usage
+
+If a routing table exists, data will be inserted into either the main table or the auxiliary table based on the `group_id` in the routing table.
+
+### Data Migration
+
+The routing table will be automatically updated when data is inserted into the auxiliary table.
 
 ### migrate data
-routing table will be auto updated when data is inserted into the aux table.
 ```bash
 python3 migrate/migrate_data.py --tables public.table_name --threshold 100
 ```
+
+The migration tool will:
+1. Move data from the main table to the auxiliary table based on the threshold
+2. Update the routing table accordingly
+3. Maintain data consistency during the migration process
 
