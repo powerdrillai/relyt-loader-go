@@ -83,7 +83,7 @@ func NewProcessor(dbconfig DatabaseConfig, fileTimeout int, extinfo string) *Bul
 		ImportErrorCallback: WriteErrorsToFiles,
 		CallbackResource:    resources,
 		FileWriteTimeout:    fileTimeout, // set file write timeout
-		GCInterval:          10,          // set GC interval
+		BGWorkerInterval:    10,          // set GC interval
 	}
 
 	if extinfo == "auxtest" {

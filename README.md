@@ -102,7 +102,13 @@ CREATE TYPE loader_s3_config AS (
     bucket_name TEXT,
     prefix TEXT,
     access_key TEXT,
-    secret_key TEXT
+    secret_key TEXT,
+    concurrency INT,
+    part_size INT,
+    import_timeout INT,
+    import_error_sleep_time INT,
+    enable_dual_buffer BOOLEAN,
+    buffer_max_records INT
 );
 
 -- Create the LOADER_CONFIG function
@@ -112,19 +118,36 @@ LANGUAGE SQL
 IMMUTABLE
 AS $$
     SELECT 
-        's3.amazonaws.com'::TEXT AS endpoint,
-        'us-west-2'::TEXT AS region,
-        'your-bucket'::TEXT AS bucket_name,
-        'import/data'::TEXT AS prefix,
-        'your-access-key'::TEXT AS access_key,
-        'your-secret-key'::TEXT AS secret_key,
-        20 AS concurrency,
-        5242880 AS part_size,
-        1800 AS import_timeout,
-        10 AS import_error_sleep_time
+    'your-s3-endpoint.com'::TEXT AS endpoint,         
+    'your-region'::TEXT AS region,                            
+    'your-bucket-name'::TEXT AS bucket_name,        
+    'import/data'::TEXT AS prefix,                       
+    'your-access-key'::TEXT AS access_key,
+    'your-secret-key'::TEXT AS secret_key,   
+    20 AS concurrency,                                        
+    5242880 AS part_size,                                     
+    1800 AS import_timeout,                                   
+    10 AS import_error_sleep_time,
+    'true'::BOOLEAN AS enable_dual_buffer,
+    5000 AS buffer_max_records
     ;
 $$;
 ```
+
+### Configuration Parameters
+
+- **endpoint**: S3 compatible storage service endpoint URL
+- **region**: Storage service region
+- **bucket_name**: S3 bucket name
+- **prefix**: S3 object key prefix for organizing files
+- **access_key**: Access key for authentication
+- **secret_key**: Secret key for authentication
+- **concurrency**: Number of concurrent import tasks, default 20
+- **part_size**: S3 multipart upload part size in bytes, default 5242880 (5MB)
+- **import_timeout**: Import timeout in seconds, default 1800 (30 minutes)
+- **import_error_sleep_time**: Retry interval after import error in seconds, default 10
+- **enable_dual_buffer**: Whether to enable dual buffer functionality, default true
+- **buffer_max_records**: Maximum number of records in buffer, default 5000
 
 ## Checkpoint Tracking
 

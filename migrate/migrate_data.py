@@ -125,13 +125,15 @@ def migrate_data(cursor, table, routing_id):
     aux_table = table + "_relyt_massive_group"
     sql = ""
     if len(conflict_columns) == 0:
-        sql = f"INSERT INTO {aux_table} SELECT * FROM {table} WHERE routing_id = {routing_id};"
+        sql = f"INSERT INTO {aux_table} SELECT * FROM {table} WHERE routing_id = %s;"
+        cursor.execute(sql, (routing_id,))
     elif ON_CONFLICT_MODE == 'update':
-        sql = f"INSERT INTO {aux_table} SELECT * FROM {table} WHERE routing_id = {routing_id} on conflict ({conflict_columns}) do update set {updateSet};"
+        sql = f"INSERT INTO {aux_table} SELECT * FROM {table} WHERE routing_id = %s on conflict ({conflict_columns}) do update set {updateSet};"
+        cursor.execute(sql, (routing_id,))
     else:
-        sql = f"INSERT INTO {aux_table} SELECT * FROM {table} WHERE routing_id = {routing_id} on conflict ({conflict_columns}) do nothing;"
+        sql = f"INSERT INTO {aux_table} SELECT * FROM {table} WHERE routing_id = %s on conflict ({conflict_columns}) do nothing;"
+        cursor.execute(sql, (routing_id,))
     print(f"migrate sql is {sql}")
-    cursor.execute(sql)
     print(f"Data migrated from {table} to {aux_table} for group id {routing_id}.")
 
 # 从主表删除指定 routing_id 的数据
