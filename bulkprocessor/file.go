@@ -170,6 +170,15 @@ func (m *FileManager) SetCurrentFile(file *File, aux bool) {
 	}
 }
 
+func (m *FileManager) GetCurrentFileInfo(aux bool) *FileInfo {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+	if aux {
+		return &m.auxFileInfo
+	}
+	return &m.fileInfo
+}
+
 // GetFile returns a file by ID
 func (m *FileManager) GetFile(id string) *File {
 	m.mutex.RLock()

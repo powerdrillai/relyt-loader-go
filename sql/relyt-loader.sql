@@ -10,7 +10,9 @@ CREATE TYPE loader_s3_config AS (
     concurrency INT,
     part_size INT,
     import_timeout INT,
-    import_error_sleep_time INT
+    import_error_sleep_time INT,
+    enable_dual_buffer BOOLEAN,
+    buffer_max_records INT
 );
 
 -- create the LOADER_CONFIG function, return the s3 config info
@@ -29,9 +31,12 @@ AS $$
         20 AS concurrency,
         5242880 AS part_size,
         1800 AS import_timeout,
-        10 AS import_error_sleep_time
+        10 AS import_error_sleep_time,
+        'true'::BOOLEAN AS enable_dual_buffer,
+        5000 AS buffer_max_records
     ;
 $$;
+
 -- revoke the execute permission from public for safety
 REVOKE EXECUTE ON FUNCTION relyt_sys.LOADER_CONFIG() FROM PUBLIC;
 -- grant the execute permission to the role who runs the loader

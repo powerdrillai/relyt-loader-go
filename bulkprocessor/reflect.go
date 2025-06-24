@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"reflect"
+	"strings"
 	"time"
 )
 
@@ -106,6 +107,14 @@ func formatValue(val reflect.Value) string {
 			return t.Format(time.RFC3339)
 		}
 		return fmt.Sprintf("%v", val.Interface())
+	case reflect.Array, reflect.Slice:
+		// Handle array or slice types
+		var result []string
+		for i := 0; i < val.Len(); i++ {
+			result = append(result, formatValue(val.Index(i)))
+		}
+		log.Printf("result: %s", "{"+strings.Join(result, ",")+"}")
+		return "{" + strings.Join(result, ",") + "}"
 	default:
 		return fmt.Sprintf("%v", val.Interface())
 	}
