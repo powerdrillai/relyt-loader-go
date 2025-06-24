@@ -34,7 +34,6 @@ type BulkProcessor struct {
 	isStarted         bool
 	flushMutex        sync.RWMutex
 	isShutdown        bool
-	importErrorChan   chan error
 	fileQueue         chan string    // Queue of file IDs to be imported
 	batchQueue        chan string    // Queue of batch directories to be imported
 	routingQueue      chan bool      // channel to notify the routing table is updated
@@ -170,7 +169,6 @@ func New(config Config) (*BulkProcessor, error) {
 		fileManager:       fileManager,
 		ctx:               ctx,
 		cancel:            cancel,
-		importErrorChan:   make(chan error, 100),   // Buffer for import errors
 		fileQueue:         make(chan string, 1000), // Buffer for file queue
 		batchQueue:        make(chan string, 1000), // Buffer for batch queue
 		routingQueue:      make(chan bool, 10),     // Buffer for routing table updated
@@ -324,7 +322,7 @@ func (p *BulkProcessor) Shutdown() error {
 	allBuffers := p.bufferManager.GetAllBuffers()
 	for _, buffer := range allBuffers {
 		if buffer.LocalFile != "" {
-			if err := CleanupFile(buffer.LocalFile); err != nil {
+			if err := CleanupLocalFile(buffer.LocalFile); err != nil {
 				fmt.Fprintf(os.Stderr, "Failed to cleanup local file: %v\n", err)
 			}
 			normalFilepaths = append(normalFilepaths, buffer.LocalFile)
@@ -369,17 +367,6 @@ func (p *BulkProcessor) checkErrorCount(err error, errorRecordsCount *int, recor
 	}
 
 	return false
-}
-
-// checkImportError checks if there's an error in the importErrorChan without blocking
-// returns nil if no error is available
-func (p *BulkProcessor) checkImportError() error {
-	select {
-	case err := <-p.importErrorChan:
-		return err
-	default:
-		return nil
-	}
 }
 
 // Insert inserts data into the processor
@@ -649,12 +636,15 @@ func (p *BulkProcessor) Flush() error {
 		time.Sleep(time.Duration(1) * time.Second)
 	}
 
+	bufferIds := []string{}
+
 	// flush buffer
 	if p.config.EnableDualBuffer {
 		for _, isAux := range []bool{false, true} {
 			p.bufferManager.bufferOperationsMutex.Lock()
 			currentBuffer := p.bufferManager.GetCurrentBuffer(isAux)
 			if currentBuffer != nil && currentBuffer.GetRecordCount() > 0 && p.bufferManager.IsActive(currentBuffer.ID) {
+				bufferIds = append(bufferIds, currentBuffer.ID)
 				log.Printf("Force flushing current buffer: %s (records: %d)",
 					currentBuffer.ID, currentBuffer.GetRecordCount())
 
@@ -674,11 +664,9 @@ func (p *BulkProcessor) Flush() error {
 
 						feedbackKeysArray := p.getFeedbackValues()
 						feedbackKeysString := fmt.Sprintf("failed %s is [%s].", p.config.FeedbackColumn, strings.Join(feedbackKeysArray, ","))
+						log.Printf("flush buffer %s failed before callback: %s", currentBuffer.ID, feedbackKeysString)
 						if p.config.ImportErrorCallback != nil {
-							log.Printf("Batch import failed before callback: %s", feedbackKeysString)
 							p.config.ImportErrorCallback(p.config.FeedbackColumn, feedbackKeysArray, err, p.config.CallbackResource)
-						} else {
-							log.Printf("Batch import failed with no callback: %s", feedbackKeysString)
 						}
 
 						continue
@@ -748,7 +736,7 @@ func (p *BulkProcessor) Flush() error {
 	p.fileManager.fileOperationsMutex.Unlock()
 
 	// if no directory send to import, return ASAP
-	if !sendDirectory && len(p.bufferManager.GetBufferByStatus(BufferStatusFrozen, BufferStatusFlushed)) == 0 {
+	if !sendDirectory && len(bufferIds) == 0 {
 		log.Printf("flush without any data")
 		return nil
 	}
@@ -777,27 +765,33 @@ func (p *BulkProcessor) Flush() error {
 		importingFiles := p.fileManager.GetFilesByStateAndDirectory(FileStateImporting, batchDir)
 		errorFiles := p.fileManager.GetFilesByStateAndDirectory(FileStateError, batchDir)
 
-		toImportBuffers := p.bufferManager.GetBufferByStatus(BufferStatusFrozen, BufferStatusFlushed)
+		flushingBuffers := []*Buffer{}
+		errorBuffers := []*Buffer{}
 
-		// If we have error files but no error from channel, check if context was canceled
-		if len(errorFiles) > 0 {
-			// check import error
+		for _, bufferId := range bufferIds {
+			buffer := p.bufferManager.GetBufferByID(bufferId)
+			if buffer != nil {
+				if buffer.status == BufferStatusFlushError || buffer.status == BufferStatusImportError {
+					errorBuffers = append(errorBuffers, buffer)
+				} else if buffer.status == BufferStatusFrozen || buffer.status == BufferStatusFlushed {
+					flushingBuffers = append(flushingBuffers, buffer)
+				}
+			}
+		}
+
+		if len(errorFiles)+len(errorBuffers) > 0 {
 			// sleep at least 100ms because there are two updates to checkpoint
-			// between setError and send importErrorChan
 			sleepTime := p.config.FlushSleepTime
 			if sleepTime <= 1000 {
 				sleepTime = 1000
 			}
 			time.Sleep(time.Duration(sleepTime) * time.Millisecond)
-			if err := p.checkImportError(); err != nil {
-				return errors.Wrap(err, "import failed with error: ")
-			} else {
-				return errors.New("import failed, found error files but no error reported")
-			}
+
+			return errors.New("import failed, check delta checkpoint for more details")
 		}
 
 		// If no files are pending, we're done
-		if len(frozenFiles) == 0 && len(importingFiles) == 0 && len(toImportBuffers) == 0 {
+		if len(frozenFiles) == 0 && len(importingFiles) == 0 && len(flushingBuffers) == 0 {
 			log.Println("No files to import, exiting...")
 			return nil
 		}
@@ -875,9 +869,6 @@ func (p *BulkProcessor) ImporterThread() {
 					}
 
 					feedbackKeysString := fmt.Sprintf("failed %s is [%s].", p.config.FeedbackColumn, strings.Join(feedbackKeysArray, ","))
-
-					// Send error to import error channel and ensure it's received
-					p.importErrorChan <- errors.Wrap(err, feedbackKeysString)
 
 					if p.config.ImportErrorCallback != nil {
 						log.Printf("Batch import failed before callback: %s", feedbackKeysString)
@@ -1293,7 +1284,9 @@ func (p *BulkProcessor) DeleteV2(fileID, routingID string, offset ...int64) erro
 
 	// Get offset value, default to 0 if not provided
 	var recordOffset int64 = 0
-	if len(offset) > 0 {
+	if len(offset) > 1 {
+		return errors.New("offset must be a single value")
+	} else if len(offset) == 1 {
 		recordOffset = offset[0]
 	}
 
@@ -1407,10 +1400,10 @@ func (p *BulkProcessor) InsertThreadV2() {
 						feedbackKeysArray := p.getFeedbackValues()
 						feedbackKeysString := fmt.Sprintf("failed %s is [%s].", p.config.FeedbackColumn, strings.Join(feedbackKeysArray, ","))
 						if p.config.ImportErrorCallback != nil {
-							log.Printf("Batch import failed before callback: %s", feedbackKeysString)
+							log.Printf("WriteToLocalFile: %s failed before callback: %s", currentBuffer.ID, feedbackKeysString)
 							p.config.ImportErrorCallback(p.config.FeedbackColumn, feedbackKeysArray, err, p.config.CallbackResource)
 						} else {
-							log.Printf("Batch import failed with no callback: %s", feedbackKeysString)
+							log.Printf("WriteToLocalFile: %s failed with no callback: %s", currentBuffer.ID, feedbackKeysString)
 						}
 						continue
 					}
@@ -1443,7 +1436,7 @@ func (p *BulkProcessor) BufferTaskThread() {
 			return
 		case task := <-p.bufferTaskQueue:
 			log.Printf("Processing buffer task: %s (records: %d)",
-				task.BufferID, task.RecordCount)
+				task.TaskId, task.RecordCount)
 
 			feedbackKeysArray := p.getFeedbackValues()
 
@@ -1453,7 +1446,7 @@ func (p *BulkProcessor) BufferTaskThread() {
 
 			for i := 0; i < maxLoopNum; i++ {
 				if err := p.processBufferTaskWithTransaction(task); err != nil {
-					log.Printf("Failed to process buffer task %s: %v", task.BufferID, err)
+					log.Printf("Failed to process buffer task %s: %v", task.TaskId, err)
 					// Update checkpoint with all error file
 					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 					if err2 := p.pgClient.UpdateDeltaCheckpointStatus(ctx, p.processId, []string{task.LocalFile}, CheckpointStatusFailed, -1, err.Error()); err2 != nil {
@@ -1463,21 +1456,20 @@ func (p *BulkProcessor) BufferTaskThread() {
 
 					// all the errors without parsing error are not expected, we will retry, parsing error just call
 					// the callback and continue to next batch
-					if !strings.Contains(err.Error(), "Bad literal") && !strings.Contains(err.Error(), "Dimensions") {
+					if !strings.Contains(err.Error(), "Bad literal") &&
+						!strings.Contains(err.Error(), "Dimensions") &&
+						!strings.Contains(err.Error(), "duplicate key value") {
 						time.Sleep(time.Duration(p.config.ImportErrorSleepTime) * time.Second)
 						continue
 					}
 
 					feedbackKeysString := fmt.Sprintf("failed %s is [%s].", p.config.FeedbackColumn, strings.Join(feedbackKeysArray, ","))
 
-					// Send error to import error channel and ensure it's received
-					p.importErrorChan <- errors.Wrap(err, feedbackKeysString)
-
 					if p.config.ImportErrorCallback != nil {
-						log.Printf("Batch import failed before callback: %s", feedbackKeysString)
+						log.Printf("task %s failed before callback: %s", task.TaskId, feedbackKeysString)
 						p.config.ImportErrorCallback(p.config.FeedbackColumn, feedbackKeysArray, err, p.config.CallbackResource)
 					} else {
-						log.Printf("Batch import failed with no callback: %s", feedbackKeysString)
+						log.Printf("task %s failed with no callback: %s", task.TaskId, feedbackKeysString)
 					}
 
 					isFailed = true
@@ -1489,7 +1481,7 @@ func (p *BulkProcessor) BufferTaskThread() {
 			}
 
 			if isFailed {
-				p.bufferManager.SetBufferStatus(task.BufferID, BufferStatusImportError)
+				p.bufferManager.SetBufferStatus(task.TaskId, BufferStatusImportError)
 
 				feedbackKeysString := fmt.Sprintf("failed %s is [%s].", p.config.FeedbackColumn, strings.Join(feedbackKeysArray, ","))
 				log.Printf("Import batch directory timeout: %s", feedbackKeysString)
@@ -1501,13 +1493,13 @@ func (p *BulkProcessor) BufferTaskThread() {
 
 			// remove local file and delta checkpoint
 			if task.LocalFile != "" {
-				if err := CleanupFile(task.LocalFile); err != nil {
+				if err := CleanupLocalFile(task.LocalFile); err != nil {
 					log.Printf("Failed to remove temporary file %s: %v", task.LocalFile, err)
 				}
 			}
 
 			// success, set buffer status to imported
-			p.bufferManager.SetBufferStatus(task.BufferID, BufferStatusImported)
+			p.bufferManager.SetBufferStatus(task.TaskId, BufferStatusImported)
 
 			// Update global max offset after successful import
 			if task.MaxOffset > 0 {
@@ -1538,7 +1530,7 @@ func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask) error
 	defer func() {
 		if !success {
 			if rollbackErr := tx.Rollback(ctx); rollbackErr != nil {
-				log.Printf("Failed to rollback transaction: %v", rollbackErr)
+				log.Printf("task %s failed to rollback transaction: %v", task.TaskId, rollbackErr)
 			}
 		}
 	}()
@@ -1590,7 +1582,7 @@ func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask) error
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
+		return fmt.Errorf("task: %s failed to commit transaction: %w", task.TaskId, err)
 	}
 	success = true
 
@@ -1653,10 +1645,10 @@ func (p *BulkProcessor) Search(options *SearchOptions, args ...interface{}) (*Se
 			$3,  -- column_names
 			$4,  -- condition
 			$5,  -- order_by
-			$6,  -- limit_count
-			$7,  -- offset_count
-			$8,  -- group_by
-			$9   -- having
+			$6,  -- group_by
+			$7,  -- having
+			$8,  -- limit_count
+			$9   -- offset_count
 		)`
 
 	// process column names
