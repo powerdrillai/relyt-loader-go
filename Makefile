@@ -1,24 +1,25 @@
-.PHONY: test test-errors test-sleep test-recovery test-timeout test-migration
+.PHONY: test testv1 testv2 testselect
 
 # 运行所有测试
-test: test-errors test-sleep test-recovery test-timeout test-migration
+all test: testv1 testv2 testselect
 
-# 测试错误处理
-test-errors:
+testv1:
 	go test -v ./bulkprocessor -run TestInsertWithSomeErrors
-
-# 测试间歇性写入
-test-sleep:
 	go test -v ./bulkprocessor -run TestInsertWithSleep
-
-# 测试PG恢复
-test-recovery:
 	go test -v ./bulkprocessor -run TestInsertWithPgRecovery
-
-# 测试导入超时
-test-timeout:
 	go test -v ./bulkprocessor -run TestInsertWithImportTimeout
-
-# 测试数据迁移
-test-migration:
 	go test -v ./bulkprocessor -run TestInsertWithMigration 
+
+testv2:
+	go test -v ./bulkprocessor -run TestBufferInsertBasic
+	go test -v ./bulkprocessor -run TestBufferInsertWithSomeErrors
+	go test -v ./bulkprocessor -run TestBufferInsertWithSleep
+	go test -v ./bulkprocessor -run TestBufferInsertWithPgRecovery
+	go test -v ./bulkprocessor -run TestBufferInsertWithImportTimeout
+	go test -v ./bulkprocessor -run TestBufferInsertWithMigration
+	go test -v ./bulkprocessor -run TestBufferInsertWithMixedOperations
+	go test -v ./bulkprocessor -run TestBufferInsertWithOffset
+
+testselect:
+	go test -v ./bulkprocessor -run TestSearchBasic
+	go test -v ./bulkprocessor -run TestSearchAdditional

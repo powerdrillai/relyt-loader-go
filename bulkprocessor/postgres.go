@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
-	"os"
 	"strings"
 	"time"
 
@@ -744,42 +742,5 @@ func (c *PostgreSQLClient) CreateRoutingTableTrigger(ctx context.Context, routin
 		return errors.Wrap(err, "failed to create trigger")
 	}
 
-	return nil
-}
-
-// processLocalFileImport 处理本地文件导入
-func (c *PostgreSQLClient) processLocalFileImport(ctx context.Context, localFile string, isAuxFile bool, config PostgreSQLConfig, fields []FieldInfo) error {
-	if localFile == "" {
-		return nil
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
-
-	// Use COPY command to import from local file
-	columnNames := GetColumnNames(fields)
-	columnsList := strings.Join(columnNames, ", ")
-
-	targetTable := config.Table
-	if isAuxFile {
-		targetTable = fmt.Sprintf("%s%s", config.Table, auxTableSuffix)
-	}
-
-	sql := fmt.Sprintf("COPY %s.%s (%s) FROM '%s' WITH (FORMAT csv, HEADER true)",
-		config.Schema, targetTable, columnsList, localFile)
-
-	log.Printf("Executing COPY SQL: %s", sql)
-
-	_, err := c.pool.Exec(ctx, sql)
-	if err != nil {
-		return fmt.Errorf("failed to execute COPY SQL: %w", err)
-	}
-
-	// Delete temporary file
-	if err := os.Remove(localFile); err != nil {
-		log.Printf("Failed to remove temporary file %s: %v", localFile, err)
-	}
-
-	log.Printf("Successfully imported local file: %s", localFile)
 	return nil
 }

@@ -88,7 +88,7 @@ func (bm *BufferManager) NewBuffer(localFilePrefix string, maxRecords int, isAux
 	datePath := time.Now().Format("2006-01-02")
 	fullPath := filepath.Join(localFilePrefix, relytName, datePath, filename)
 	buffer := &Buffer{
-		ID:            uuid.New().String()[:8],
+		ID:            id,
 		Records:       make([]*Record, 0),
 		MaxRecords:    maxRecords,
 		LocalFilePath: fullPath,
@@ -112,7 +112,7 @@ func (bm *BufferManager) RecycleBuffers() []string {
 	var filePaths []string
 	for _, buffer := range allBuffers {
 		if buffer.LocalFile != "" {
-			CleanupFile(buffer.LocalFile)
+			CleanupLocalFile(buffer.LocalFile)
 			filePaths = append(filePaths, buffer.LocalFile)
 		}
 		delete(bm.buffers, buffer.ID)
@@ -177,6 +177,15 @@ func (bm *BufferManager) GetAllBuffers() []*Buffer {
 		buffers = append(buffers, buffer)
 	}
 	return buffers
+}
+
+func (bm *BufferManager) GetBufferByID(bufferID string) *Buffer {
+	bm.mutex.RLock()
+	defer bm.mutex.RUnlock()
+	if buffer, exists := bm.buffers[bufferID]; exists {
+		return buffer
+	}
+	return nil
 }
 
 func (bm *BufferManager) IsActive(bufferID string) bool {
@@ -311,10 +320,11 @@ func (b *Buffer) DeduplicateRecords() []RecordIndex {
 	return deletedIndices
 }
 
-func CleanupFile(filePath string) error {
+func CleanupLocalFile(filePath string) error {
 	if filePath == "" {
 		return nil
 	}
+	log.Printf("Removing temporary file %s", filePath)
 	return os.Remove(filePath)
 }
 
@@ -361,7 +371,7 @@ func (b *Buffer) WriteToLocalFile(headers []string) error {
 
 // BufferTask represents the buffer task
 type BufferTask struct {
-	BufferID       string
+	TaskId         string
 	LocalFile      string
 	RecordCount    int
 	CreatedAt      time.Time
@@ -372,7 +382,7 @@ type BufferTask struct {
 // NewBufferTask create a new buffer task
 func NewBufferTask(buffer *Buffer, deletedRecords []RecordIndex) *BufferTask {
 	bufferTask := BufferTask{
-		BufferID:       buffer.ID,
+		TaskId:         buffer.ID,
 		LocalFile:      buffer.LocalFile,
 		DeletedRecords: deletedRecords,
 		RecordCount:    buffer.GetRecordCount(),

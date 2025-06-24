@@ -61,8 +61,8 @@ func InitTestTables(db *sql.DB) error {
 	(6, 120, 'test6', '[0.6,0.7,0.8]'),
 	(7, 130, 'test7', '[0.7,0.8,0.9]'),
 	(8, 130, 'test8', '[0.8,0.9,1.0]'),
-	(9, 140, 'test9', '[0.9,1.0,1.1]'),
-	(10, 140, 'test10', '[1.0,1.1,1.2]');
+	(9, 140, null, '[0.9,1.0,1.1]'),
+	(10, 140, '', '[1.0,1.1,1.2]');
 	`
 	_, err = db.Exec(query)
 	if err != nil {
@@ -75,8 +75,8 @@ func InitTestTables(db *sql.DB) error {
 	VALUES 
 	(1, 100, 'test1', '[0.1,0.2,0.3]'),
 	(2, 100, 'test2', '[0.2,0.3,0.4]'),
-	(3, 110, 'test3', '[0.3,0.4,0.5]'),
-	(4, 110, 'test4', '[0.4,0.5,0.6]');
+	(3, 110, '', '[0.3,0.4,0.5]'),
+	(4, 110, null, '[0.4,0.5,0.6]');
 	`
 	_, err = db.Exec(query)
 	if err != nil {
@@ -155,8 +155,8 @@ func TestSearchBasic(t *testing.T) {
 	// 将结果转换为字符串进行比较
 	row0Str = fmt.Sprintf("%v", result.Rows[0])
 	row1Str = fmt.Sprintf("%v", result.Rows[1])
-	expectedRow0Str = "[10 140 test10 4.05]"
-	expectedRow1Str = "[9 140 test9 4.621504]"
+	expectedRow0Str = "[10 140  4.05]"
+	expectedRow1Str = "[9 140 <nil> 4.621504]"
 
 	if row0Str != expectedRow0Str {
 		t.Errorf("result.Rows[0]: %v:%v, expected: %s", result.Columns, result.Rows[0], expectedRow0Str)
@@ -287,8 +287,8 @@ func TestSearchAdditional(t *testing.T) {
 	if err != nil {
 		t.Errorf("failed to search data: %v", err)
 	}
-	if len(result.Rows) != 10 {
-		t.Errorf("expected 10 rows, but got %d", len(result.Rows))
+	if len(result.Rows) != 8 {
+		t.Errorf("expected 8 rows, but got %d", len(result.Rows))
 	}
 	log.Printf("Test 7 result size: %d, result: %v", len(result.Rows), result)
 
@@ -370,5 +370,29 @@ func TestSearchAdditional(t *testing.T) {
 		t.Errorf("expected 1 rows, but got %d", len(result.Rows))
 	}
 	log.Printf("Test 12 result size: %d, result: %v", len(result.Rows), result)
+
+	// 13. select null: select id, routing_id, ext from test_routing_data where ext is null or ext = ''
+	searchOptions = &SearchOptions{
+		Columns:   []string{"id", "routing_id as routingid", "ext"},
+		Condition: "ext is null or ext = ''",
+	}
+	result, err = processor.Search(searchOptions)
+	if err != nil {
+		t.Errorf("failed to search data: %v", err)
+	}
+
+	// check result
+	if len(result.Rows) != 4 {
+		t.Errorf("expected 4 rows, but got %d", len(result.Rows))
+	}
+	log.Printf("Test 13 result size: %d, result: %v", len(result.Rows), result)
+
+	columns := len(result.Columns)
+
+	for _, row := range result.Rows {
+		for i := 0; i < columns; i++ {
+			log.Printf("Test 13 result column: %d, value: %v", i, row[i])
+		}
+	}
 
 }
