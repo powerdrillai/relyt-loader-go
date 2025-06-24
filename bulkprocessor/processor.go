@@ -721,9 +721,12 @@ func (p *BulkProcessor) Flush() error {
 				p.fileManager.fileOperationsMutex.Unlock()
 				return err
 			}
+
+			// next CreateFile will reset the batchCounter
+			currentFileInfo := p.fileManager.GetCurrentFileInfo(isAux)
+			currentFileInfo.batchCounter = p.config.BatchImportSize
 		}
 	}
-	p.fileManager.fileOperationsMutex.Unlock()
 
 	batchDir := ""
 	sendDirectory := false
@@ -741,6 +744,8 @@ func (p *BulkProcessor) Flush() error {
 	}
 	p.lastFlushTime = time.Now()
 	p.pendingBatchMutex.Unlock()
+
+	p.fileManager.fileOperationsMutex.Unlock()
 
 	// if no directory send to import, return ASAP
 	if !sendDirectory && len(p.bufferManager.GetBufferByStatus(BufferStatusFrozen, BufferStatusFlushed)) == 0 {
