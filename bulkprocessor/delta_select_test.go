@@ -101,7 +101,7 @@ func TestSearchBasic(t *testing.T) {
 		OrderBy:   "id ASC",
 		Limit:     3,
 	}
-	result, err := processor.Search(searchOptions, 2)
+	result, err := processor.SearchV2(searchOptions, 2)
 	if err != nil {
 		t.Errorf("failed to search data: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestSearchBasic(t *testing.T) {
 		OrderBy:   "id ASC",
 		Limit:     2,
 	}
-	result, err = processor.Search(searchOptions, 0)
+	result, err = processor.SearchV2(searchOptions, 0)
 	if err != nil {
 		t.Errorf("failed to search with vector similarity: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestSearchBasic(t *testing.T) {
 		OrderBy:   "distance ASC",
 		Limit:     2,
 	}
-	result, err = processor.Search(searchOptions, 0, "[1,2,3]")
+	result, err = processor.SearchV2(searchOptions, 0, "[1,2,3]")
 	if err != nil {
 		t.Errorf("failed to search with vector similarity using parameters: %v", err)
 	}
@@ -179,7 +179,7 @@ func TestSearchAdditional(t *testing.T) {
 		OrderBy:   "id ASC",
 		Limit:     5,
 	}
-	result, err := processor.Search(searchOptions, []interface{}{1, 2, 5, 6})
+	result, err := processor.SearchV2(searchOptions, []interface{}{1, 2, 5, 6})
 	if err != nil {
 		t.Errorf("failed to search data: %v", err)
 	}
@@ -194,7 +194,7 @@ func TestSearchAdditional(t *testing.T) {
 		OrderBy: "distance ASC",
 		Limit:   3,
 	}
-	result, err = processor.Search(searchOptions)
+	result, err = processor.SearchV2(searchOptions)
 	if err != nil {
 		t.Errorf("failed to search data: %v", err)
 	}
@@ -210,7 +210,7 @@ func TestSearchAdditional(t *testing.T) {
 		OrderBy:   "id DESC",
 		Limit:     5,
 	}
-	result, err = processor.Search(searchOptions, 3, 100)
+	result, err = processor.SearchV2(searchOptions, 3, 100)
 	if err != nil {
 		t.Errorf("failed to search data: %v", err)
 	}
@@ -225,7 +225,7 @@ func TestSearchAdditional(t *testing.T) {
 		OrderBy: "double_distance ASC",
 		Limit:   3,
 	}
-	result, err = processor.Search(searchOptions)
+	result, err = processor.SearchV2(searchOptions)
 	if err != nil {
 		t.Errorf("failed to search data: %v", err)
 	}
@@ -252,7 +252,7 @@ func TestSearchAdditional(t *testing.T) {
 		OrderBy:   "id ASC",
 		Limit:     10,
 	}
-	result, err = processor.Search(searchOptions, []interface{}{1, 2, 3, 4, 5}, 100)
+	result, err = processor.SearchV2(searchOptions, []interface{}{1, 2, 3, 4, 5}, 100)
 	if err != nil {
 		t.Errorf("failed to search data: %v", err)
 	}
@@ -268,7 +268,7 @@ func TestSearchAdditional(t *testing.T) {
 		Limit:   5,
 		Offset:  2,
 	}
-	result, err = processor.Search(searchOptions)
+	result, err = processor.SearchV2(searchOptions)
 	if err != nil {
 		t.Errorf("failed to search data: %v", err)
 	}
@@ -283,7 +283,7 @@ func TestSearchAdditional(t *testing.T) {
 		Condition: "ext is not null",
 		OrderBy:   "id ASC",
 	}
-	result, err = processor.Search(searchOptions)
+	result, err = processor.SearchV2(searchOptions)
 	if err != nil {
 		t.Errorf("failed to search data: %v", err)
 	}
@@ -298,7 +298,7 @@ func TestSearchAdditional(t *testing.T) {
 		Condition: "id in ($1) and routing_id in ($2)",
 		OrderBy:   "id ASC",
 	}
-	result, err = processor.Search(searchOptions, []interface{}{1, 3, 5, 7}, []interface{}{100, 120})
+	result, err = processor.SearchV2(searchOptions, []interface{}{1, 3, 5, 7}, []interface{}{100, 120})
 	if err != nil {
 		t.Errorf("failed to search data: %v", err)
 	}
@@ -312,7 +312,7 @@ func TestSearchAdditional(t *testing.T) {
 		Columns: []string{"routing_id", "count(*)"},
 		GroupBy: "routing_id",
 	}
-	result, err = processor.Search(searchOptions)
+	result, err = processor.SearchV2(searchOptions)
 	if err != nil {
 		t.Errorf("failed to search data: %v", err)
 	}
@@ -328,7 +328,7 @@ func TestSearchAdditional(t *testing.T) {
 		GroupBy: "routing_id",
 		Having:  "count(*) > 2",
 	}
-	result, err = processor.Search(searchOptions)
+	result, err = processor.SearchV2(searchOptions)
 	if err != nil {
 		t.Errorf("failed to search data: %v", err)
 	}
@@ -348,7 +348,7 @@ func TestSearchAdditional(t *testing.T) {
 		Limit:     5,
 		Offset:    1,
 	}
-	result, err = processor.Search(searchOptions, 0, []interface{}{100, 110, 120})
+	result, err = processor.SearchV2(searchOptions, 0, []interface{}{100, 110, 120})
 	if err != nil {
 		t.Errorf("failed to search data: %v", err)
 	}
@@ -362,7 +362,7 @@ func TestSearchAdditional(t *testing.T) {
 		Columns:   []string{"count(*)"},
 		Condition: "id in ($1)",
 	}
-	result, err = processor.Search(searchOptions, []interface{}{1, 2, 3, 4, 5})
+	result, err = processor.SearchV2(searchOptions, []interface{}{1, 2, 3, 4, 5})
 	if err != nil {
 		t.Errorf("failed to search data: %v", err)
 	}
@@ -376,7 +376,7 @@ func TestSearchAdditional(t *testing.T) {
 		Columns:   []string{"id", "routing_id as routingid", "ext"},
 		Condition: "ext is null or ext = ''",
 	}
-	result, err = processor.Search(searchOptions)
+	result, err = processor.SearchV2(searchOptions)
 	if err != nil {
 		t.Errorf("failed to search data: %v", err)
 	}

@@ -744,3 +744,41 @@ func (c *PostgreSQLClient) CreateRoutingTableTrigger(ctx context.Context, routin
 
 	return nil
 }
+
+func (c *PostgreSQLClient) DeleteTablesWithCondition(ctx context.Context, schema, table, fileID, routingID string, haveAuxTable bool) (int, error) {
+	sqlStatement := `
+	SELECT relyt_sys.delete_tables_with_condition(
+		$1,  -- schema_name
+		$2,  -- main_table
+		$3,  -- file_id
+		$4,  -- routing_id
+		$5  -- have_aux_table
+	)`
+
+	var result int
+	err := c.pool.QueryRow(ctx, sqlStatement, schema, table, fileID, routingID, haveAuxTable).Scan(&result)
+	if err != nil {
+		return 0, errors.Wrap(err, "failed to delete tables with condition")
+	}
+
+	return result, nil
+}
+
+func (c *PostgreSQLClient) GetColumnsWithCondition(ctx context.Context, args ...interface{}) (pgx.Rows, error) {
+	// build query
+	baseSQL := `
+		SELECT * FROM relyt_sys.get_columns_with_condition(
+			$1,  -- schema_name
+			$2,  -- target_table_name
+			$3,  -- column_names
+			$4,  -- condition
+			$5,  -- order_by
+			$6,  -- group_by
+			$7,  -- having
+			$8,  -- limit_count
+			$9,  -- offset_count
+			$10 -- have_aux_table
+		)`
+
+	return c.pool.Query(ctx, baseSQL, args...)
+}

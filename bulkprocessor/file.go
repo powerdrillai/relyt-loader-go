@@ -423,7 +423,7 @@ func (m *FileManager) IsInSameBatch(file1 *File, file2 *File) bool {
 // with status imported which are used to delete the delta checkpoint, we want to keep the
 // file paths with status error in the table relyt_loader_delta_checkpoint, after we check the reason
 // of the error, we can delete the file paths from the table relyt_loader_delta_checkpoint manually.
-func (m *FileManager) RecycleFiles() []string {
+func (m *FileManager) RecycleFiles(deleteS3 bool) []string {
 	// Create a list of all files that need to be cleaned up from S3
 	allFiles := append(
 		m.GetFilesByState(FileStateImported),
@@ -448,7 +448,7 @@ func (m *FileManager) RecycleFiles() []string {
 			// for further check, this files will be deleted from S3 with a expired time
 			// and be deleted from relyt_loader_delta_checkpoint manually.
 			delete(m.files, file.ID)
-			if file.State != FileStateError {
+			if file.State != FileStateError && deleteS3 {
 				importedFilepaths = append(importedFilepaths, file.S3Key)
 				s3Keys = append(s3Keys, file.S3Key)
 			}
