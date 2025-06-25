@@ -256,7 +256,7 @@ func (p *BulkProcessor) Start() error {
 		go p.InsertThreadV2()
 
 		p.bufferThreadWg.Add(1)
-		go p.BufferTaskThread()
+		go p.ImporterThreadV2()
 	}
 
 	return nil
@@ -1011,7 +1011,7 @@ func (p *BulkProcessor) BGWorkerThread() {
 			// Not canceled
 		}
 
-		importedFilepaths := p.fileManager.RecycleFiles()
+		importedFilepaths := p.fileManager.RecycleFiles(false)
 		importedFilepaths = append(importedFilepaths, p.bufferManager.RecycleBuffers()...)
 		if len(importedFilepaths) > 0 {
 			log.Printf("GC thread recycling files: %v", importedFilepaths)
@@ -1263,6 +1263,22 @@ func (p *BulkProcessor) InsertV2(fileID, routingID string, records interface{}, 
 	return nil
 }
 
+func (p *BulkProcessor) DeleteSyncV2(fileID, routingID string) error {
+	p.mutex.RLock()
+	if p.isShutdown {
+		p.mutex.RUnlock()
+		return ErrProcessorClosed
+	}
+	p.mutex.RUnlock()
+
+	_, err := p.pgClient.DeleteTablesWithCondition(p.ctx, p.config.PostgreSQL.Schema, p.config.PostgreSQL.Table, fileID, routingID, p.hasRoutingTable)
+	if err != nil {
+		return fmt.Errorf("failed to delete tables with condition: %w", err)
+	}
+
+	return nil
+}
+
 func (p *BulkProcessor) DeleteV2(fileID, routingID string, offset ...int64) error {
 	if !p.config.EnableDualBuffer {
 		return errors.New("dual buffer is not enabled")
@@ -1424,7 +1440,7 @@ func (p *BulkProcessor) InsertThreadV2() {
 	}
 }
 
-func (p *BulkProcessor) BufferTaskThread() {
+func (p *BulkProcessor) ImporterThreadV2() {
 	defer p.bufferThreadWg.Done()
 
 	log.Println("BufferTask thread started")
@@ -1496,6 +1512,13 @@ func (p *BulkProcessor) BufferTaskThread() {
 				if err := CleanupLocalFile(task.LocalFile); err != nil {
 					log.Printf("Failed to remove temporary file %s: %v", task.LocalFile, err)
 				}
+
+				// Update checkpoint with all imported file
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				if err := p.pgClient.UpdateDeltaCheckpointStatus(ctx, p.processId, []string{task.LocalFile}, CheckpointStatusCompleted, 0, ""); err != nil {
+					fmt.Fprintf(os.Stderr, "Failed to update checkpoint for imported file: %v\n", err)
+				}
+				cancel()
 			}
 
 			// success, set buffer status to imported
@@ -1537,19 +1560,24 @@ func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask) error
 
 	// 1. delete records first
 	for _, deletedRecord := range task.DeletedRecords {
-		log.Printf("Deleting record in transaction: %s, %s", deletedRecord.fileID, deletedRecord.routingID)
+		deleteSQL := `SELECT relyt_sys.delete_tables_with_condition(
+							$1,  -- schema_name
+							$2,  -- main_table
+							$3,  -- file_id
+							$4,  -- routing_id
+							$5   -- have_aux_table
+						)`
 
-		// build condition string, include type conversion
-		//TODO: 参数绑定
-		condition := fmt.Sprintf("fileid = %s::bigint AND routing_id = %s::text",
-			deletedRecord.fileID, deletedRecord.routingID)
+		log.Printf("Executing delete SQL in transaction: relyt_sys.delete_tables_with_condition('%s', '%s', '%s', '%s', %t)",
+			p.config.PostgreSQL.Schema, p.config.PostgreSQL.Table, deletedRecord.fileID, deletedRecord.routingID, p.hasRoutingTable)
 
-		deleteSQL := `SELECT relyt_sys.delete_tables_with_condition($1, $2, $3)`
-
-		log.Printf("Executing delete SQL in transaction: relyt_sys.delete_tables_with_condition('%s', '%s', '%s')",
-			p.config.PostgreSQL.Schema, p.config.PostgreSQL.Table, condition)
-
-		_, err := tx.Exec(ctx, deleteSQL, p.config.PostgreSQL.Schema, p.config.PostgreSQL.Table, condition)
+		_, err := tx.Exec(ctx, deleteSQL,
+			p.config.PostgreSQL.Schema,
+			p.config.PostgreSQL.Table,
+			deletedRecord.fileID,
+			deletedRecord.routingID,
+			p.hasRoutingTable,
+		)
 		if err != nil {
 			return fmt.Errorf("failed to execute delete SQL for %s:%s: %w", deletedRecord.fileID, deletedRecord.routingID, err)
 		}
@@ -1628,28 +1656,14 @@ func processSQLParams(input string, args []interface{}) string {
 	return processed
 }
 
-// Search search data from main table and aux table
-func (p *BulkProcessor) Search(options *SearchOptions, args ...interface{}) (*SearchResult, error) {
+// SearchV2 search data from main table and aux table
+func (p *BulkProcessor) SearchV2(options *SearchOptions, args ...interface{}) (*SearchResult, error) {
 	p.mutex.RLock()
 	if p.isShutdown {
 		p.mutex.RUnlock()
 		return nil, ErrProcessorClosed
 	}
 	p.mutex.RUnlock()
-
-	// build query
-	baseSQL := `
-		SELECT * FROM relyt_sys.get_columns_with_condition(
-			$1,  -- schema_name
-			$2,  -- target_table_name
-			$3,  -- column_names
-			$4,  -- condition
-			$5,  -- order_by
-			$6,  -- group_by
-			$7,  -- having
-			$8,  -- limit_count
-			$9   -- offset_count
-		)`
 
 	// process column names
 	processedColumns := make([]string, len(options.Columns))
@@ -1675,13 +1689,14 @@ func (p *BulkProcessor) Search(options *SearchOptions, args ...interface{}) (*Se
 		processedHaving,
 		options.Limit,
 		options.Offset,
+		p.hasRoutingTable,
 	}
 
-	// log.Printf("baseSQL: select * from get_columns_with_condition('%v', '%v', '%v', '%v', '%v', '%v', '%v', '%v', '%v')", params...)
+	// log.Printf("baseSQL: select * from get_columns_with_condition('%v', '%v', '%v', '%v', '%v', '%v', '%v', '%v', '%v', %t)", params...)
 
-	rows, err := p.pgClient.ExecuteSQL(p.ctx, baseSQL, params...)
+	rows, err := p.pgClient.GetColumnsWithCondition(p.ctx, params...)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to execute sql")
+		return nil, errors.Wrap(err, "failed to get columns with condition")
 	}
 	defer rows.Close()
 
