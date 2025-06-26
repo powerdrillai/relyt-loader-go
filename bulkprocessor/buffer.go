@@ -104,7 +104,7 @@ func (bm *BufferManager) NewBuffer(localFilePrefix string, maxRecords int, isAux
 }
 
 func (bm *BufferManager) RecycleBuffers() []string {
-	allBuffers := bm.GetBufferByStatus(BufferStatusImported, BufferStatusImportError)
+	allBuffers := bm.GetBufferByStatus(BufferStatusImported)
 
 	bm.mutex.Lock()
 	defer bm.mutex.Unlock()
@@ -112,7 +112,6 @@ func (bm *BufferManager) RecycleBuffers() []string {
 	var filePaths []string
 	for _, buffer := range allBuffers {
 		if buffer.LocalFile != "" {
-			CleanupLocalFile(buffer.LocalFile)
 			filePaths = append(filePaths, buffer.LocalFile)
 		}
 		delete(bm.buffers, buffer.ID)

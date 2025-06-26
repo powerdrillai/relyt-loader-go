@@ -45,6 +45,7 @@ type Config struct {
 	ImportErrorSleepTime int    // S3 import error sleep time in seconds
 	EnableDualBuffer     bool   // enable dual buffer, default: true
 	BufferMaxRecords     int    // buffer max records, default: 1000
+	UseInsertOnConflict  bool   // use insert on conflict, default: true
 	LocalFilePrefix      string // local file prefix, default: "/tmp"
 }
 
@@ -106,6 +107,10 @@ func (c *Config) Validate() error {
 
 	if c.LocalFilePrefix == "" {
 		c.LocalFilePrefix = os.TempDir()
+	}
+
+	if !c.UseInsertOnConflict {
+		c.UseInsertOnConflict = true
 	}
 
 	return nil

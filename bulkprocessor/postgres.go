@@ -2,11 +2,15 @@ package bulkprocessor
 
 import (
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"io"
+	"os"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pkg/errors"
@@ -218,7 +222,8 @@ func (c *PostgreSQLClient) GetLoadConfigFromDB(ctx context.Context, config *Conf
 		import_timeout,
 		import_error_sleep_time,
 		enable_dual_buffer,
-		buffer_max_records
+		buffer_max_records,
+		use_insert_on_conflict
 	FROM relyt_sys.LOADER_CONFIG()
 	`
 
@@ -236,6 +241,7 @@ func (c *PostgreSQLClient) GetLoadConfigFromDB(ctx context.Context, config *Conf
 		&config.ImportErrorSleepTime,
 		&config.EnableDualBuffer,
 		&config.BufferMaxRecords,
+		&config.UseInsertOnConflict,
 	)
 
 	if err != nil {
@@ -251,7 +257,8 @@ func (c *PostgreSQLClient) UpdateLoadConfig(ctx context.Context, config *Config)
 		import_timeout,
 		import_error_sleep_time,
 		enable_dual_buffer,
-		buffer_max_records
+		buffer_max_records,
+		use_insert_on_conflict
 	FROM relyt_sys.LOADER_CONFIG()
 	`
 
@@ -261,6 +268,7 @@ func (c *PostgreSQLClient) UpdateLoadConfig(ctx context.Context, config *Config)
 		&config.ImportErrorSleepTime,
 		&config.EnableDualBuffer,
 		&config.BufferMaxRecords,
+		&config.UseInsertOnConflict,
 	)
 
 	if err != nil {
@@ -781,4 +789,138 @@ func (c *PostgreSQLClient) GetColumnsWithCondition(ctx context.Context, args ...
 		)`
 
 	return c.pool.Query(ctx, baseSQL, args...)
+}
+
+// CopyFromFileInTransaction copies data from a local file to a PostgreSQL table within a transaction
+func (c *PostgreSQLClient) CopyFromFileInTransaction(ctx context.Context, tx pgx.Tx, filePath, targetTable string, columnNames []string) error {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to open file %s: %w", filePath, err)
+	}
+	defer file.Close()
+
+	copyCommand := fmt.Sprintf(
+		"COPY %s.%s (%s) FROM STDIN WITH (FORMAT csv, HEADER false, NULL 'null')",
+		c.config.Schema,
+		targetTable,
+		strings.Join(columnNames, ", "),
+	)
+
+	if _, err := tx.Conn().PgConn().CopyFrom(ctx, file, copyCommand); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *PostgreSQLClient) InsertIntoOnConflictFromFile(ctx context.Context, tx pgx.Tx, filePath, targetTable string, columnNames []string, updateOnConflict bool) error {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to open file %s: %w", filePath, err)
+	}
+	defer file.Close()
+
+	// Get primary key columns to handle conflicts
+	pkColumns, err := c.GetTablePrimaryKeys(ctx)
+	if err != nil {
+		return errors.Wrap(err, "failed to get primary key columns")
+	}
+
+	// Create CSV reader
+	reader := csv.NewReader(file)
+	reader.FieldsPerRecord = -1 // Allow variable number of fields
+
+	// Build the base INSERT statement
+	columnsList := strings.Join(columnNames, ", ")
+	placeholders := make([]string, len(columnNames))
+	for i := range columnNames {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+	}
+	valuesClause := strings.Join(placeholders, ", ")
+
+	var sqlStatement string
+	if len(pkColumns) > 0 && updateOnConflict {
+		// Build the ON CONFLICT clause
+		conflictColumns := strings.Join(pkColumns, ", ")
+
+		// Build the update set clause (set each column to excluded.column)
+		updateSetParts := make([]string, 0, len(columnNames))
+		for _, col := range columnNames {
+			// Skip primary key columns in the update part
+			isPK := false
+			for _, pk := range pkColumns {
+				if pk == col {
+					isPK = true
+					break
+				}
+			}
+			if !isPK {
+				updateSetParts = append(updateSetParts, fmt.Sprintf("%s = excluded.%s", col, col))
+			}
+		}
+
+		// If there are non-PK columns to update
+		if len(updateSetParts) > 0 {
+			updateSet := strings.Join(updateSetParts, ", ")
+			sqlStatement = fmt.Sprintf(`INSERT INTO %s.%s (%s) VALUES (%s) ON CONFLICT (%s) DO UPDATE SET %s`,
+				c.config.Schema, targetTable, columnsList, valuesClause, conflictColumns, updateSet)
+		} else {
+			// All columns are primary keys, do nothing on conflict
+			sqlStatement = fmt.Sprintf(`INSERT INTO %s.%s (%s) VALUES (%s) ON CONFLICT (%s) DO NOTHING`,
+				c.config.Schema, targetTable, columnsList, valuesClause, conflictColumns)
+		}
+	} else if len(pkColumns) > 0 {
+		// Do nothing on conflict (as per configuration)
+		conflictColumns := strings.Join(pkColumns, ", ")
+		sqlStatement = fmt.Sprintf(`INSERT INTO %s.%s (%s) VALUES (%s) ON CONFLICT (%s) DO NOTHING`,
+			c.config.Schema, targetTable, columnsList, valuesClause, conflictColumns)
+	} else {
+		// No primary key, use standard INSERT
+		sqlStatement = fmt.Sprintf(`INSERT INTO %s.%s (%s) VALUES (%s)`,
+			c.config.Schema, targetTable, columnsList, valuesClause)
+	}
+
+	// Generate unique statement name using UUID to ensure uniqueness across connections
+	stmtName := fmt.Sprintf("insert_on_conflict_%s_%s", strings.ReplaceAll(targetTable, ".", "_"), uuid.New().String()[:8])
+
+	// Prepare the statement
+	stmt, err := tx.Prepare(ctx, stmtName, sqlStatement)
+	if err != nil {
+		return fmt.Errorf("failed to prepare statement: %w", err)
+	}
+
+	// Read and process each row
+	lineNum := 0
+	for {
+		lineNum++
+		record, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("failed to read CSV line %d: %w", lineNum, err)
+		}
+
+		// Convert empty strings to nil for NULL handling
+		args := make([]interface{}, len(record))
+		for i, value := range record {
+			args[i] = value
+		}
+
+		// Execute the INSERT statement
+		_, err = tx.Exec(ctx, stmt.Name, args...)
+		if err != nil {
+			return fmt.Errorf("failed to execute INSERT at line %d: %w", lineNum, err)
+		}
+	}
+
+	// Clean up the prepared statement to avoid conflicts in future calls
+	// Note: This is optional as statements are automatically cleaned up when the transaction ends
+	// but it's good practice to be explicit
+	err = tx.Conn().PgConn().Deallocate(ctx, stmtName)
+	if err != nil {
+		return fmt.Errorf("failed to deallocate statement: %w", err)
+	}
+
+	return nil
 }

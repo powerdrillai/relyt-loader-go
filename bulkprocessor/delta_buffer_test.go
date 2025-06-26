@@ -88,14 +88,14 @@ func CreateTestDataTaleWithAuxV2(db *sql.DB) error {
 		id bigint NOT NULL PRIMARY KEY,
 		fileid bigint NOT NULL,
 		routing_id text NOT NULL,
-		ext text,
+		ext text NOT NULL,
 		vector vecf16(3) NOT NULL
 	);
 	CREATE TABLE IF NOT EXISTS test_routing_data_v2_relyt_massive_group (
 		id bigint NOT NULL PRIMARY KEY,
 		fileid bigint NOT NULL,
 		routing_id text NOT NULL,
-		ext text,
+		ext text NOT NULL,
 		vector vecf16(3) NOT NULL
 	);
 	CREATE TABLE IF NOT EXISTS relyt_sys.test_routing_data_v2_relyt_routing (
@@ -217,7 +217,7 @@ func CreateTestDataTaleWithOutAux(db *sql.DB) error {
 		id bigint NOT NULL PRIMARY KEY,
 		fileid bigint NOT NULL,
 		routing_id text NOT NULL,
-		ext text,
+		ext text NOT NULL,
 		vector vecf16(3) NOT NULL
 	);
 	`
@@ -968,13 +968,13 @@ func TestBufferInsertWithMigration(t *testing.T) {
 	} else {
 		log.Printf("Counted %d records in main table, %d records in aux table.", mainCount, auxCount)
 		if mainCount+auxCount != 142 {
-			t.Errorf("expected %d records, but got %d", 45+230, mainCount+auxCount)
+			t.Errorf("expected %d records, but got %d", 142, mainCount+auxCount)
 		}
 		if auxCount != 115 {
-			t.Errorf("expected %d records in aux table, but got %d", 230, auxCount)
+			t.Errorf("expected %d records in aux table, but got %d", 115, auxCount)
 		}
 		if mainCount != 27 {
-			t.Errorf("expected %d records in main table, but got %d", 45, mainCount)
+			t.Errorf("expected %d records in main table, but got %d", 27, mainCount)
 		}
 	}
 
@@ -1095,7 +1095,7 @@ func TestBufferInsertWithMixedOperations(t *testing.T) {
 
 			// Mixed operations: execute delete operations under specific conditions
 			if i == 10 {
-				// Delete data for the first fileID
+				// Delete data for the first batch
 				log.Printf("Executing delete operation #1: fileID=%s, routingID=%s", lastFileID, lastRoutingID)
 				err := processor.DeleteV2(lastFileID, lastRoutingID)
 				if err != nil {
@@ -1103,7 +1103,7 @@ func TestBufferInsertWithMixedOperations(t *testing.T) {
 				}
 				deleteCount++
 			} else if i == 20 {
-				// Delete data for the second fileID
+				// Delete data for the second batch
 				log.Printf("Executing delete operation #2: fileID=%s, routingID=%s", lastFileID, lastRoutingID)
 				err := processor.DeleteV2(lastFileID, lastRoutingID)
 				if err != nil {
@@ -1111,7 +1111,7 @@ func TestBufferInsertWithMixedOperations(t *testing.T) {
 				}
 				deleteCount++
 			} else if i == 30 {
-				// Delete data for the third fileID
+				// Delete data for the third batch
 				log.Printf("Executing delete operation #3: fileID=%s, routingID=%s", lastFileID, lastRoutingID)
 				err := processor.DeleteV2(lastFileID, lastRoutingID)
 				if err != nil {
@@ -1125,7 +1125,7 @@ func TestBufferInsertWithMixedOperations(t *testing.T) {
 	}
 
 	if len(tests) > 0 {
-		log.Printf("insert batch %d, contains %d records", i/batchSize, len(tests))
+		log.Printf("insert final batch, contains %d records", len(tests))
 		// Get fileID and routingID from the first record in tests
 		lastFileID = fmt.Sprintf("%d", tests[0].FileID)
 		lastRoutingID = tests[0].RoutingID
@@ -1468,5 +1468,128 @@ func TestBufferDeleteSync(t *testing.T) {
 	if mainCount != 5 {
 		t.Errorf("expected main table count to be 5, got %d", mainCount)
 	}
+}
 
+func TestBufferInsertWithDuplicate(t *testing.T) {
+	// Initialize database connection
+	dbConfig := InitDatabaseConfig("127.0.0.1", 7000, "postgres", "", "postgres")
+	db, err := SetupDataBase(dbConfig)
+	if err != nil {
+		log.Fatalf("failed to setup database: %v", err)
+	} else {
+		err := CreateTestDataTaleWithAuxV2(db)
+		if err != nil {
+			log.Fatalf("failed to create test table: %v", err)
+			return
+		}
+		err = TruncateTestDataTableWithAuxV2(db)
+		if err != nil {
+			log.Fatalf("failed to truncate test table: %v", err)
+			return
+		}
+		err = InitTestRoutingTable(db)
+		if err != nil {
+			log.Fatalf("failed to init test routing table: %v", err)
+			return
+		}
+
+		err = ClearRelytCheckpointTable(db)
+		if err != nil {
+			log.Fatalf("failed to clear relyt_checkpoint table: %v", err)
+			return
+		}
+	}
+	defer db.Close()
+
+	fileTimeout := 3 // set file write timeout to 3 seconds
+	processor := NewProcessorV2(dbConfig, fileTimeout, 0)
+	defer processor.Shutdown()
+
+	filePath := "../examples/data/test_duplicate_v2.csv"
+
+	batchSize := 5
+	var tests []TestDataWithAuxV2
+
+	csvFile, err := os.Open(filePath)
+	if err != nil {
+		log.Fatalf("failed to open csv file: %v", err)
+	}
+	defer csvFile.Close()
+
+	csvReader := csv.NewReader(csvFile)
+	csvReader.FieldsPerRecord = -1
+	csvReader.Comma = '\t'
+	csvReader.ReuseRecord = true
+
+	i := 0
+
+	for {
+		record, err := csvReader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Errorf("failed to read csv file: %v", err)
+		}
+		id, err := strconv.Atoi(record[0])
+		if err != nil {
+			t.Errorf("failed to parse id: %v", err)
+		}
+		fileID, err := strconv.Atoi(record[1])
+		if err != nil {
+			t.Errorf("failed to parse file_id: %v", err)
+		}
+		routingID := record[2]
+		if len(record) < 5 {
+			t.Errorf("record does not contain enough fields: %v", record)
+		} else {
+			log.Printf("record %d: id=%d, file_id=%d, routing_id=%s, ext=%s, vector=%s", i, id, fileID, routingID, record[3], record[4])
+		}
+		ext := record[3]
+		vector := record[4]
+		tests = append(tests, TestDataWithAuxV2{
+			ID:        id,
+			FileID:    fileID,
+			RoutingID: routingID,
+			Ext:       ext,
+			Vector:    vector,
+		})
+		i++
+
+		// insert batch
+		if i%batchSize == 0 {
+			log.Printf("insert batch %d, contains %d records", i/batchSize, len(tests))
+			err := processor.InsertV2(fmt.Sprintf("%d", fileID), routingID, tests)
+			if err != nil {
+				t.Errorf("failed to insert data: %v", err)
+			}
+			tests = nil // clear the list, prepare for the next batch
+		}
+	}
+
+	// Flush all pending data
+	log.Println("Flushing all pending data...")
+	err = processor.Flush()
+	if err != nil {
+		t.Errorf("Failed to flush: %v", err)
+	}
+
+	// Wait for import to complete
+	log.Println("waiting for import to complete...")
+	time.Sleep(time.Duration(5) * time.Second)
+
+	// Check the count of records in the test tables
+	mainCount, err := GetCountFromTestDataTableWithAuxV2(db, false)
+	if err != nil {
+		t.Errorf("Failed to get count from main table: %v", err)
+	}
+	auxCount, err := GetCountFromTestDataTableWithAuxV2(db, true)
+	if err != nil {
+		t.Errorf("Failed to get count from aux table: %v", err)
+	}
+
+	// Check that we have some records remaining
+	if mainCount+auxCount != 25 {
+		t.Errorf("Expected some records to remain after processing, but got 0")
+	}
 }
