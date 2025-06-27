@@ -24,6 +24,16 @@ type TestDataWithAuxV2 struct {
 	Vector    string `relyt:"vector"`
 }
 
+// TestDataWithCopyOnConflict 包含版本字段的测试数据结构
+type TestDataWithCopyOnConflict struct {
+	ID        int    `relyt:"id"`
+	FileID    int    `relyt:"fileid"`
+	RoutingID string `relyt:"routing_id"`
+	Version   int    `relyt:"version"`
+	Ext       string `relyt:"ext"`
+	Vector    string `relyt:"vector"`
+}
+
 func NewProcessorV2(dbconfig DatabaseConfig, fileTimeout int, bufferSize int, tablename ...string) *BulkProcessor {
 	// open a error.log
 	logFile, err := os.OpenFile("/tmp/error.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
@@ -174,12 +184,17 @@ func InitTestDataTableWithAuxV2(db *sql.DB) error {
 	return nil
 }
 
-func InitTestRoutingTable(db *sql.DB) error {
+func InitTestRoutingTable(db *sql.DB, tableName ...string) error {
 	log.Println("Initializing test routing table in PostgreSQL...")
-	query := `
-	INSERT INTO relyt_sys.test_routing_data_v2_relyt_routing (routing_id, store_table_name)
-	VALUES ('100', 'test_routing_data_v2');
-	`
+
+	tablename := "test_routing_data_v2"
+	if len(tableName) > 0 {
+		tablename = tableName[0]
+	}
+	query := fmt.Sprintf(`
+	INSERT INTO relyt_sys.%s_relyt_routing (routing_id, store_table_name)
+	VALUES ('100', '%s');
+	`, tablename, tablename)
 
 	_, err := db.Exec(query)
 	if err != nil {
@@ -250,6 +265,57 @@ func GetCountFromTestDataTableWithoutAux(db *sql.DB) (int, error) {
 	// This function retrieves the count of records in all test tables.
 	log.Println("Counting records in test tables...")
 	table := "test_routing_data_without_aux"
+	query := fmt.Sprintf(`SELECT COUNT(*) FROM %s`, table)
+
+	var count int
+	err := db.QueryRow(query).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count records: %w", err)
+	}
+	return count, nil
+}
+
+func CreateTestDataTaleWithCopyOnConflict(db *sql.DB) error {
+	query := `
+	CREATE TABLE IF NOT EXISTS test_routing_data_copy_on_conflict (
+		id bigint not null,
+		fileid bigint not null,
+		routing_id text not null,
+		version bigint not null,
+		ext text not null,
+		vector vecf16(3) not null,
+		PRIMARY KEY (routing_id, fileid, id)
+	);
+	`
+	_, err := db.Exec(query)
+	if err != nil {
+		return fmt.Errorf("failed to create test table: %w", err)
+	}
+	log.Println("Test table created successfully.")
+	return nil
+
+}
+
+func TruncateTestDataTableWithCopyOnConflict(db *sql.DB) error {
+	log.Println("Truncating test table with copy on conflict in PostgreSQL...")
+	query := `
+	TRUNCATE TABLE test_routing_data_copy_on_conflict;
+	`
+	_, err := db.Exec(query)
+	if err != nil {
+		return fmt.Errorf("failed to truncate test table: %w", err)
+	}
+	log.Println("Test table truncated successfully.")
+	return nil
+}
+
+// GetCountFromTestDataTableWithCopyOnConflict 获取测试表的记录数
+func GetCountFromTestDataTableWithCopyOnConflict(db *sql.DB, auxtable bool) (int, error) {
+	log.Println("Counting records in test tables with copy on conflict...")
+	table := "test_routing_data_copy_on_conflict"
+	if auxtable {
+		table = "test_routing_data_copy_on_conflict_relyt_massive_group"
+	}
 	query := fmt.Sprintf(`SELECT COUNT(*) FROM %s`, table)
 
 	var count int
@@ -1567,16 +1633,23 @@ func TestBufferInsertWithDuplicate(t *testing.T) {
 		}
 	}
 
+	for _, test := range tests {
+		log.Printf("insert batch %d, contains %d records", i/batchSize, len(tests))
+		fileID := test.FileID
+		routingID := test.RoutingID
+		err := processor.InsertV2(fmt.Sprintf("%d", fileID), routingID, []TestDataWithAuxV2{test})
+		if err != nil {
+			t.Errorf("failed to insert data: %v", err)
+		}
+	}
+
 	// Flush all pending data
 	log.Println("Flushing all pending data...")
+	time.Sleep(time.Duration(5) * time.Second)
 	err = processor.Flush()
 	if err != nil {
 		t.Errorf("Failed to flush: %v", err)
 	}
-
-	// Wait for import to complete
-	log.Println("waiting for import to complete...")
-	time.Sleep(time.Duration(5) * time.Second)
 
 	// Check the count of records in the test tables
 	mainCount, err := GetCountFromTestDataTableWithAuxV2(db, false)
@@ -1589,7 +1662,187 @@ func TestBufferInsertWithDuplicate(t *testing.T) {
 	}
 
 	// Check that we have some records remaining
-	if mainCount+auxCount != 25 {
-		t.Errorf("Expected some records to remain after processing, but got 0")
+	if mainCount+auxCount != 26 {
+		t.Errorf("Expected 26 records, got %d", mainCount+auxCount)
 	}
+
+	// Check that the records are correct
+	searchOptions := &SearchOptions{
+		Columns:   []string{"fileid", "routing_id"},
+		Condition: "id in (1001, 1025)",
+		OrderBy:   "id ASC",
+	}
+	results, err := processor.SearchV2(searchOptions)
+	if err != nil {
+		t.Errorf("failed to search data: %v", err)
+	}
+
+	row0Str := fmt.Sprintf("%v", results.Rows[0])
+	row1Str := fmt.Sprintf("%v", results.Rows[1])
+	expectedRow0Str := "[120 120]"
+	expectedRow1Str := "[170 170]"
+
+	if row0Str != expectedRow0Str {
+		t.Errorf("expected results: %v, got: %v", expectedRow0Str, row0Str)
+	}
+
+	if row1Str != expectedRow1Str {
+		t.Errorf("expected results: %v, got: %v", expectedRow1Str, row1Str)
+	}
+
+	log.Printf("results: %v", results)
+}
+
+func TestBufferInsertWithCopyOnConflict(t *testing.T) {
+	// Initialize database connection
+	dbConfig := InitDatabaseConfig("127.0.0.1", 7000, "postgres", "", "postgres")
+	db, err := SetupDataBase(dbConfig)
+	if err != nil {
+		log.Fatalf("failed to setup database: %v", err)
+	} else {
+		err := CreateTestDataTaleWithCopyOnConflict(db)
+		if err != nil {
+			log.Fatalf("failed to create test table: %v", err)
+			return
+		}
+		err = TruncateTestDataTableWithCopyOnConflict(db)
+		if err != nil {
+			log.Fatalf("failed to truncate test table: %v", err)
+			return
+		}
+
+		err = ClearRelytCheckpointTable(db)
+		if err != nil {
+			log.Fatalf("failed to clear relyt_checkpoint table: %v", err)
+			return
+		}
+	}
+	defer db.Close()
+
+	fileTimeout := 3 // set file write timeout to 3 seconds
+	processor := NewProcessorV2(dbConfig, fileTimeout, 0, "test_routing_data_copy_on_conflict")
+	defer processor.Shutdown()
+
+	filePath := "../examples/data/test_copy_on_conflict.csv"
+
+	batchSize := 1
+	var tests []TestDataWithCopyOnConflict
+
+	csvFile, err := os.Open(filePath)
+	if err != nil {
+		log.Fatalf("failed to open csv file: %v", err)
+	}
+	defer csvFile.Close()
+
+	csvReader := csv.NewReader(csvFile)
+	csvReader.FieldsPerRecord = -1
+	csvReader.Comma = '\t'
+	csvReader.ReuseRecord = true
+
+	i := 0
+	for {
+		record, err := csvReader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Errorf("failed to read csv file: %v", err)
+		}
+
+		if len(record) < 6 {
+			t.Errorf("record does not contain enough fields: %v", record)
+			continue
+		}
+
+		id, err := strconv.Atoi(record[0])
+		if err != nil {
+			t.Errorf("failed to parse id: %v", err)
+		}
+		fileID, err := strconv.Atoi(record[1])
+		if err != nil {
+			t.Errorf("failed to parse file_id: %v", err)
+		}
+		routingID := record[2]
+		version, err := strconv.Atoi(record[3])
+		if err != nil {
+			t.Errorf("failed to parse version: %v", err)
+		}
+		ext := record[4]
+		vector := record[5]
+
+		tests = append(tests, TestDataWithCopyOnConflict{
+			ID:        id,
+			FileID:    fileID,
+			RoutingID: routingID,
+			Version:   version,
+			Ext:       ext,
+			Vector:    vector,
+		})
+		i++
+
+		// insert batch
+		if i%batchSize == 0 {
+			err := processor.InsertV2(fmt.Sprintf("%d", fileID), routingID, tests)
+			if err != nil {
+				t.Errorf("failed to insert data: %v", err)
+			}
+			tests = nil // clear the list, prepare for the next batch
+		}
+	}
+
+	for _, test := range tests {
+		fileID := test.FileID
+		routingID := test.RoutingID
+		err := processor.InsertV2(fmt.Sprintf("%d", fileID), routingID, []TestDataWithCopyOnConflict{test})
+		if err != nil {
+			t.Errorf("failed to insert data: %v", err)
+		}
+	}
+
+	// Flush all pending data
+	log.Println("Flushing all pending data...")
+	time.Sleep(time.Duration(5) * time.Second)
+	err = processor.Flush()
+	if err != nil {
+		t.Errorf("Failed to flush: %v", err)
+	}
+
+	// Check the count of records in the test tables
+	count, err := GetCountFromTestDataTableWithCopyOnConflict(db, false)
+	if err != nil {
+		t.Errorf("Failed to get count from main table: %v", err)
+	}
+	if count != 11 {
+		t.Errorf("Expected 11 records, got %d", count)
+	}
+
+	processor.DeleteSyncV2(fmt.Sprintf("%d", 110), "110")
+
+	// Check the count of records in the test tables
+	count, err = GetCountFromTestDataTableWithCopyOnConflict(db, false)
+	if err != nil {
+		t.Errorf("Failed to get count from main table: %v", err)
+	}
+	if count != 9 {
+		t.Errorf("Expected 9 records, got %d", count)
+	}
+
+	// Check that the records are correct
+	searchOptions := &SearchOptions{
+		Columns:   []string{"fileid", "routing_id", "ext"},
+		Condition: "id = 1009",
+	}
+	results, err := processor.SearchV2(searchOptions)
+	if err != nil {
+		t.Errorf("failed to search data: %v", err)
+	}
+
+	row0Str := fmt.Sprintf("%v", results.Rows[0])
+	expectedRow0Str := "[120 120 ext_1005_120_120_v2_duplicate5]"
+
+	if row0Str != expectedRow0Str {
+		t.Errorf("expected results: %v, got: %v", expectedRow0Str, row0Str)
+	}
+
+	log.Printf("results: %v", results)
 }

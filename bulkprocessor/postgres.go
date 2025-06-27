@@ -792,18 +792,27 @@ func (c *PostgreSQLClient) GetColumnsWithCondition(ctx context.Context, args ...
 }
 
 // CopyFromFileInTransaction copies data from a local file to a PostgreSQL table within a transaction
-func (c *PostgreSQLClient) CopyFromFileInTransaction(ctx context.Context, tx pgx.Tx, filePath, targetTable string, columnNames []string) error {
+func (c *PostgreSQLClient) CopyFromFileInTransaction(ctx context.Context, tx pgx.Tx, filePath, targetTable string, columnNames []string, updateOnConflict bool) error {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to open file %s: %w", filePath, err)
 	}
 	defer file.Close()
 
+	conflictClause := ""
+
+	if updateOnConflict {
+		conflictClause = "DO ON CONFLICT DO UPDATE"
+	} else {
+		conflictClause = "DO ON CONFLICT DO NOTHING"
+	}
+
 	copyCommand := fmt.Sprintf(
-		"COPY %s.%s (%s) FROM STDIN WITH (FORMAT csv, HEADER false, NULL 'null')",
+		"COPY %s.%s (%s) FROM STDIN WITH (FORMAT csv, HEADER false, NULL 'null') %s",
 		c.config.Schema,
 		targetTable,
 		strings.Join(columnNames, ", "),
+		conflictClause,
 	)
 
 	if _, err := tx.Conn().PgConn().CopyFrom(ctx, file, copyCommand); err != nil {

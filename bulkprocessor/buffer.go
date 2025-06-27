@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -39,8 +40,9 @@ type Record struct {
 	Tag       RecordTag
 	FileID    string
 	RoutingID string
+	PKValues  []string
+	Version   string
 	Values    []string
-	Timestamp time.Time
 	Offset    int64 // Kafka offset for this record
 }
 
@@ -74,6 +76,13 @@ func NewBufferManager() *BufferManager {
 	}
 }
 
+func (bm *BufferManager) GetCSVDir(localFilePrefix string) string {
+	relytName := "relyt_data"
+	datePath := time.Now().Format("2006-01-02")
+	fullPath := filepath.Join(localFilePrefix, relytName, datePath)
+	return fullPath
+}
+
 // NewBuffer 创建新的缓冲区
 func (bm *BufferManager) NewBuffer(localFilePrefix string, maxRecords int, isAux bool) *Buffer {
 	id := uuid.New().String()[:8]
@@ -83,10 +92,8 @@ func (bm *BufferManager) NewBuffer(localFilePrefix string, maxRecords int, isAux
 		filename = fmt.Sprintf("%s_%s.csv", BufferPrefixAux, id)
 	}
 
-	// 添加日期路径
-	relytName := "relyt_data"
-	datePath := time.Now().Format("2006-01-02")
-	fullPath := filepath.Join(localFilePrefix, relytName, datePath, filename)
+	dir := bm.GetCSVDir(localFilePrefix)
+	fullPath := filepath.Join(dir, filename)
 	buffer := &Buffer{
 		ID:            id,
 		Records:       make([]*Record, 0),
@@ -104,7 +111,7 @@ func (bm *BufferManager) NewBuffer(localFilePrefix string, maxRecords int, isAux
 }
 
 func (bm *BufferManager) RecycleBuffers() []string {
-	allBuffers := bm.GetBufferByStatus(BufferStatusImported)
+	allBuffers := bm.GetBufferByStatus(BufferStatusImported, BufferStatusImportError)
 
 	bm.mutex.Lock()
 	defer bm.mutex.Unlock()
@@ -267,6 +274,14 @@ type RecordIndex struct {
 	routingID string
 }
 
+type PrimaryKey struct {
+	PKValues []string
+}
+
+func (pk *PrimaryKey) toString() string {
+	return strings.Join(pk.PKValues, "-")
+}
+
 func (b *Buffer) DeduplicateRecords() []RecordIndex {
 	b.BufferMutex.Lock()
 	defer b.BufferMutex.Unlock()
@@ -277,6 +292,9 @@ func (b *Buffer) DeduplicateRecords() []RecordIndex {
 
 	// records the delete records
 	deleteMap := make(map[RecordIndex]bool)
+	//hash<routingID-fileID, version>
+	versionMap := make(map[RecordIndex]string)
+	primarySet := make(map[string]struct{})
 	// records the records to keep
 	keepMap := make(map[int]bool)
 
@@ -295,7 +313,34 @@ func (b *Buffer) DeduplicateRecords() []RecordIndex {
 			if deleteMap[key] {
 				keepMap[i] = false
 			} else {
-				keepMap[i] = true
+				pk := PrimaryKey{
+					PKValues: record.PKValues,
+				}
+
+				// save the latest version for the insert record
+				if version, exists := versionMap[key]; exists {
+					if record.Version == version {
+						// if the insert record has the same version then check the primary key
+						if len(record.PKValues) > 0 {
+							// if the primary key is already in the set, mark it as delete
+							if _, exists := primarySet[pk.toString()]; exists {
+								keepMap[i] = false
+							} else {
+								primarySet[pk.toString()] = struct{}{}
+								keepMap[i] = true
+							}
+						}
+					} else if record.Version < version {
+						keepMap[i] = false
+					} else {
+						//InsertThreadV2 have filter the records which have the smaller version
+						log.Printf("NOTICE: The record versions in the buffer are in descending order")
+					}
+				} else {
+					versionMap[key] = record.Version
+					primarySet[pk.toString()] = struct{}{}
+					keepMap[i] = true
+				}
 			}
 		} else {
 			keepMap[i] = true

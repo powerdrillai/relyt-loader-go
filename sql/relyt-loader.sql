@@ -35,7 +35,7 @@ AS $$
         10 AS import_error_sleep_time,
         'true'::BOOLEAN AS enable_dual_buffer,
         5000 AS buffer_max_records,
-        'true'::BOOLEAN AS use_insert_on_conflict
+        'false'::BOOLEAN AS use_insert_on_conflict
     ;
 $$;
 

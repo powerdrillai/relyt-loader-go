@@ -110,7 +110,7 @@ func (c *Config) Validate() error {
 	}
 
 	if !c.UseInsertOnConflict {
-		c.UseInsertOnConflict = true
+		c.UseInsertOnConflict = false
 	}
 
 	return nil
