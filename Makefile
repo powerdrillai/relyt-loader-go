@@ -19,7 +19,8 @@ testv2:
 	go test -v ./bulkprocessor -run TestBufferInsertWithMigration
 	go test -v ./bulkprocessor -run TestBufferInsertWithMixedOperations
 	go test -v ./bulkprocessor -run TestBufferInsertWithOffset
-
+	go test -v ./bulkprocessor -run TestBufferDeleteSync
+	go test -v ./bulkprocessor -run TestBufferInsertWithDuplicate
 testselect:
 	go test -v ./bulkprocessor -run TestSearchBasic
 	go test -v ./bulkprocessor -run TestSearchAdditional

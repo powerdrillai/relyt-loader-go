@@ -56,6 +56,9 @@ type BulkProcessor struct {
 	lastFlushTime       time.Time
 	hasRoutingTable     bool
 	routingColIndex     int
+	versionColIndex     int
+	pkColumns           []string
+	pkColumnsIndex      []int
 	routingMutex        sync.RWMutex
 	routingHashSet      map[string]struct{}
 
@@ -154,6 +157,12 @@ func New(config Config) (*BulkProcessor, error) {
 		}
 	}
 
+	pkColumns, err := pgClient.GetTablePrimaryKeys(ctx)
+	if err != nil {
+		pgClient.Close()
+		return nil, errors.Wrap(err, "failed to get primary keys")
+	}
+
 	var bufferManager *BufferManager
 	if config.EnableDualBuffer {
 		bufferManager = NewBufferManager()
@@ -179,7 +188,10 @@ func New(config Config) (*BulkProcessor, error) {
 		lastFlushTime:     time.Now(),
 		hasRoutingTable:   hasRoutingTable,
 		routingColIndex:   -1,
+		versionColIndex:   -1,
 		routingHashSet:    routingHashSet,
+		pkColumns:         pkColumns,
+		pkColumnsIndex:    nil,
 		bufferManager:     bufferManager,
 		bufferTaskQueue:   make(chan *BufferTask, 100),
 		bufferThreadWg:    sync.WaitGroup{},
@@ -303,7 +315,7 @@ func (p *BulkProcessor) Shutdown() error {
 	var s3Keys []string
 	var normalFilepaths []string
 	for _, file := range allFiles {
-		if file.S3Key != "" && file.State != FileStateError {
+		if file.S3Key != "" && file.State != FileStateError && false {
 			s3Keys = append(s3Keys, file.S3Key)
 			normalFilepaths = append(normalFilepaths, file.S3Key)
 		}
@@ -319,15 +331,8 @@ func (p *BulkProcessor) Shutdown() error {
 	}
 
 	// Cleanup buffer files
-	allBuffers := p.bufferManager.GetAllBuffers()
-	for _, buffer := range allBuffers {
-		if buffer.LocalFile != "" {
-			if err := CleanupLocalFile(buffer.LocalFile); err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to cleanup local file: %v\n", err)
-			}
-			normalFilepaths = append(normalFilepaths, buffer.LocalFile)
-		}
-	}
+	normalFilepaths = append(normalFilepaths, p.bufferManager.RecycleBuffers()...)
+
 	// Cleanup checkpoint records
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	if err := p.pgClient.DeleteDeltaCheckpointByProcessIdAndFilepaths(ctx, p.processId, normalFilepaths); err != nil {
@@ -636,7 +641,7 @@ func (p *BulkProcessor) Flush() error {
 		time.Sleep(time.Duration(1) * time.Second)
 	}
 
-	bufferIds := []string{}
+	needFlushBufferIds := []string{}
 
 	// flush buffer
 	if p.config.EnableDualBuffer {
@@ -644,7 +649,6 @@ func (p *BulkProcessor) Flush() error {
 			p.bufferManager.bufferOperationsMutex.Lock()
 			currentBuffer := p.bufferManager.GetCurrentBuffer(isAux)
 			if currentBuffer != nil && currentBuffer.GetRecordCount() > 0 && p.bufferManager.IsActive(currentBuffer.ID) {
-				bufferIds = append(bufferIds, currentBuffer.ID)
 				log.Printf("Force flushing current buffer: %s (records: %d)",
 					currentBuffer.ID, currentBuffer.GetRecordCount())
 
@@ -679,6 +683,11 @@ func (p *BulkProcessor) Flush() error {
 			} else {
 				p.bufferManager.bufferOperationsMutex.Unlock()
 			}
+		}
+
+		buffers := p.bufferManager.GetBufferByStatus(BufferStatusFlushed, BufferStatusFrozen)
+		for _, buffer := range buffers {
+			needFlushBufferIds = append(needFlushBufferIds, buffer.ID)
 		}
 	}
 
@@ -736,7 +745,7 @@ func (p *BulkProcessor) Flush() error {
 	p.fileManager.fileOperationsMutex.Unlock()
 
 	// if no directory send to import, return ASAP
-	if !sendDirectory && len(bufferIds) == 0 {
+	if !sendDirectory && len(needFlushBufferIds) == 0 {
 		log.Printf("flush without any data")
 		return nil
 	}
@@ -768,7 +777,7 @@ func (p *BulkProcessor) Flush() error {
 		flushingBuffers := []*Buffer{}
 		errorBuffers := []*Buffer{}
 
-		for _, bufferId := range bufferIds {
+		for _, bufferId := range needFlushBufferIds {
 			buffer := p.bufferManager.GetBufferByID(bufferId)
 			if buffer != nil {
 				if buffer.status == BufferStatusFlushError || buffer.status == BufferStatusImportError {
@@ -1030,6 +1039,22 @@ func (p *BulkProcessor) BGWorkerThread() {
 		}
 		cancel()
 
+		// check the files in the fullPath directory
+		dirPath := p.bufferManager.GetCSVDir(p.config.LocalFilePrefix)
+		files, err := os.ReadDir(dirPath)
+		if err != nil {
+			log.Printf("Failed to read directory: %v", err)
+			time.Sleep(1 * time.Second)
+		} else {
+			log.Printf("BGWORKER: Found %d files in %s", len(files), dirPath)
+		}
+
+		if len(files) > 0 {
+			log.Printf("BGWORKER: Found %d files in %s", len(files), dirPath)
+		} else {
+			log.Printf("BGWORKER: No files found in %s", dirPath)
+		}
+
 		time.Sleep(time.Duration(p.config.BGWorkerInterval) * time.Second)
 	}
 }
@@ -1215,6 +1240,22 @@ func (p *BulkProcessor) InsertV2(fileID, routingID string, records interface{}, 
 
 		p.structType = elemType
 		p.fields = fields
+
+		if p.routingColIndex < 0 {
+			p.routingColIndex = GetColumnIndex(p.fields, "routing_id")
+		}
+
+		if p.versionColIndex < 0 {
+			p.versionColIndex = GetColumnIndex(p.fields, "version")
+		}
+
+		if p.pkColumnsIndex == nil {
+			p.pkColumnsIndex = make([]int, len(p.pkColumns))
+			for i, columnName := range p.pkColumns {
+				p.pkColumnsIndex[i] = GetColumnIndex(p.fields, columnName)
+			}
+			log.Printf("pkColumnsIndex: %v", p.pkColumnsIndex)
+		}
 	}
 
 	// Get offset value, default to 0 if not provided
@@ -1241,10 +1282,6 @@ func (p *BulkProcessor) InsertV2(fileID, routingID string, records interface{}, 
 
 		if p.feedFieldIndex < 0 {
 			p.feedFieldIndex = GetColumnIndex(p.fields, p.config.FeedbackColumn)
-		}
-
-		if p.routingColIndex < 0 {
-			p.routingColIndex = GetColumnIndex(p.fields, "routing_id")
 		}
 
 		// create record and write to queue
@@ -1330,6 +1367,7 @@ func (p *BulkProcessor) InsertThreadV2() {
 
 	var localRoutingInited = false
 	var localRoutingHashSet map[string]struct{}
+	versionMap := make(map[RecordIndex]string)
 
 	for {
 		select {
@@ -1344,6 +1382,25 @@ func (p *BulkProcessor) InsertThreadV2() {
 		case record := <-p.recordQueueV2:
 			values := record.Values
 			operation := record.Tag
+
+			recordIndex := RecordIndex{
+				fileID:    record.FileID,
+				routingID: record.RoutingID,
+			}
+
+			// check version
+			if p.versionColIndex >= 0 && operation == OperationInsert {
+				record.Version = values[p.versionColIndex]
+
+				if version, exsit := versionMap[recordIndex]; exsit && version > record.Version {
+					log.Printf("The record fileID: %s, routingID: %s versions is %s, outdated, skip it",
+						recordIndex.fileID, recordIndex.routingID, version)
+					atomic.AddInt32(&p.recordsNum, -1)
+					continue
+				}
+				versionMap[recordIndex] = record.Version
+			}
+
 			if p.feedFieldIndex >= 0 && operation == OperationInsert {
 				index := p.feedFieldIndex
 				p.feedbackKeysMutex.Lock()
@@ -1356,6 +1413,13 @@ func (p *BulkProcessor) InsertThreadV2() {
 					log.Printf("Feedback key already exists: %s", values[index])
 				}
 				p.feedbackKeysMutex.Unlock()
+			}
+
+			if p.pkColumnsIndex != nil && operation == OperationInsert {
+				record.PKValues = make([]string, len(p.pkColumnsIndex))
+				for i, index := range p.pkColumnsIndex {
+					record.PKValues[i] = values[index]
+				}
 			}
 
 			toAuxFile := false
@@ -1389,7 +1453,7 @@ func (p *BulkProcessor) InsertThreadV2() {
 				pgTable := fmt.Sprintf("%s.%s", p.config.PostgreSQL.Schema, targetTable)
 
 				if err := p.pgClient.InsertDeltaCheckpoint(ctx, p.processId, pgTable, currentBuffer.LocalFilePath); err != nil {
-					fmt.Fprintf(os.Stderr, "Failed to insert delta checkpoint with new file: %v\n", err)
+					fmt.Fprintf(os.Stderr, "Failed to insert delta checkpoint with new file: %s, %v\n", currentBuffer.LocalFilePath, err)
 				}
 			}
 
@@ -1403,6 +1467,8 @@ func (p *BulkProcessor) InsertThreadV2() {
 				p.bufferManager.SetBufferStatus(currentBuffer.ID, BufferStatusFrozen)
 				p.bufferManager.SetCurrentBuffer(nil, toAuxFile)
 				p.bufferManager.bufferOperationsMutex.Unlock()
+
+				versionMap = make(map[RecordIndex]string)
 
 				// deduplicate records
 				deletedRecords := currentBuffer.DeduplicateRecords()
@@ -1421,6 +1487,7 @@ func (p *BulkProcessor) InsertThreadV2() {
 						} else {
 							log.Printf("WriteToLocalFile: %s failed with no callback: %s", currentBuffer.ID, feedbackKeysString)
 						}
+						atomic.AddInt32(&p.recordsNum, -1)
 						continue
 					}
 				}
@@ -1463,6 +1530,7 @@ func (p *BulkProcessor) ImporterThreadV2() {
 			for i := 0; i < maxLoopNum; i++ {
 				if err := p.processBufferTaskWithTransaction(task); err != nil {
 					log.Printf("Failed to process buffer task %s: %v", task.TaskId, err)
+
 					// Update checkpoint with all error file
 					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 					if err2 := p.pgClient.UpdateDeltaCheckpointStatus(ctx, p.processId, []string{task.LocalFile}, CheckpointStatusFailed, -1, err.Error()); err2 != nil {
@@ -1498,7 +1566,6 @@ func (p *BulkProcessor) ImporterThreadV2() {
 
 			if isFailed {
 				p.bufferManager.SetBufferStatus(task.TaskId, BufferStatusImportError)
-
 				feedbackKeysString := fmt.Sprintf("failed %s is [%s].", p.config.FeedbackColumn, strings.Join(feedbackKeysArray, ","))
 				log.Printf("Import batch directory timeout: %s", feedbackKeysString)
 				if p.config.ImportErrorCallback != nil {
@@ -1591,21 +1658,14 @@ func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask) error
 			targetTable += auxTableSuffix
 		}
 
-		file, err := os.Open(task.LocalFile)
-		if err != nil {
-			return fmt.Errorf("failed to open file %s: %w", task.LocalFile, err)
-		}
-		defer file.Close()
-
-		copyCommand := fmt.Sprintf(
-			"COPY %s.%s (%s) FROM STDIN WITH (FORMAT csv, HEADER false)",
-			p.config.PostgreSQL.Schema,
-			targetTable,
-			strings.Join(GetColumnNames(p.fields), ", "),
-		)
-
-		if _, err := tx.Conn().PgConn().CopyFrom(ctx, file, copyCommand); err != nil {
-			return fmt.Errorf("COPY failed: %w", err)
+		if p.config.UseInsertOnConflict {
+			if err := p.pgClient.InsertIntoOnConflictFromFile(ctx, tx, task.LocalFile, targetTable, GetColumnNames(p.fields), p.config.UpdateOnConflict); err != nil {
+				return fmt.Errorf("Insert into on conflict from file failed: %w", err)
+			}
+		} else {
+			if err := p.pgClient.CopyFromFileInTransaction(ctx, tx, task.LocalFile, targetTable, GetColumnNames(p.fields), p.config.UpdateOnConflict); err != nil {
+				return fmt.Errorf("COPY failed: %w", err)
+			}
 		}
 	}
 
