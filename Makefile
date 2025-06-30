@@ -21,6 +21,7 @@ testv2:
 	go test -v ./bulkprocessor -run TestBufferInsertWithOffset
 	go test -v ./bulkprocessor -run TestBufferDeleteSync
 	go test -v ./bulkprocessor -run TestBufferInsertWithDuplicate
+	go test -v ./bulkprocessor -run TestBufferInsertWithCopyOnConflict
 testselect:
 	go test -v ./bulkprocessor -run TestSearchBasic
 	go test -v ./bulkprocessor -run TestSearchAdditional

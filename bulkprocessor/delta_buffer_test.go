@@ -1623,14 +1623,12 @@ func TestBufferInsertWithDuplicate(t *testing.T) {
 		i++
 
 		// insert batch
-		if i%batchSize == 0 {
-			log.Printf("insert batch %d, contains %d records", i/batchSize, len(tests))
-			err := processor.InsertV2(fmt.Sprintf("%d", fileID), routingID, tests)
-			if err != nil {
-				t.Errorf("failed to insert data: %v", err)
-			}
-			tests = nil // clear the list, prepare for the next batch
+		err = processor.InsertV2(fmt.Sprintf("%d", fileID), routingID, tests)
+		if err != nil {
+			t.Errorf("failed to insert data: %v", err)
 		}
+		tests = nil // clear the list, prepare for the next batch
+
 	}
 
 	for _, test := range tests {
@@ -1669,7 +1667,7 @@ func TestBufferInsertWithDuplicate(t *testing.T) {
 	// Check that the records are correct
 	searchOptions := &SearchOptions{
 		Columns:   []string{"fileid", "routing_id"},
-		Condition: "id in (1001, 1025)",
+		Condition: "id in (1001, 1006)",
 		OrderBy:   "id ASC",
 	}
 	results, err := processor.SearchV2(searchOptions)
@@ -1679,8 +1677,8 @@ func TestBufferInsertWithDuplicate(t *testing.T) {
 
 	row0Str := fmt.Sprintf("%v", results.Rows[0])
 	row1Str := fmt.Sprintf("%v", results.Rows[1])
-	expectedRow0Str := "[120 120]"
-	expectedRow1Str := "[170 170]"
+	expectedRow0Str := "[100 100]"
+	expectedRow1Str := "[120 120]"
 
 	if row0Str != expectedRow0Str {
 		t.Errorf("expected results: %v, got: %v", expectedRow0Str, row0Str)
