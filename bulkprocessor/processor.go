@@ -1761,8 +1761,9 @@ func processSQLParams(input string, args []interface{}) string {
 	return processed
 }
 
-// SearchV2 search data from main table and aux table
-func (p *BulkProcessor) SearchV2(options *SearchOptions, args ...interface{}) (*SearchResult, error) {
+// SearchJsonRowsV2 return pgx.Rows object, let caller control the iteration
+// caller need to call rows.Next() and rows.Scan()
+func (p *BulkProcessor) SearchJsonRowsV2(options *SearchOptions, args ...interface{}) (pgx.Rows, error) {
 	p.mutex.RLock()
 	if p.isShutdown {
 		p.mutex.RUnlock()
@@ -1802,6 +1803,17 @@ func (p *BulkProcessor) SearchV2(options *SearchOptions, args ...interface{}) (*
 	rows, err := p.pgClient.GetColumnsWithCondition(p.ctx, params...)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to get columns with condition")
+	}
+
+	return rows, nil
+}
+
+// SearchV2 search data from main table and aux table
+func (p *BulkProcessor) SearchV2(options *SearchOptions, args ...interface{}) (*SearchResult, error) {
+	// 复用SearchJsonRowsV2的逻辑获取rows
+	rows, err := p.SearchJsonRowsV2(options, args...)
+	if err != nil {
+		return nil, err
 	}
 	defer rows.Close()
 
@@ -1873,49 +1885,12 @@ func (p *BulkProcessor) SearchV2(options *SearchOptions, args ...interface{}) (*
 }
 
 func (p *BulkProcessor) SearchJsonV2(options *SearchOptions, args ...interface{}) ([]json.RawMessage, error) {
-	p.mutex.RLock()
-	if p.isShutdown {
-		p.mutex.RUnlock()
-		return nil, ErrProcessorClosed
-	}
-	p.mutex.RUnlock()
-
-	// process column names
-	processedColumns := make([]string, len(options.Columns))
-	for i, col := range options.Columns {
-		processedColumns[i] = processSQLParams(col, args)
-	}
-
-	// process condition params
-	processedCondition := processSQLParams(options.Condition, args)
-
-	// process GroupBy params
-	processedGroupBy := processSQLParams(options.GroupBy, args)
-	processedHaving := processSQLParams(options.Having, args)
-
-	// prepare params
-	params := []interface{}{
-		p.config.PostgreSQL.Schema,
-		p.config.PostgreSQL.Table,
-		pq.Array(processedColumns),
-		processedCondition,
-		options.OrderBy,
-		processedGroupBy,
-		processedHaving,
-		options.Limit,
-		options.Offset,
-		p.hasRoutingTable,
-	}
-
-	// log.Printf("baseSQL: select * from get_columns_with_condition('%v', '%v', '%v', '%v', '%v', '%v', '%v', '%v', '%v', %t)", params...)
-
-	rows, err := p.pgClient.GetColumnsWithCondition(p.ctx, params...)
+	rows, err := p.SearchJsonRowsV2(options, args...)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to get columns with condition")
+		return nil, err
 	}
 	defer rows.Close()
 
-	// 构建JSON结果数组
 	var jsonResults []json.RawMessage
 
 	for rows.Next() {
@@ -1924,7 +1899,6 @@ func (p *BulkProcessor) SearchJsonV2(options *SearchOptions, args ...interface{}
 			return nil, errors.Wrap(err, "rows.Scan")
 		}
 
-		// 直接使用数据库返回的JSON数据
 		jsonResults = append(jsonResults, resultJSON)
 	}
 
@@ -1932,57 +1906,5 @@ func (p *BulkProcessor) SearchJsonV2(options *SearchOptions, args ...interface{}
 		return nil, errors.Wrap(err, "rows iteration")
 	}
 
-	// 如果没有数据，返回空数组
-	if len(jsonResults) == 0 {
-		return []json.RawMessage{}, nil
-	}
-
 	return jsonResults, nil
-}
-
-// SearchJsonRowsV2 return pgx.Rows object, let caller control the iteration
-// caller need to call rows.Next() and rows.Scan()
-func (p *BulkProcessor) SearchJsonRowsV2(options *SearchOptions, args ...interface{}) (pgx.Rows, error) {
-	p.mutex.RLock()
-	if p.isShutdown {
-		p.mutex.RUnlock()
-		return nil, ErrProcessorClosed
-	}
-	p.mutex.RUnlock()
-
-	// process column names
-	processedColumns := make([]string, len(options.Columns))
-	for i, col := range options.Columns {
-		processedColumns[i] = processSQLParams(col, args)
-	}
-
-	// process condition params
-	processedCondition := processSQLParams(options.Condition, args)
-
-	// process GroupBy params
-	processedGroupBy := processSQLParams(options.GroupBy, args)
-	processedHaving := processSQLParams(options.Having, args)
-
-	// prepare params
-	params := []interface{}{
-		p.config.PostgreSQL.Schema,
-		p.config.PostgreSQL.Table,
-		pq.Array(processedColumns),
-		processedCondition,
-		options.OrderBy,
-		processedGroupBy,
-		processedHaving,
-		options.Limit,
-		options.Offset,
-		p.hasRoutingTable,
-	}
-
-	// log.Printf("baseSQL: select * from get_columns_with_condition('%v', '%v', '%v', '%v', '%v', '%v', '%v', '%v', '%v', %t)", params...)
-
-	rows, err := p.pgClient.GetColumnsWithCondition(p.ctx, params...)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get columns with condition")
-	}
-
-	return rows, nil
 }

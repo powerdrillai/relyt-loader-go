@@ -18,14 +18,14 @@ type S3Config struct {
 
 // PostgreSQLConfig represents the configuration for PostgreSQL
 type PostgreSQLConfig struct {
-	Host     string // PostgreSQL host
-	Port     int    // PostgreSQL port
-	Username string // PostgreSQL username
-	Password string // PostgreSQL password
-	Database string // PostgreSQL database name
-	Table    string // Target table name
-	Schema   string // Schema name (default: public)
-	MaxConns int    // Maximum number of connections to the database
+	Host        string // PostgreSQL host
+	Port        int    // PostgreSQL port
+	Username    string // PostgreSQL username
+	Password    string // PostgreSQL password
+	Database    string // PostgreSQL database name
+	Table       string // Target table name
+	Schema      string // Schema name (default: public)
+	MaxPoolSize int    // Maximum number of connections to the database, default: 3
 }
 
 // Config represents the configuration for the bulk processor
@@ -49,7 +49,7 @@ type Config struct {
 	UseInsertOnConflict  bool   // use insert on conflict, default: true
 	InsertIntoBatchSize  int    // insert into batch size, default: 100
 	LocalFilePrefix      string // local file prefix, default: "/tmp"
-	MaxConcurrentWorkers int    // 最大并行worker数量，默认: 4
+	MaxConcurrentWorkers int    // max concurrent workers, default: 1
 }
 
 // Validate validates the configuration
@@ -72,8 +72,8 @@ func (c *Config) Validate() error {
 	if c.PostgreSQL.Schema == "" {
 		c.PostgreSQL.Schema = "public" // Default schema
 	}
-	if c.PostgreSQL.MaxConns <= 0 {
-		c.PostgreSQL.MaxConns = 10 // Default max connections to the database
+	if c.PostgreSQL.MaxPoolSize <= 0 {
+		c.PostgreSQL.MaxPoolSize = 3 // Default max connections to the database
 	}
 	if c.BatchSize <= 0 {
 		c.BatchSize = 10000 // Default batch size
@@ -124,7 +124,7 @@ func (c *Config) Validate() error {
 	}
 
 	if c.MaxConcurrentWorkers <= 0 {
-		c.MaxConcurrentWorkers = 10 // 默认10个并行worker
+		c.MaxConcurrentWorkers = 1
 	}
 
 	return nil

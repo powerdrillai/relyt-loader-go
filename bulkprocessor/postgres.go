@@ -64,7 +64,7 @@ func NewPostgreSQLClient(config PostgreSQLConfig) (*PostgreSQLClient, error) {
 		config.Host,
 		config.Port,
 		config.Database,
-		config.MaxConns,
+		config.MaxPoolSize,
 	)
 
 	// Add SSL mode=disable if needed
