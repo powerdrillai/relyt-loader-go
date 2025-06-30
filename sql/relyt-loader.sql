@@ -13,7 +13,9 @@ CREATE TYPE loader_s3_config AS (
     import_error_sleep_time INT,
     enable_dual_buffer BOOLEAN,
     buffer_max_records INT,
-    use_insert_on_conflict BOOLEAN
+    use_insert_on_conflict BOOLEAN,
+    max_concurrent_workers INT,
+    insert_into_batch_size INT
 );
 
 -- create the LOADER_CONFIG function, return the s3 config info
@@ -35,7 +37,9 @@ AS $$
         10 AS import_error_sleep_time,
         'true'::BOOLEAN AS enable_dual_buffer,
         5000 AS buffer_max_records,
-        'false'::BOOLEAN AS use_insert_on_conflict
+        'false'::BOOLEAN AS use_insert_on_conflict,
+        1 AS max_concurrent_workers,
+        100 AS insert_into_batch_size
     ;
 $$;
 

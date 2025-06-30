@@ -18,13 +18,14 @@ type S3Config struct {
 
 // PostgreSQLConfig represents the configuration for PostgreSQL
 type PostgreSQLConfig struct {
-	Host     string // PostgreSQL host
-	Port     int    // PostgreSQL port
-	Username string // PostgreSQL username
-	Password string // PostgreSQL password
-	Database string // PostgreSQL database name
-	Table    string // Target table name
-	Schema   string // Schema name (default: public)
+	Host        string // PostgreSQL host
+	Port        int    // PostgreSQL port
+	Username    string // PostgreSQL username
+	Password    string // PostgreSQL password
+	Database    string // PostgreSQL database name
+	Table       string // Target table name
+	Schema      string // Schema name (default: public)
+	MaxPoolSize int    // Maximum number of connections to the database, default: 3
 }
 
 // Config represents the configuration for the bulk processor
@@ -46,7 +47,9 @@ type Config struct {
 	EnableDualBuffer     bool   // enable dual buffer, default: true
 	BufferMaxRecords     int    // buffer max records, default: 1000
 	UseInsertOnConflict  bool   // use insert on conflict, default: true
+	InsertIntoBatchSize  int    // insert into batch size, default: 100
 	LocalFilePrefix      string // local file prefix, default: "/tmp"
+	MaxConcurrentWorkers int    // max concurrent workers, default: 1
 }
 
 // Validate validates the configuration
@@ -68,6 +71,9 @@ func (c *Config) Validate() error {
 	}
 	if c.PostgreSQL.Schema == "" {
 		c.PostgreSQL.Schema = "public" // Default schema
+	}
+	if c.PostgreSQL.MaxPoolSize <= 0 {
+		c.PostgreSQL.MaxPoolSize = 3 // Default max connections to the database
 	}
 	if c.BatchSize <= 0 {
 		c.BatchSize = 10000 // Default batch size
@@ -111,6 +117,14 @@ func (c *Config) Validate() error {
 
 	if !c.UseInsertOnConflict {
 		c.UseInsertOnConflict = false
+	}
+
+	if c.InsertIntoBatchSize <= 0 {
+		c.InsertIntoBatchSize = 10
+	}
+
+	if c.MaxConcurrentWorkers <= 0 {
+		c.MaxConcurrentWorkers = 1
 	}
 
 	return nil

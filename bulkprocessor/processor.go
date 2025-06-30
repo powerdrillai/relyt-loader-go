@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/lib/pq"
 	"github.com/pkg/errors"
 )
@@ -69,6 +70,10 @@ type BulkProcessor struct {
 
 	// Global offset tracking using atomic variable
 	maxOffset int64
+
+	// parallel processing related fields
+	workerWg      sync.WaitGroup
+	activeWorkers int32 // atomic counter for active workers
 }
 
 // SearchResult
@@ -196,6 +201,8 @@ func New(config Config) (*BulkProcessor, error) {
 		bufferTaskQueue:   make(chan *BufferTask, 100),
 		bufferThreadWg:    sync.WaitGroup{},
 		recordQueueV2:     make(chan *Record, 10000),
+		workerWg:          sync.WaitGroup{},
+		activeWorkers:     0,
 	}, nil
 }
 
@@ -292,6 +299,8 @@ func (p *BulkProcessor) Shutdown() error {
 	// Wait for buffer threads to finish (if dual buffer is enabled)
 	if p.config.EnableDualBuffer {
 		p.bufferThreadWg.Wait()
+		// wait for all parallel workers to finish
+		p.workerWg.Wait()
 	}
 
 	// Create a list of all files that need to be cleaned up from S3
@@ -658,7 +667,7 @@ func (p *BulkProcessor) Flush() error {
 				p.bufferManager.bufferOperationsMutex.Unlock()
 
 				// deduplicate records
-				deletedRecords := currentBuffer.DeduplicateRecords()
+				deletedRecords := currentBuffer.DeduplicateRecords(len(p.pkColumns) > 0, p.versionColIndex >= 0)
 
 				// write to local file
 				if currentBuffer.GetRecordCount() > 0 {
@@ -1049,12 +1058,6 @@ func (p *BulkProcessor) BGWorkerThread() {
 			log.Printf("BGWORKER: Found %d files in %s", len(files), dirPath)
 		}
 
-		if len(files) > 0 {
-			log.Printf("BGWORKER: Found %d files in %s", len(files), dirPath)
-		} else {
-			log.Printf("BGWORKER: No files found in %s", dirPath)
-		}
-
 		time.Sleep(time.Duration(p.config.BGWorkerInterval) * time.Second)
 	}
 }
@@ -1249,7 +1252,7 @@ func (p *BulkProcessor) InsertV2(fileID, routingID string, records interface{}, 
 			p.versionColIndex = GetColumnIndex(p.fields, "version")
 		}
 
-		if p.pkColumnsIndex == nil {
+		if p.pkColumnsIndex == nil && len(p.pkColumns) > 0 {
 			p.pkColumnsIndex = make([]int, len(p.pkColumns))
 			for i, columnName := range p.pkColumns {
 				p.pkColumnsIndex[i] = GetColumnIndex(p.fields, columnName)
@@ -1471,7 +1474,7 @@ func (p *BulkProcessor) InsertThreadV2() {
 				versionMap = make(map[RecordIndex]string)
 
 				// deduplicate records
-				deletedRecords := currentBuffer.DeduplicateRecords()
+				deletedRecords := currentBuffer.DeduplicateRecords(len(p.pkColumns) > 0, p.versionColIndex >= 0)
 
 				// write to local file
 				if currentBuffer.GetRecordCount() > 0 {
@@ -1523,79 +1526,121 @@ func (p *BulkProcessor) ImporterThreadV2() {
 
 			feedbackKeysArray := p.getFeedbackValues()
 
-			isFailed := true
-			maxLoopNum := p.config.ImportTimeout / p.config.ImportErrorSleepTime
-			err := errors.New("Buffer Task timeout")
-
-			for i := 0; i < maxLoopNum; i++ {
-				if err := p.processBufferTaskWithTransaction(task); err != nil {
-					log.Printf("Failed to process buffer task %s: %v", task.TaskId, err)
-
-					// Update checkpoint with all error file
-					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-					if err2 := p.pgClient.UpdateDeltaCheckpointStatus(ctx, p.processId, []string{task.LocalFile}, CheckpointStatusFailed, -1, err.Error()); err2 != nil {
-						fmt.Fprintf(os.Stderr, "Failed to update checkpoint for error file: %v\n", err2)
+			if p.config.MaxConcurrentWorkers > 1 {
+				for {
+					currentActive := atomic.LoadInt32(&p.activeWorkers)
+					if currentActive < int32(p.config.MaxConcurrentWorkers) {
+						break
 					}
-					cancel()
-
-					// all the errors without parsing error are not expected, we will retry, parsing error just call
-					// the callback and continue to next batch
-					if !strings.Contains(err.Error(), "Bad literal") &&
-						!strings.Contains(err.Error(), "Dimensions") &&
-						!strings.Contains(err.Error(), "duplicate key value") {
-						time.Sleep(time.Duration(p.config.ImportErrorSleepTime) * time.Second)
-						continue
-					}
-
-					feedbackKeysString := fmt.Sprintf("failed %s is [%s].", p.config.FeedbackColumn, strings.Join(feedbackKeysArray, ","))
-
-					if p.config.ImportErrorCallback != nil {
-						log.Printf("task %s failed before callback: %s", task.TaskId, feedbackKeysString)
-						p.config.ImportErrorCallback(p.config.FeedbackColumn, feedbackKeysArray, err, p.config.CallbackResource)
-					} else {
-						log.Printf("task %s failed with no callback: %s", task.TaskId, feedbackKeysString)
-					}
-
-					isFailed = true
-					break
-				} else {
-					isFailed = false
-					break
+					log.Printf("Waiting for available worker slot, current active: %d, max: %d, queue len: %d",
+						currentActive, p.config.MaxConcurrentWorkers, len(p.bufferTaskQueue))
+					time.Sleep(500 * time.Millisecond)
 				}
+
+				p.workerWg.Add(1)
+				workerID := int(atomic.AddInt32(&p.activeWorkers, 1))
+
+				go func(t *BufferTask, wID int) {
+					defer p.workerWg.Done()
+					defer atomic.AddInt32(&p.activeWorkers, -1)
+
+					log.Printf("Parallel Worker %d started processing task: %s (records: %d)", wID, t.TaskId, t.RecordCount)
+					startTime := time.Now()
+
+					p.processBufferTask(t, wID, feedbackKeysArray)
+
+					duration := time.Since(startTime)
+					log.Printf("Parallel Worker %d finished processing task: %s, duration: %v", wID, t.TaskId, duration)
+				}(task, workerID)
+			} else {
+				startTime := time.Now()
+				p.processBufferTask(task, -1, feedbackKeysArray)
+				log.Printf("Single Worker finished processing task: %s, duration: %v", task.TaskId, time.Since(startTime))
 			}
+		}
+	}
+}
 
-			if isFailed {
-				p.bufferManager.SetBufferStatus(task.TaskId, BufferStatusImportError)
-				feedbackKeysString := fmt.Sprintf("failed %s is [%s].", p.config.FeedbackColumn, strings.Join(feedbackKeysArray, ","))
-				log.Printf("Import batch directory timeout: %s", feedbackKeysString)
-				if p.config.ImportErrorCallback != nil {
-					p.config.ImportErrorCallback(p.config.FeedbackColumn, feedbackKeysArray, err, p.config.CallbackResource)
-				}
+// parallel process buffer task
+func (p *BulkProcessor) processBufferTask(task *BufferTask, workerID int, feedbackKeysArray []string) {
+	log.Printf("Worker %d starting to process buffer task: %s (records: %d)",
+		workerID, task.TaskId, task.RecordCount)
+
+	isFailed := true
+	maxLoopNum := p.config.ImportTimeout / p.config.ImportErrorSleepTime
+	err := errors.New("Buffer Task timeout")
+
+	for i := 0; i < maxLoopNum; i++ {
+		if err := p.processBufferTaskWithTransaction(task); err != nil {
+			log.Printf("Worker %d failed to process buffer task %s: %v",
+				workerID, task.TaskId, err)
+
+			// Update checkpoint with all error file
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err2 := p.pgClient.UpdateDeltaCheckpointStatus(ctx, p.processId, []string{task.LocalFile}, CheckpointStatusFailed, -1, err.Error()); err2 != nil {
+				fmt.Fprintf(os.Stderr, "Worker %d failed to update checkpoint for error file: %v\n", workerID, err2)
+			}
+			cancel()
+
+			// all the errors without parsing error are not expected, we will retry, parsing error just call
+			// the callback and continue to next batch
+			if !strings.Contains(err.Error(), "Bad literal") &&
+				!strings.Contains(err.Error(), "Dimensions") &&
+				!strings.Contains(err.Error(), "duplicate key value") {
+				time.Sleep(time.Duration(p.config.ImportErrorSleepTime) * time.Second)
 				continue
 			}
 
-			// remove local file and delta checkpoint
-			if task.LocalFile != "" {
-				if err := CleanupLocalFile(task.LocalFile); err != nil {
-					log.Printf("Failed to remove temporary file %s: %v", task.LocalFile, err)
-				}
+			feedbackKeysString := fmt.Sprintf("failed %s is [%s].", p.config.FeedbackColumn, strings.Join(feedbackKeysArray, ","))
 
-				// Update checkpoint with all imported file
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				if err := p.pgClient.UpdateDeltaCheckpointStatus(ctx, p.processId, []string{task.LocalFile}, CheckpointStatusCompleted, 0, ""); err != nil {
-					fmt.Fprintf(os.Stderr, "Failed to update checkpoint for imported file: %v\n", err)
-				}
-				cancel()
+			if p.config.ImportErrorCallback != nil {
+				log.Printf("Worker %d task %s failed before callback: %s",
+					workerID, task.TaskId, feedbackKeysString)
+				p.config.ImportErrorCallback(p.config.FeedbackColumn, feedbackKeysArray, err, p.config.CallbackResource)
+			} else {
+				log.Printf("Worker %d task %s failed with no callback: %s",
+					workerID, task.TaskId, feedbackKeysString)
 			}
 
-			// success, set buffer status to imported
-			p.bufferManager.SetBufferStatus(task.TaskId, BufferStatusImported)
-
-			// Update global max offset after successful import
-			if task.MaxOffset > 0 {
-				p.UpdateMaxOffset(task.MaxOffset)
-			}
+			isFailed = true
+			break
+		} else {
+			isFailed = false
+			break
 		}
+	}
+
+	if isFailed {
+		p.bufferManager.SetBufferStatus(task.TaskId, BufferStatusImportError)
+		feedbackKeysString := fmt.Sprintf("failed %s is [%s].", p.config.FeedbackColumn, strings.Join(feedbackKeysArray, ","))
+		log.Printf("Worker %d import batch directory timeout: %s", workerID, feedbackKeysString)
+		if p.config.ImportErrorCallback != nil {
+			p.config.ImportErrorCallback(p.config.FeedbackColumn, feedbackKeysArray, err, p.config.CallbackResource)
+		}
+		return
+	}
+
+	// remove local file and delta checkpoint
+	if task.LocalFile != "" {
+		if err := CleanupLocalFile(task.LocalFile); err != nil {
+			log.Printf("Worker %d failed to remove temporary file %s: %v",
+				workerID, task.LocalFile, err)
+		}
+
+		// Update checkpoint with all imported file
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := p.pgClient.UpdateDeltaCheckpointStatus(ctx, p.processId, []string{task.LocalFile}, CheckpointStatusCompleted, 0, ""); err != nil {
+			fmt.Fprintf(os.Stderr, "Worker %d failed to update checkpoint for imported file: %v\n", workerID, err)
+		}
+		cancel()
+	}
+
+	// success, set buffer status to imported
+	p.bufferManager.SetBufferStatus(task.TaskId, BufferStatusImported)
+
+	// Update global max offset after successful import
+	if task.MaxOffset > 0 {
+		p.UpdateMaxOffset(task.MaxOffset)
 	}
 }
 
@@ -1659,7 +1704,7 @@ func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask) error
 		}
 
 		if p.config.UseInsertOnConflict {
-			if err := p.pgClient.InsertIntoOnConflictFromFile(ctx, tx, task.LocalFile, targetTable, GetColumnNames(p.fields), p.config.UpdateOnConflict); err != nil {
+			if err := p.pgClient.InsertIntoOnConflictFromFile(ctx, tx, task.LocalFile, targetTable, GetColumnNames(p.fields), p.config.UpdateOnConflict, p.config.InsertIntoBatchSize); err != nil {
 				return fmt.Errorf("Insert into on conflict from file failed: %w", err)
 			}
 		} else {
@@ -1716,8 +1761,9 @@ func processSQLParams(input string, args []interface{}) string {
 	return processed
 }
 
-// SearchV2 search data from main table and aux table
-func (p *BulkProcessor) SearchV2(options *SearchOptions, args ...interface{}) (*SearchResult, error) {
+// SearchJsonRowsV2 return pgx.Rows object, let caller control the iteration
+// caller need to call rows.Next() and rows.Scan()
+func (p *BulkProcessor) SearchJsonRowsV2(options *SearchOptions, args ...interface{}) (pgx.Rows, error) {
 	p.mutex.RLock()
 	if p.isShutdown {
 		p.mutex.RUnlock()
@@ -1757,6 +1803,17 @@ func (p *BulkProcessor) SearchV2(options *SearchOptions, args ...interface{}) (*
 	rows, err := p.pgClient.GetColumnsWithCondition(p.ctx, params...)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to get columns with condition")
+	}
+
+	return rows, nil
+}
+
+// SearchV2 search data from main table and aux table
+func (p *BulkProcessor) SearchV2(options *SearchOptions, args ...interface{}) (*SearchResult, error) {
+	// 复用SearchJsonRowsV2的逻辑获取rows
+	rows, err := p.SearchJsonRowsV2(options, args...)
+	if err != nil {
+		return nil, err
 	}
 	defer rows.Close()
 
@@ -1825,4 +1882,29 @@ func (p *BulkProcessor) SearchV2(options *SearchOptions, args ...interface{}) (*
 	}
 
 	return &SearchResult{Columns: jsonCols, Rows: allRows}, nil
+}
+
+func (p *BulkProcessor) SearchJsonV2(options *SearchOptions, args ...interface{}) ([]json.RawMessage, error) {
+	rows, err := p.SearchJsonRowsV2(options, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jsonResults []json.RawMessage
+
+	for rows.Next() {
+		var resultJSON []byte
+		if err := rows.Scan(&resultJSON); err != nil {
+			return nil, errors.Wrap(err, "rows.Scan")
+		}
+
+		jsonResults = append(jsonResults, resultJSON)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, errors.Wrap(err, "rows iteration")
+	}
+
+	return jsonResults, nil
 }

@@ -6,11 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pkg/errors"
@@ -58,12 +58,13 @@ type TableColumn struct {
 
 // NewPostgreSQLClient creates a new PostgreSQL client
 func NewPostgreSQLClient(config PostgreSQLConfig) (*PostgreSQLClient, error) {
-	connString := fmt.Sprintf("postgres://%s:%s@%s:%d/%s",
+	connString := fmt.Sprintf("postgres://%s:%s@%s:%d/%s?pool_max_conns=%d",
 		config.Username,
 		config.Password,
 		config.Host,
 		config.Port,
 		config.Database,
+		config.MaxPoolSize,
 	)
 
 	// Add SSL mode=disable if needed
@@ -223,7 +224,9 @@ func (c *PostgreSQLClient) GetLoadConfigFromDB(ctx context.Context, config *Conf
 		import_error_sleep_time,
 		enable_dual_buffer,
 		buffer_max_records,
-		use_insert_on_conflict
+		use_insert_on_conflict,
+		max_concurrent_workers,
+		insert_into_batch_size
 	FROM relyt_sys.LOADER_CONFIG()
 	`
 
@@ -242,6 +245,8 @@ func (c *PostgreSQLClient) GetLoadConfigFromDB(ctx context.Context, config *Conf
 		&config.EnableDualBuffer,
 		&config.BufferMaxRecords,
 		&config.UseInsertOnConflict,
+		&config.MaxConcurrentWorkers,
+		&config.InsertIntoBatchSize,
 	)
 
 	if err != nil {
@@ -258,7 +263,9 @@ func (c *PostgreSQLClient) UpdateLoadConfig(ctx context.Context, config *Config)
 		import_error_sleep_time,
 		enable_dual_buffer,
 		buffer_max_records,
-		use_insert_on_conflict
+		use_insert_on_conflict,
+		max_concurrent_workers,
+		insert_into_batch_size
 	FROM relyt_sys.LOADER_CONFIG()
 	`
 
@@ -269,11 +276,16 @@ func (c *PostgreSQLClient) UpdateLoadConfig(ctx context.Context, config *Config)
 		&config.EnableDualBuffer,
 		&config.BufferMaxRecords,
 		&config.UseInsertOnConflict,
+		&config.MaxConcurrentWorkers,
+		&config.InsertIntoBatchSize,
 	)
 
 	if err != nil {
 		return errors.Wrap(err, "failed to update load config")
 	}
+
+	log.Printf("load config: import_timeout %d, import_error_sleep_time %d, enable_dual_buffer %t, buffer_max_records %d, use_insert_on_conflict %t, max_concurrent_workers %d, insert_into_batch_size %d",
+		config.ImportTimeout, config.ImportErrorSleepTime, config.EnableDualBuffer, config.BufferMaxRecords, config.UseInsertOnConflict, config.MaxConcurrentWorkers, config.InsertIntoBatchSize)
 
 	return nil
 }
@@ -822,7 +834,7 @@ func (c *PostgreSQLClient) CopyFromFileInTransaction(ctx context.Context, tx pgx
 	return nil
 }
 
-func (c *PostgreSQLClient) InsertIntoOnConflictFromFile(ctx context.Context, tx pgx.Tx, filePath, targetTable string, columnNames []string, updateOnConflict bool) error {
+func (c *PostgreSQLClient) InsertIntoOnConflictFromFile(ctx context.Context, tx pgx.Tx, filePath, targetTable string, columnNames []string, updateOnConflict bool, insertIntoSize int) error {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to open file %s: %w", filePath, err)
@@ -841,11 +853,6 @@ func (c *PostgreSQLClient) InsertIntoOnConflictFromFile(ctx context.Context, tx 
 
 	// Build the base INSERT statement
 	columnsList := strings.Join(columnNames, ", ")
-	placeholders := make([]string, len(columnNames))
-	for i := range columnNames {
-		placeholders[i] = fmt.Sprintf("$%d", i+1)
-	}
-	valuesClause := strings.Join(placeholders, ", ")
 
 	var sqlStatement string
 	if len(pkColumns) > 0 && updateOnConflict {
@@ -871,64 +878,86 @@ func (c *PostgreSQLClient) InsertIntoOnConflictFromFile(ctx context.Context, tx 
 		// If there are non-PK columns to update
 		if len(updateSetParts) > 0 {
 			updateSet := strings.Join(updateSetParts, ", ")
-			sqlStatement = fmt.Sprintf(`INSERT INTO %s.%s (%s) VALUES (%s) ON CONFLICT (%s) DO UPDATE SET %s`,
-				c.config.Schema, targetTable, columnsList, valuesClause, conflictColumns, updateSet)
+			sqlStatement = fmt.Sprintf(`INSERT INTO %s.%s (%s) VALUES %s ON CONFLICT (%s) DO UPDATE SET %s`,
+				c.config.Schema, targetTable, columnsList, "%s", conflictColumns, updateSet)
 		} else {
 			// All columns are primary keys, do nothing on conflict
-			sqlStatement = fmt.Sprintf(`INSERT INTO %s.%s (%s) VALUES (%s) ON CONFLICT (%s) DO NOTHING`,
-				c.config.Schema, targetTable, columnsList, valuesClause, conflictColumns)
+			sqlStatement = fmt.Sprintf(`INSERT INTO %s.%s (%s) VALUES %s ON CONFLICT (%s) DO NOTHING`,
+				c.config.Schema, targetTable, columnsList, "%s", conflictColumns)
 		}
 	} else if len(pkColumns) > 0 {
 		// Do nothing on conflict (as per configuration)
 		conflictColumns := strings.Join(pkColumns, ", ")
-		sqlStatement = fmt.Sprintf(`INSERT INTO %s.%s (%s) VALUES (%s) ON CONFLICT (%s) DO NOTHING`,
-			c.config.Schema, targetTable, columnsList, valuesClause, conflictColumns)
+		sqlStatement = fmt.Sprintf(`INSERT INTO %s.%s (%s) VALUES %s ON CONFLICT (%s) DO NOTHING`,
+			c.config.Schema, targetTable, columnsList, "%s", conflictColumns)
 	} else {
 		// No primary key, use standard INSERT
-		sqlStatement = fmt.Sprintf(`INSERT INTO %s.%s (%s) VALUES (%s)`,
-			c.config.Schema, targetTable, columnsList, valuesClause)
+		sqlStatement = fmt.Sprintf(`INSERT INTO %s.%s (%s) VALUES %s`,
+			c.config.Schema, targetTable, columnsList, "%s")
 	}
 
-	// Generate unique statement name using UUID to ensure uniqueness across connections
-	stmtName := fmt.Sprintf("insert_on_conflict_%s_%s", strings.ReplaceAll(targetTable, ".", "_"), uuid.New().String()[:8])
-
-	// Prepare the statement
-	stmt, err := tx.Prepare(ctx, stmtName, sqlStatement)
-	if err != nil {
-		return fmt.Errorf("failed to prepare statement: %w", err)
-	}
-
-	// Read and process each row
+	// Read and process rows in batches
 	lineNum := 0
+	batch := make([][]string, 0, insertIntoSize)
+
 	for {
 		lineNum++
 		record, err := reader.Read()
 		if err == io.EOF {
+			// Process remaining batch
+			if len(batch) > 0 {
+				if err := c.executeBatchInsert(ctx, tx, sqlStatement, batch, lineNum-len(batch)); err != nil {
+					return err
+				}
+			}
 			break
 		}
 		if err != nil {
 			return fmt.Errorf("failed to read CSV line %d: %w", lineNum, err)
 		}
 
-		// Convert empty strings to nil for NULL handling
-		args := make([]interface{}, len(record))
-		for i, value := range record {
-			args[i] = value
-		}
+		batch = append(batch, record)
 
-		// Execute the INSERT statement
-		_, err = tx.Exec(ctx, stmt.Name, args...)
-		if err != nil {
-			return fmt.Errorf("failed to execute INSERT at line %d: %w", lineNum, err)
+		// Execute batch when it reaches the size limit
+		if len(batch) >= insertIntoSize {
+			if err := c.executeBatchInsert(ctx, tx, sqlStatement, batch, lineNum-len(batch)+1); err != nil {
+				return err
+			}
+			batch = batch[:0] // Reset batch
 		}
 	}
 
-	// Clean up the prepared statement to avoid conflicts in future calls
-	// Note: This is optional as statements are automatically cleaned up when the transaction ends
-	// but it's good practice to be explicit
-	err = tx.Conn().PgConn().Deallocate(ctx, stmtName)
+	return nil
+}
+
+// executeBatchInsert executes a batch insert with the given records
+func (c *PostgreSQLClient) executeBatchInsert(ctx context.Context, tx pgx.Tx, sqlTemplate string, batch [][]string, startLineNum int) error {
+	if len(batch) == 0 {
+		return nil
+	}
+
+	// Build VALUES clause for the batch
+	valuesParts := make([]string, len(batch))
+	allArgs := make([]interface{}, 0, len(batch)*len(batch[0]))
+	argIndex := 1
+
+	for i, record := range batch {
+		placeholders := make([]string, len(record))
+		for j := range record {
+			placeholders[j] = fmt.Sprintf("$%d", argIndex)
+			allArgs = append(allArgs, record[j])
+			argIndex++
+		}
+		valuesParts[i] = fmt.Sprintf("(%s)", strings.Join(placeholders, ", "))
+	}
+
+	valuesClause := strings.Join(valuesParts, ", ")
+	sqlStatement := fmt.Sprintf(sqlTemplate, valuesClause)
+
+	// Execute the batch insert
+	_, err := tx.Exec(ctx, sqlStatement, allArgs...)
 	if err != nil {
-		return fmt.Errorf("failed to deallocate statement: %w", err)
+		return fmt.Errorf("failed to execute batch INSERT starting at line %d: %w", startLineNum, err)
 	}
 
 	return nil

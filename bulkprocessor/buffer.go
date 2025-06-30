@@ -282,7 +282,7 @@ func (pk *PrimaryKey) toString() string {
 	return strings.Join(pk.PKValues, "-")
 }
 
-func (b *Buffer) DeduplicateRecords() []RecordIndex {
+func (b *Buffer) DeduplicateRecords(havePK, haveVersion bool) []RecordIndex {
 	b.BufferMutex.Lock()
 	defer b.BufferMutex.Unlock()
 
@@ -313,15 +313,16 @@ func (b *Buffer) DeduplicateRecords() []RecordIndex {
 			if deleteMap[key] {
 				keepMap[i] = false
 			} else {
-				pk := PrimaryKey{
-					PKValues: record.PKValues,
-				}
-
-				// save the latest version for the insert record
-				if version, exists := versionMap[key]; exists {
-					if record.Version == version {
-						// if the insert record has the same version then check the primary key
-						if len(record.PKValues) > 0 {
+				if !havePK && !haveVersion {
+					keepMap[i] = true
+				} else if havePK && haveVersion {
+					pk := PrimaryKey{
+						PKValues: record.PKValues,
+					}
+					// save the latest version for the insert record
+					if version, exists := versionMap[key]; exists {
+						if record.Version == version {
+							// if the insert record has the same version then check the primary key
 							// if the primary key is already in the set, mark it as delete
 							if _, exists := primarySet[pk.toString()]; exists {
 								keepMap[i] = false
@@ -329,17 +330,41 @@ func (b *Buffer) DeduplicateRecords() []RecordIndex {
 								primarySet[pk.toString()] = struct{}{}
 								keepMap[i] = true
 							}
+						} else if record.Version < version {
+							keepMap[i] = false
+						} else {
+							//InsertThreadV2 have filter the records which have the smaller version
+							log.Printf("NOTICE: The record versions in the buffer are in descending order")
 						}
-					} else if record.Version < version {
+					} else {
+						versionMap[key] = record.Version
+						primarySet[pk.toString()] = struct{}{}
+						keepMap[i] = true
+					}
+				} else if havePK && !haveVersion {
+					pk := PrimaryKey{
+						PKValues: record.PKValues,
+					}
+
+					if _, exists := primarySet[pk.toString()]; exists {
 						keepMap[i] = false
 					} else {
-						//InsertThreadV2 have filter the records which have the smaller version
-						log.Printf("NOTICE: The record versions in the buffer are in descending order")
+						primarySet[pk.toString()] = struct{}{}
+						keepMap[i] = true
 					}
-				} else {
-					versionMap[key] = record.Version
-					primarySet[pk.toString()] = struct{}{}
-					keepMap[i] = true
+				} else { // !havePK && haveVersion
+					if version, exists := versionMap[key]; exists {
+						if record.Version == version {
+							keepMap[i] = true
+						} else if record.Version < version {
+							keepMap[i] = false
+						} else {
+							log.Printf("NOTICE: The record versions in the buffer are in descending order")
+						}
+					} else {
+						versionMap[key] = record.Version
+						keepMap[i] = true
+					}
 				}
 			}
 		} else {
