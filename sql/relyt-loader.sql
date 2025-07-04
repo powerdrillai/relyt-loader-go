@@ -1,75 +1,38 @@
 -- the following sql must be executed before using this loader
 -- create a type to represent the s3 config info
-CREATE TYPE loader_s3_config AS (
-    endpoint TEXT,
-    region TEXT,
-    bucket_name TEXT,
-    prefix TEXT,
-    access_key TEXT,
-    secret_key TEXT,
-    concurrency INT,
-    part_size INT,
-    import_timeout INT,
-    import_error_sleep_time INT,
-    enable_dual_buffer BOOLEAN,
-    buffer_max_records INT,
-    use_insert_on_conflict BOOLEAN,
-    max_concurrent_workers INT,
-    insert_into_batch_size INT
-);
 
--- create the LOADER_CONFIG function, return the s3 config info
-CREATE OR REPLACE FUNCTION relyt_sys.LOADER_CONFIG()
-RETURNS loader_s3_config
-LANGUAGE SQL
-IMMUTABLE
-AS $$
-    SELECT 
-        's3.amazonaws.com'::TEXT AS endpoint,
-        'us-west-2'::TEXT AS region,
-        'your-bucket'::TEXT AS bucket_name,
-        'import/data'::TEXT AS prefix,
-        'your-access-key'::TEXT AS access_key,
-        'your-secret-key'::TEXT AS secret_key,
-        20 AS concurrency,
-        5242880 AS part_size,
-        1800 AS import_timeout,
-        10 AS import_error_sleep_time,
-        'true'::BOOLEAN AS enable_dual_buffer,
-        5000 AS buffer_max_records,
-        'false'::BOOLEAN AS use_insert_on_conflict,
-        1 AS max_concurrent_workers,
-        100 AS insert_into_batch_size
-    ;
-$$;
+CREATE TABLE IF NOT EXISTS relyt_sys.SDK_LOADER_CONFIG (
+    CONFIG_NAME TEXT PRIMARY KEY,
+    CONFIG_VALUE TEXT
+) USING heap DISTRIBUTED NONE;
 
--- revoke the execute permission from public for safety
-REVOKE EXECUTE ON FUNCTION relyt_sys.LOADER_CONFIG() FROM PUBLIC;
--- grant the execute permission to the role who runs the loader
-GRANT EXECUTE ON FUNCTION relyt_sys.LOADER_CONFIG() TO loader-user;
+INSERT INTO relyt_sys.SDK_LOADER_CONFIG (CONFIG_NAME, CONFIG_VALUE) VALUES ('endpoint', 's3.amazonaws.com') ON CONFLICT (CONFIG_NAME) DO UPDATE SET CONFIG_VALUE = EXCLUDED.CONFIG_VALUE;
+INSERT INTO relyt_sys.SDK_LOADER_CONFIG (CONFIG_NAME, CONFIG_VALUE) VALUES ('region', 'us-west-2') ON CONFLICT (CONFIG_NAME) DO UPDATE SET CONFIG_VALUE = EXCLUDED.CONFIG_VALUE;
+INSERT INTO relyt_sys.SDK_LOADER_CONFIG (CONFIG_NAME, CONFIG_VALUE) VALUES ('bucket_name', 'your-bucket') ON CONFLICT (CONFIG_NAME) DO UPDATE SET CONFIG_VALUE = EXCLUDED.CONFIG_VALUE;
+INSERT INTO relyt_sys.SDK_LOADER_CONFIG (CONFIG_NAME, CONFIG_VALUE) VALUES ('prefix', 'import/data') ON CONFLICT (CONFIG_NAME) DO UPDATE SET CONFIG_VALUE = EXCLUDED.CONFIG_VALUE;
+INSERT INTO relyt_sys.SDK_LOADER_CONFIG (CONFIG_NAME, CONFIG_VALUE) VALUES ('access_key', 'your-access-key') ON CONFLICT (CONFIG_NAME) DO UPDATE SET CONFIG_VALUE = EXCLUDED.CONFIG_VALUE;
+INSERT INTO relyt_sys.SDK_LOADER_CONFIG (CONFIG_NAME, CONFIG_VALUE) VALUES ('secret_key', 'your-secret-key') ON CONFLICT (CONFIG_NAME) DO UPDATE SET CONFIG_VALUE = EXCLUDED.CONFIG_VALUE;
+INSERT INTO relyt_sys.SDK_LOADER_CONFIG (CONFIG_NAME, CONFIG_VALUE) VALUES ('concurrency', '20') ON CONFLICT (CONFIG_NAME) DO UPDATE SET CONFIG_VALUE = EXCLUDED.CONFIG_VALUE;
+INSERT INTO relyt_sys.SDK_LOADER_CONFIG (CONFIG_NAME, CONFIG_VALUE) VALUES ('part_size', '5242880') ON CONFLICT (CONFIG_NAME) DO UPDATE SET CONFIG_VALUE = EXCLUDED.CONFIG_VALUE;
+INSERT INTO relyt_sys.SDK_LOADER_CONFIG (CONFIG_NAME, CONFIG_VALUE) VALUES ('import_timeout', '1800') ON CONFLICT (CONFIG_NAME) DO UPDATE SET CONFIG_VALUE = EXCLUDED.CONFIG_VALUE;
+INSERT INTO relyt_sys.SDK_LOADER_CONFIG (CONFIG_NAME, CONFIG_VALUE) VALUES ('import_error_sleep_time', '10') ON CONFLICT (CONFIG_NAME) DO UPDATE SET CONFIG_VALUE = EXCLUDED.CONFIG_VALUE;
+INSERT INTO relyt_sys.SDK_LOADER_CONFIG (CONFIG_NAME, CONFIG_VALUE) VALUES ('enable_dual_buffer', 'true') ON CONFLICT (CONFIG_NAME) DO UPDATE SET CONFIG_VALUE = EXCLUDED.CONFIG_VALUE;
+INSERT INTO relyt_sys.SDK_LOADER_CONFIG (CONFIG_NAME, CONFIG_VALUE) VALUES ('buffer_max_records', '5000') ON CONFLICT (CONFIG_NAME) DO UPDATE SET CONFIG_VALUE = EXCLUDED.CONFIG_VALUE;
+INSERT INTO relyt_sys.SDK_LOADER_CONFIG (CONFIG_NAME, CONFIG_VALUE) VALUES ('tuples_pre_partition', '-1') ON CONFLICT (CONFIG_NAME) DO UPDATE SET CONFIG_VALUE = EXCLUDED.CONFIG_VALUE;
+-- 0: insert on conflict, 1: copy from local, 2: copy from s3
+INSERT INTO relyt_sys.SDK_LOADER_CONFIG (CONFIG_NAME, CONFIG_VALUE) VALUES ('import_strategy', '0') ON CONFLICT (CONFIG_NAME) DO UPDATE SET CONFIG_VALUE = EXCLUDED.CONFIG_VALUE;
+INSERT INTO relyt_sys.SDK_LOADER_CONFIG (CONFIG_NAME, CONFIG_VALUE) VALUES ('max_concurrent_workers', '1') ON CONFLICT (CONFIG_NAME) DO UPDATE SET CONFIG_VALUE = EXCLUDED.CONFIG_VALUE;
+INSERT INTO relyt_sys.SDK_LOADER_CONFIG (CONFIG_NAME, CONFIG_VALUE) VALUES ('insert_into_batch_size', '100') ON CONFLICT (CONFIG_NAME) DO UPDATE SET CONFIG_VALUE = EXCLUDED.CONFIG_VALUE;
 
--- example: how to update the config (only admin can update this function)
--- CREATE OR REPLACE FUNCTION relyt_sys.LOADER_CONFIG()
--- RETURNS loader_s3_config
--- LANGUAGE SQL
--- IMMUTABLE
--- AS $$
---     SELECT 
---         'cn.amazonaws.com'::TEXT AS endpoint,
---         'us-west-2'::TEXT AS region,
---         'your-bucket'::TEXT AS bucket_name,
---         'import/data'::TEXT AS prefix,
---         'your-access-key'::TEXT AS access_key,
---         'your-secret-key'::TEXT AS secret_key,
---         20 AS concurrency,
---         5242880 AS part_size,
---         1600 AS import_timeout,
---         10 AS import_error_sleep_time
---     ;
--- $$;
+-- revoke all permission from public
+REVOKE ALL ON relyt_sys.SDK_LOADER_CONFIG FROM public;
 
--- example: test the function
--- SELECT * FROM relyt_sys.LOADER_CONFIG(); 
+-- grant the select and insert permission to loader-user
+GRANT USAGE ON SCHEMA relyt_sys TO loader-user;
+GRANT SELECT,INSERT,UPDATE ON relyt_sys.SDK_LOADER_CONFIG TO loader-user;
+
+-- update the config
+-- UPDATE relyt_sys.SDK_LOADER_CONFIG SET CONFIG_VALUE = '1' WHERE CONFIG_NAME = 'import_strategy';
 
 -- checkpoint table
 CREATE TABLE IF NOT EXISTS relyt_sys.relyt_loader_checkpoint (

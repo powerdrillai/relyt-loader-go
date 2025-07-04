@@ -1,6 +1,9 @@
 package bulkprocessor
 
-import "os"
+import (
+	"os"
+	"path/filepath"
+)
 
 type ImportErrorHandler func(fieldname string, values []string, err error, resources interface{})
 
@@ -28,6 +31,12 @@ type PostgreSQLConfig struct {
 	MaxPoolSize int    // Maximum number of connections to the database, default: 3
 }
 
+const (
+	InsertOnConflict = 0
+	CopyFromLocal    = 1
+	CopyFromS3       = 2
+)
+
 // Config represents the configuration for the bulk processor
 type Config struct {
 	// S3 configuration is now always loaded from database through PostgreSQL connection
@@ -46,8 +55,9 @@ type Config struct {
 	ImportErrorSleepTime int    // S3 import error sleep time in seconds
 	EnableDualBuffer     bool   // enable dual buffer, default: true
 	BufferMaxRecords     int    // buffer max records, default: 1000
-	UseInsertOnConflict  bool   // use insert on conflict, default: true
+	ImportStrategy       int    // use insert on conflict, default: true
 	InsertIntoBatchSize  int    // insert into batch size, default: 100
+	TuplesPrePartition   int    // tuples pre partition, default: 5000
 	LocalFilePrefix      string // local file prefix, default: "/tmp"
 	MaxConcurrentWorkers int    // max concurrent workers, default: 1
 }
@@ -104,7 +114,7 @@ func (c *Config) Validate() error {
 	}
 
 	if c.BufferMaxRecords <= 0 {
-		c.BufferMaxRecords = 1000
+		c.BufferMaxRecords = 5000
 	}
 
 	if !c.EnableDualBuffer {
@@ -112,11 +122,11 @@ func (c *Config) Validate() error {
 	}
 
 	if c.LocalFilePrefix == "" {
-		c.LocalFilePrefix = os.TempDir()
+		c.LocalFilePrefix = filepath.Join(os.TempDir(), "relyt_data")
 	}
 
-	if !c.UseInsertOnConflict {
-		c.UseInsertOnConflict = false
+	if c.ImportStrategy == 0 {
+		c.ImportStrategy = InsertOnConflict
 	}
 
 	if c.InsertIntoBatchSize <= 0 {

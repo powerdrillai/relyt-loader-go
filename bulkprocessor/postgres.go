@@ -209,28 +209,30 @@ func (c *PostgreSQLClient) UpdateCheckpointStatus(ctx context.Context, processId
 func (c *PostgreSQLClient) GetLoadConfigFromDB(ctx context.Context, config *Config) (*S3Config, error) {
 	var s3Config S3Config
 
-	// Query the LOADER_CONFIG function
+	// Query the SDK_LOADER_CONFIG table
 	sqlStatement := `
 	SELECT 
-		endpoint, 
-		region, 
-		bucket_name, 
-		prefix, 
-		access_key, 
-		secret_key, 
-		concurrency, 
-		part_size,
-		import_timeout,
-		import_error_sleep_time,
-		enable_dual_buffer,
-		buffer_max_records,
-		use_insert_on_conflict,
-		max_concurrent_workers,
-		insert_into_batch_size
-	FROM relyt_sys.LOADER_CONFIG()
+		MAX(CASE WHEN CONFIG_NAME = 'endpoint' THEN CONFIG_VALUE END) as endpoint,
+		MAX(CASE WHEN CONFIG_NAME = 'region' THEN CONFIG_VALUE END) as region,
+		MAX(CASE WHEN CONFIG_NAME = 'bucket_name' THEN CONFIG_VALUE END) as bucket_name,
+		MAX(CASE WHEN CONFIG_NAME = 'prefix' THEN CONFIG_VALUE END) as prefix,
+		MAX(CASE WHEN CONFIG_NAME = 'access_key' THEN CONFIG_VALUE END) as access_key,
+		MAX(CASE WHEN CONFIG_NAME = 'secret_key' THEN CONFIG_VALUE END) as secret_key,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'concurrency' THEN CONFIG_VALUE END)::INT, 20) as concurrency,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'part_size' THEN CONFIG_VALUE END)::BIGINT, 5242880) as part_size,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'import_timeout' THEN CONFIG_VALUE END)::INT, 1800) as import_timeout,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'import_error_sleep_time' THEN CONFIG_VALUE END)::INT, 10) as import_error_sleep_time,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'enable_dual_buffer' THEN CONFIG_VALUE END)::BOOLEAN, true) as enable_dual_buffer,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'buffer_max_records' THEN CONFIG_VALUE END)::INT, 5000) as buffer_max_records,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'tuples_pre_partition' THEN CONFIG_VALUE END)::INT, 5000) as tuples_pre_partition,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'import_strategy' THEN CONFIG_VALUE END)::INT, 2) as import_strategy,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'max_concurrent_workers' THEN CONFIG_VALUE END)::INT, 1) as max_concurrent_workers,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'insert_into_batch_size' THEN CONFIG_VALUE END)::INT, 100) as insert_into_batch_size
+	FROM relyt_sys.SDK_LOADER_CONFIG
 	`
 
 	row := c.pool.QueryRow(ctx, sqlStatement)
+
 	err := row.Scan(
 		&s3Config.Endpoint,
 		&s3Config.Region,
@@ -244,7 +246,8 @@ func (c *PostgreSQLClient) GetLoadConfigFromDB(ctx context.Context, config *Conf
 		&config.ImportErrorSleepTime,
 		&config.EnableDualBuffer,
 		&config.BufferMaxRecords,
-		&config.UseInsertOnConflict,
+		&config.TuplesPrePartition,
+		&config.ImportStrategy,
 		&config.MaxConcurrentWorkers,
 		&config.InsertIntoBatchSize,
 	)
@@ -259,14 +262,15 @@ func (c *PostgreSQLClient) GetLoadConfigFromDB(ctx context.Context, config *Conf
 func (c *PostgreSQLClient) UpdateLoadConfig(ctx context.Context, config *Config) error {
 	sqlStatement := `
 		SELECT
-		import_timeout,
-		import_error_sleep_time,
-		enable_dual_buffer,
-		buffer_max_records,
-		use_insert_on_conflict,
-		max_concurrent_workers,
-		insert_into_batch_size
-	FROM relyt_sys.LOADER_CONFIG()
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'import_timeout' THEN CONFIG_VALUE END)::INT, 1800) as import_timeout,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'import_error_sleep_time' THEN CONFIG_VALUE END)::INT, 10) as import_error_sleep_time,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'enable_dual_buffer' THEN CONFIG_VALUE END)::BOOLEAN, true) as enable_dual_buffer,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'buffer_max_records' THEN CONFIG_VALUE END)::INT, 5000) as buffer_max_records,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'tuples_pre_partition' THEN CONFIG_VALUE END)::INT, 5000) as tuples_pre_partition,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'import_strategy' THEN CONFIG_VALUE END)::INT, 0) as import_strategy,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'max_concurrent_workers' THEN CONFIG_VALUE END)::INT, 1) as max_concurrent_workers,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'insert_into_batch_size' THEN CONFIG_VALUE END)::INT, 100) as insert_into_batch_size
+	FROM relyt_sys.SDK_LOADER_CONFIG
 	`
 
 	row := c.pool.QueryRow(ctx, sqlStatement)
@@ -275,17 +279,18 @@ func (c *PostgreSQLClient) UpdateLoadConfig(ctx context.Context, config *Config)
 		&config.ImportErrorSleepTime,
 		&config.EnableDualBuffer,
 		&config.BufferMaxRecords,
-		&config.UseInsertOnConflict,
+		&config.TuplesPrePartition,
+		&config.ImportStrategy,
 		&config.MaxConcurrentWorkers,
 		&config.InsertIntoBatchSize,
 	)
 
+	log.Printf("Update config result: ImportTimeout %d, ImportErrorSleepTime %d, EnableDualBuffer %t, BufferMaxRecords %d, TuplesPrePartition %d, ImportStrategy %d, MaxConcurrentWorkers %d, InsertIntoBatchSize %d",
+		config.ImportTimeout, config.ImportErrorSleepTime, config.EnableDualBuffer, config.BufferMaxRecords, config.TuplesPrePartition, config.ImportStrategy, config.MaxConcurrentWorkers, config.InsertIntoBatchSize)
+
 	if err != nil {
 		return errors.Wrap(err, "failed to update load config")
 	}
-
-	log.Printf("load config: import_timeout %d, import_error_sleep_time %d, enable_dual_buffer %t, buffer_max_records %d, use_insert_on_conflict %t, max_concurrent_workers %d, insert_into_batch_size %d",
-		config.ImportTimeout, config.ImportErrorSleepTime, config.EnableDualBuffer, config.BufferMaxRecords, config.UseInsertOnConflict, config.MaxConcurrentWorkers, config.InsertIntoBatchSize)
 
 	return nil
 }
@@ -717,6 +722,21 @@ func (c *PostgreSQLClient) DeleteDeltaCheckpointByProcessIdAndFilepaths(ctx cont
 	return nil
 }
 
+// DeleteCompletedDeltaCheckpoint deletes completed delta checkpoint records that are older than the given interval(hours)
+func (c *PostgreSQLClient) DeleteCompletedDeltaCheckpoint(ctx context.Context, interval_hours int) error {
+	sqlStatement := `
+	DELETE FROM relyt_sys.relyt_loader_delta_checkpoint
+	WHERE status = 'COMPLETED' AND finish_time < $1
+	`
+
+	_, err := c.pool.Exec(ctx, sqlStatement, time.Now().Add(-time.Duration(interval_hours)*time.Hour))
+	if err != nil {
+		return errors.Wrap(err, "failed to delete completed delta checkpoint")
+	}
+
+	return nil
+}
+
 // Delete delta checkpoint record
 func (c *PostgreSQLClient) DeleteDeltaCheckpointByProcessId(ctx context.Context, processId string) error {
 	sqlStatement := `
@@ -830,8 +850,8 @@ func (c *PostgreSQLClient) GetColumnsWithCondition(ctx context.Context, args ...
 	return rows, finalSQL, nil
 }
 
-// CopyFromFileInTransaction copies data from a local file to a PostgreSQL table within a transaction
-func (c *PostgreSQLClient) CopyFromFileInTransaction(ctx context.Context, tx pgx.Tx, filePath, targetTable string, columnNames []string, updateOnConflict bool) error {
+// CopyFromLocalOnConflict copies data from a local file to a PostgreSQL table within a transaction
+func (c *PostgreSQLClient) CopyFromLocalOnConflict(ctx context.Context, tx pgx.Tx, filePath, targetTable string, columnNames []string, updateOnConflict bool) error {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to open file %s: %w", filePath, err)
@@ -861,7 +881,7 @@ func (c *PostgreSQLClient) CopyFromFileInTransaction(ctx context.Context, tx pgx
 	return nil
 }
 
-func (c *PostgreSQLClient) InsertIntoOnConflictFromFile(ctx context.Context, tx pgx.Tx, filePath, targetTable string, columnNames []string, updateOnConflict bool, insertIntoSize int) error {
+func (c *PostgreSQLClient) InsertIntoOnConflictFromLocal(ctx context.Context, tx pgx.Tx, filePath, targetTable string, columnNames []string, updateOnConflict bool, insertIntoSize int) error {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to open file %s: %w", filePath, err)
@@ -985,6 +1005,38 @@ func (c *PostgreSQLClient) executeBatchInsert(ctx context.Context, tx pgx.Tx, sq
 	_, err := tx.Exec(ctx, sqlStatement, allArgs...)
 	if err != nil {
 		return fmt.Errorf("failed to execute batch INSERT starting at line %d: %w", startLineNum, err)
+	}
+
+	return nil
+}
+
+func (c *PostgreSQLClient) CopyFromS3OnConflict(ctx context.Context, tx pgx.Tx, s3URL, targetTable string,
+	columnNames []string, updateOnConflict bool, s3Config S3Config) error {
+
+	var copySQL string
+	if updateOnConflict {
+		copySQL = fmt.Sprintf(`
+			COPY %s.%s (%s) FROM '%s'
+			ACCESS_KEY_ID '%s'
+			SECRET_ACCESS_KEY '%s'
+			(FORMAT csv, HEADER false, NULL 'null')
+			DO ON CONFLICT DO UPDATE;`,
+			c.config.Schema, targetTable, strings.Join(columnNames, ", "), s3URL,
+			s3Config.AccessKey, s3Config.SecretKey)
+	} else {
+		copySQL = fmt.Sprintf(`
+			COPY %s.%s (%s) FROM '%s'
+			ACCESS_KEY_ID '%s'
+			SECRET_ACCESS_KEY '%s'
+			(FORMAT csv, HEADER false, NULL 'null')
+			DO ON CONFLICT DO NOTHING;`,
+			c.config.Schema, targetTable, strings.Join(columnNames, ", "), s3URL,
+			s3Config.AccessKey, s3Config.SecretKey)
+	}
+
+	_, err := tx.Exec(ctx, copySQL)
+	if err != nil {
+		return fmt.Errorf("failed to execute COPY FROM S3: %w", err)
 	}
 
 	return nil

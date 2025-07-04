@@ -51,62 +51,69 @@ type Buffer struct {
 	ID            string
 	Records       []*Record
 	MaxRecords    int
+	S3FilePath    string
 	LocalFilePath string
 	CreatedAt     time.Time
-	FirstWriteAt  time.Time
-	LastWriteAt   time.Time
 	BufferMutex   sync.RWMutex
 	status        BufferStatus
-	LocalFile     string
 	MaxOffset     int64 // Maximum offset in this buffer
 }
 
 type BufferManager struct {
 	buffers               map[string]*Buffer
-	currentBuffer         *Buffer
-	currentAuxBuffer      *Buffer
+	filePrefix            string
+	processId             string
 	mutex                 sync.RWMutex
 	bufferOperationsMutex sync.Mutex
+	buffer                *Buffer
+	auxBuffer             *Buffer
 }
 
 // NewBufferManager 创建新的缓冲区管理器
-func NewBufferManager() *BufferManager {
+func NewBufferManager(filePrefix string, processId string) *BufferManager {
+	// Create a unique batch directory identifier
 	return &BufferManager{
-		buffers: make(map[string]*Buffer),
+		buffers:    make(map[string]*Buffer),
+		filePrefix: filePrefix,
+		processId:  processId,
+		buffer:     nil,
+		auxBuffer:  nil,
 	}
 }
 
-func (bm *BufferManager) GetCSVDir(localFilePrefix string) string {
-	relytName := "relyt_data"
+func (bm *BufferManager) GetLocalCSVDir() string {
 	datePath := time.Now().Format("2006-01-02")
-	fullPath := filepath.Join(localFilePrefix, relytName, datePath)
+	fullPath := filepath.Join(datePath, bm.processId, bm.filePrefix)
 	return fullPath
 }
 
 // NewBuffer 创建新的缓冲区
 func (bm *BufferManager) NewBuffer(localFilePrefix string, maxRecords int, isAux bool) *Buffer {
 	id := uuid.New().String()[:8]
-	// 创建临时文件
-	filename := fmt.Sprintf("%s_%s.csv", BufferPrefixNormal, id)
+	timestamp := time.Now().Format("150405.000")
+
+	buffer_id := fmt.Sprintf("%s_%s_%s", BufferPrefixNormal, timestamp, id)
 	if isAux {
-		filename = fmt.Sprintf("%s_%s.csv", BufferPrefixAux, id)
+		buffer_id = fmt.Sprintf("%s_%s_%s", BufferPrefixAux, timestamp, id)
 	}
 
-	dir := bm.GetCSVDir(localFilePrefix)
-	fullPath := filepath.Join(dir, filename)
+	fileDir := bm.GetLocalCSVDir()
+	localFilePath := filepath.Join(localFilePrefix, fileDir, buffer_id)
+	s3FilePath := filepath.Join(fileDir, buffer_id)
+
 	buffer := &Buffer{
 		ID:            id,
 		Records:       make([]*Record, 0),
 		MaxRecords:    maxRecords,
-		LocalFilePath: fullPath,
+		LocalFilePath: localFilePath,
+		S3FilePath:    s3FilePath,
 		CreatedAt:     time.Now(),
-		FirstWriteAt:  time.Time{},
-		LastWriteAt:   time.Now(),
 		status:        BufferStatusActive,
 	}
 	bm.mutex.Lock()
 	defer bm.mutex.Unlock()
 	bm.buffers[buffer.ID] = buffer
+
 	return buffer
 }
 
@@ -118,32 +125,75 @@ func (bm *BufferManager) RecycleBuffers() []string {
 
 	var filePaths []string
 	for _, buffer := range allBuffers {
-		if buffer.LocalFile != "" {
-			filePaths = append(filePaths, buffer.LocalFile)
+		if buffer.LocalFilePath != "" {
+			CleanupLocalFile(buffer.LocalFilePath)
+			filePaths = append(filePaths, buffer.LocalFilePath)
 		}
 		delete(bm.buffers, buffer.ID)
 	}
 	return filePaths
 }
 
+func (bm *BufferManager) RecycleLocalDir(localFilePrefix string, interval_days int) []string {
+	cutoffDate := time.Now().AddDate(0, 0, -interval_days)
+
+	var deletedPaths []string
+
+	err := filepath.Walk(localFilePrefix, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if path == localFilePrefix || !info.IsDir() {
+			return nil
+		}
+
+		dirName := filepath.Base(path)
+		if len(dirName) != 10 || dirName[4] != '-' || dirName[7] != '-' {
+			return nil
+		}
+
+		dirDate, err := time.Parse("2006-01-02", dirName)
+		if err != nil {
+			return nil
+		}
+
+		if dirDate.Before(cutoffDate) {
+			log.Printf("Deleting old local directory: %s (date: %s)", path, dirName)
+			if err := os.RemoveAll(path); err != nil {
+				log.Printf("Failed to delete directory %s: %v", path, err)
+				return nil
+			}
+			deletedPaths = append(deletedPaths, path)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		log.Printf("Error walking local directory %s: %v", localFilePrefix, err)
+	}
+
+	return deletedPaths
+}
+
 func (bm *BufferManager) GetCurrentBuffer(isAux bool) *Buffer {
 	bm.mutex.RLock()
 	defer bm.mutex.RUnlock()
 	if isAux {
-		return bm.currentAuxBuffer
+		return bm.auxBuffer
 	}
-	return bm.currentBuffer
+	return bm.buffer
 }
 
 func (bm *BufferManager) SetCurrentBuffer(newBuffer *Buffer, isAux bool) *Buffer {
 	bm.mutex.Lock()
 	defer bm.mutex.Unlock()
 
-	// 设置新的当前缓冲区
 	if isAux {
-		bm.currentAuxBuffer = newBuffer
+		bm.auxBuffer = newBuffer
 	} else {
-		bm.currentBuffer = newBuffer
+		bm.buffer = newBuffer
 	}
 	return newBuffer
 }
@@ -238,12 +288,7 @@ func (b *Buffer) AddRecord(record *Record) {
 	b.BufferMutex.Lock()
 	defer b.BufferMutex.Unlock()
 
-	if b.FirstWriteAt.IsZero() {
-		b.FirstWriteAt = time.Now()
-	}
-
 	b.Records = append(b.Records, record)
-	b.LastWriteAt = time.Now()
 
 	// Update max offset if this record has a higher offset
 	if record.Offset > b.MaxOffset {
@@ -393,12 +438,16 @@ func CleanupLocalFile(filePath string) error {
 	if filePath == "" {
 		return nil
 	}
-	log.Printf("Removing temporary file %s", filePath)
-	return os.Remove(filePath)
+	log.Printf("Removing temporary directory %s", filePath)
+	return os.RemoveAll(filePath)
 }
 
-// WriteToLocalFile write the records to the local file
-func (b *Buffer) WriteToLocalFile(headers []string) error {
+func GetLocalFileFullPath(localFilePath string) string {
+	return fmt.Sprintf("%s/local.csv", localFilePath)
+}
+
+// BufferWriteToFile write the records to the local file
+func (b *Buffer) BufferWriteToFile(headers []string, s3Client *S3Client, tuplesPrePartition int, copyFromS3 bool) error {
 	b.BufferMutex.Lock()
 	defer b.BufferMutex.Unlock()
 
@@ -406,42 +455,102 @@ func (b *Buffer) WriteToLocalFile(headers []string) error {
 		return nil
 	}
 
-	fullPath := b.LocalFilePath
+	fullPath := GetLocalFileFullPath(b.LocalFilePath)
 
 	// ensure the directory exists
 	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
+	// Write to local file
 	file, err := os.Create(fullPath)
 	if err != nil {
 		return fmt.Errorf("failed to create local file: %w", err)
 	}
 	defer file.Close()
 
-	// create the csv writer
+	// create the csv writer for local file
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
 
-	// write all the records (without headers)
+	// Filter records (exclude delete operations)
+	var validRecords []*Record
 	for _, record := range b.Records {
-		if record.Tag == OperationDelete {
-			continue
-		}
-		if err := writer.Write(record.Values); err != nil {
-			return fmt.Errorf("failed to write record: %w", err)
+		if record.Tag != OperationDelete {
+			validRecords = append(validRecords, record)
 		}
 	}
 
-	b.LocalFile = fullPath
-	log.Printf("Buffer %s wrote %d records to local file: %s", b.ID, len(b.Records), fullPath)
+	// Write all valid records to local file
+	for _, record := range validRecords {
+		if err := writer.Write(record.Values); err != nil {
+			return fmt.Errorf("failed to write record to local file: %w", err)
+		}
+	}
+
+	log.Printf("Buffer %s wrote %d records to local file: %s", b.ID, len(validRecords), fullPath)
+
+	// Write to S3 in multiple partitions using streaming:
+	// 1. Lower memory usage: data flows through pipe without buffering entire file
+	// 2. No file splitting needed: can write to multiple S3 partitions without creating local files
+	// 3. Parallel processing: data generation and S3 upload happen simultaneously
+	// 4. Reduced disk I/O: avoids writing large files to local disk
+	if s3Client != nil && (tuplesPrePartition > 0 || copyFromS3) && len(validRecords) > 0 {
+		totalRecords := len(validRecords)
+		numPartitions := (totalRecords + tuplesPrePartition - 1) / tuplesPrePartition // Ceiling division
+
+		for i := 0; i < numPartitions; i++ {
+			start := i * tuplesPrePartition
+			end := start + tuplesPrePartition
+			if end > totalRecords {
+				end = totalRecords
+			}
+
+			if start >= totalRecords {
+				break
+			}
+
+			// Create S3 path for this partition
+			s3PartitionPath := fmt.Sprintf("%s/part_%d.csv", b.S3FilePath, i+1)
+
+			// Create streaming writer for S3
+			s3Writer, err := s3Client.NewStreamingWriter(s3PartitionPath)
+			if err != nil {
+				return fmt.Errorf("failed to create S3 streaming writer for partition %d: %w", i+1, err)
+			}
+
+			// Create CSV writer for S3
+			csvWriter := csv.NewWriter(s3Writer)
+
+			// Write records directly to S3
+			for j := start; j < end; j++ {
+				if err := csvWriter.Write(validRecords[j].Values); err != nil {
+					s3Writer.Close()
+					return fmt.Errorf("failed to write record to S3 partition %d: %w", i+1, err)
+				}
+			}
+
+			// Flush and close S3 writer
+			csvWriter.Flush()
+			if err := csvWriter.Error(); err != nil {
+				s3Writer.Close()
+				return fmt.Errorf("CSV writer error for S3 partition %d: %w", i+1, err)
+			}
+
+			if err := s3Writer.Close(); err != nil {
+				return fmt.Errorf("failed to close S3 writer for partition %d: %w", i+1, err)
+			}
+		}
+	}
+
 	return nil
 }
 
 // BufferTask represents the buffer task
 type BufferTask struct {
-	TaskId         string
-	LocalFile      string
+	TaskId         string // same as buffer id
+	LocalFile      string // same as buffer local file path
+	S3File         string // same as buffer s3 file path
 	RecordCount    int
 	CreatedAt      time.Time
 	DeletedRecords []RecordIndex
@@ -452,7 +561,8 @@ type BufferTask struct {
 func NewBufferTask(buffer *Buffer, deletedRecords []RecordIndex) *BufferTask {
 	bufferTask := BufferTask{
 		TaskId:         buffer.ID,
-		LocalFile:      buffer.LocalFile,
+		LocalFile:      buffer.LocalFilePath,
+		S3File:         buffer.S3FilePath,
 		DeletedRecords: deletedRecords,
 		RecordCount:    buffer.GetRecordCount(),
 		CreatedAt:      time.Now(),
@@ -460,4 +570,13 @@ func NewBufferTask(buffer *Buffer, deletedRecords []RecordIndex) *BufferTask {
 	}
 	buffer.Records = nil
 	return &bufferTask
+}
+
+func (bm *BufferManager) GetCurrentBufferInfo(isAux bool) *Buffer {
+	bm.mutex.RLock()
+	defer bm.mutex.RUnlock()
+	if isAux {
+		return bm.auxBuffer
+	}
+	return bm.buffer
 }

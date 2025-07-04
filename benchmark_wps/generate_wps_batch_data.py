@@ -24,7 +24,7 @@
 #  version           | bigint                |           | not null |
 #  index_update_time | bigint                |           | not null |
 #  ext_group         | character varying(50) |           | not null |
-#  vector            | vecf16(3)          |           | not null |
+#  vector            | vecf16(1024)          |           | not null |
 # Partition key: RANGE (routing_id)
 # Indexes:
 #     "content_personal_vector_semantic_insight_vector_bge_m3_dense_pkey" PRIMARY KEY, btree (routing_id, fileid, id)
@@ -78,6 +78,7 @@ def generate_csv_file(file_index, base_records_per_file, start_id, output_dir, d
     """
     生成单个CSV文件（包含基础数据和10%重复数据）
     每一万条数据重新生成一次(routing_id, fileid)组合
+    重复数据随机插入到基础数据中，最后对数据进行打乱
     
     Args:
         file_index: 文件索引
@@ -109,8 +110,8 @@ def generate_csv_file(file_index, base_records_per_file, start_id, output_dir, d
     FIXED_VERSION = 1
     FIXED_INDEX_UPDATE_TIME = 1640995200
     FIXED_EXT_GROUP = "text"
-    # 生成固定的3维向量
-    FIXED_VECTOR = [0.1, 0.2, 0.3]
+    # 生成固定的1024维向量
+    FIXED_VECTOR = [0.1] * 1024  # 生成1024个0.1的固定向量
     
     # 每一万条数据重新生成一次(routing_id, fileid)组合
     RECORDS_PER_COMBINATION = 10000
@@ -121,16 +122,22 @@ def generate_csv_file(file_index, base_records_per_file, start_id, output_dir, d
     with open(filename, 'w', newline='', encoding='utf-8', buffering=32*1024*1024) as csvfile:
         csv_writer = csv.writer(csvfile)
         
-        # 预分配数据列表，一次性生成所有数据再写入
+        # 预分配数据列表
         data_batch = []
-        base_records = []  # 存储基础数据的主键信息，用于生成重复数据
         rand = get_thread_random()
         
-        # 第一步：生成基础数据
-        print(f"[文件-{file_index}] 生成 {base_records_per_file:,} 条基础数据...")
+        # 计算重复数据数量
+        duplicate_count = int(base_records_per_file * duplicate_ratio)
+        total_records = base_records_per_file + duplicate_count
+        
+        print(f"[文件-{file_index}] 生成 {base_records_per_file:,} 条基础数据 + {duplicate_count:,} 条重复数据...")
         
         current_routing_id = None
         current_fileid = None
+        
+        # 第一步：生成所有基础数据
+        print(f"[文件-{file_index}] 生成基础数据...")
+        base_records_info = []  # 存储基础数据的主键信息，用于生成重复数据
         
         for i in range(base_records_per_file):
             current_id = start_id + i
@@ -166,15 +173,13 @@ def generate_csv_file(file_index, base_records_per_file, start_id, output_dir, d
             data_batch.append(record)
             
             # 保存基础数据的主键信息，用于生成重复数据
-            base_records.append((str(current_id), current_routing_id, current_fileid))
+            base_records_info.append((str(current_id), current_routing_id, current_fileid))
         
-        # 第二步：生成10%的主键重复数据
-        duplicate_count = int(base_records_per_file * duplicate_ratio)
-        print(f"[文件-{file_index}] 生成 {duplicate_count:,} 条主键重复数据...")
-        
+        # 第二步：生成重复数据
+        print(f"[文件-{file_index}] 生成重复数据...")
         for i in range(duplicate_count):
             # 随机选择一个基础数据的主键
-            base_id, base_routing_id, base_fileid = rand.choice(base_records)
+            base_id, base_routing_id, base_fileid = rand.choice(base_records_info)
             
             # 创建重复主键的记录，其他字段保持固定
             duplicate_record = [
@@ -203,7 +208,9 @@ def generate_csv_file(file_index, base_records_per_file, start_id, output_dir, d
             ]
             data_batch.append(duplicate_record)
         
-        total_records = len(data_batch)
+        # 第三步：对数据进行打乱
+        print(f"[文件-{file_index}] 打乱数据顺序...")
+        rand.shuffle(data_batch)
         
         # 一次性写入所有数据
         print(f"[文件-{file_index}] 开始写入 {total_records:,} 条记录到磁盘...")
@@ -237,9 +244,9 @@ def main():
     - 每个文件包含110万条记录（100万基础 + 10万重复）
     """
     # 配置参数
-    total_base_records = 10_000_000  # 1千万条基础记录
-    base_records_per_file = 1_000_000  # 每个文件100万条基础记录
-    duplicate_ratio = 0  # 10%重复数据
+    total_base_records = 100000
+    base_records_per_file = 100000
+    duplicate_ratio = 0.1  # 重复数据比例(0-1)
     
     # 计算文件数量
     total_files = (total_base_records + base_records_per_file - 1) // base_records_per_file  # 向上取整
@@ -297,7 +304,8 @@ def main():
                         file_index,
                         current_base_records,
                         start_id,
-                        output_dir
+                        output_dir,
+                        duplicate_ratio
                     )
                     future_to_file[future] = file_index
                 
@@ -337,7 +345,8 @@ def main():
                     file_index,
                     current_base_records,
                     start_id,
-                    output_dir
+                    output_dir,
+                    duplicate_ratio
                 )
                 completed_files.append((file_idx, record_count, elapsed_time, filename))
                 total_generated_records += record_count
