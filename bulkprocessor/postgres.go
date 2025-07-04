@@ -784,7 +784,7 @@ func (c *PostgreSQLClient) DeleteTablesWithCondition(ctx context.Context, schema
 	return result, nil
 }
 
-func (c *PostgreSQLClient) GetColumnsWithCondition(ctx context.Context, args ...interface{}) (pgx.Rows, error) {
+func (c *PostgreSQLClient) GetColumnsWithCondition(ctx context.Context, args ...interface{}) (pgx.Rows, string, error) {
 	// build query
 	baseSQL := `
 		SELECT * FROM relyt_sys.get_columns_with_condition(
@@ -800,7 +800,34 @@ func (c *PostgreSQLClient) GetColumnsWithCondition(ctx context.Context, args ...
 			$10 -- have_aux_table
 		)`
 
-	return c.pool.Query(ctx, baseSQL, args...)
+	getSQLStatement := `
+		SELECT * FROM relyt_sys.get_columns_sql_with_condition(
+			$1,  -- schema_name
+			$2,  -- target_table_name
+			$3,  -- column_names
+			$4,  -- condition
+			$5,  -- order_by
+			$6,  -- group_by
+			$7,  -- having
+			$8,  -- limit_count
+			$9,  -- offset_count
+			$10 -- have_aux_table
+		)`
+
+	// 根据args生成完整的sql
+	sqlRow := c.pool.QueryRow(ctx, getSQLStatement, args...)
+	var finalSQL string
+	err := sqlRow.Scan(&finalSQL)
+	if err != nil {
+		return nil, "", errors.Wrap(err, "failed to get final sql")
+	}
+
+	rows, err := c.pool.Query(ctx, baseSQL, args...)
+	if err != nil {
+		return nil, finalSQL, errors.Wrap(err, "failed to get columns with condition")
+	}
+
+	return rows, finalSQL, nil
 }
 
 // CopyFromFileInTransaction copies data from a local file to a PostgreSQL table within a transaction

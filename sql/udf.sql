@@ -104,3 +104,73 @@ BEGIN
     RETURN QUERY EXECUTE query;
 END;
 $$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION relyt_sys.get_columns_sql_with_condition(
+    schema_name TEXT,
+    target_table_name TEXT,
+    column_names TEXT[],
+    condition TEXT DEFAULT NULL,
+    order_by TEXT DEFAULT NULL,
+    group_by TEXT DEFAULT NULL,
+    having_con TEXT DEFAULT NULL,
+    limit_count INTEGER DEFAULT NULL,
+    offset_count INTEGER DEFAULT NULL,
+    have_aux_table BOOLEAN DEFAULT TRUE
+) RETURNS TEXT AS $$
+DECLARE
+    query_sql TEXT;
+BEGIN
+
+    -- build base query based on have_aux_table parameter
+    IF have_aux_table THEN
+        query_sql = format('
+            WITH combined_data AS (
+                (SELECT * FROM %I.%I %s)
+                UNION ALL
+                (SELECT * FROM %I.%I %s)
+            )
+            SELECT row_to_json(t)
+            FROM (SELECT %s FROM combined_data %s %s %s %s %s) AS t',
+            -- main table
+            schema_name,
+            target_table_name,
+            CASE WHEN condition IS NOT NULL AND condition != '' THEN format('WHERE %s', condition) ELSE '' END,
+            -- aux table
+            schema_name,
+            target_table_name || '_relyt_massive_group',
+            CASE WHEN condition IS NOT NULL AND condition != '' THEN format('WHERE %s', condition) ELSE '' END,
+            -- window function
+            CASE 
+                WHEN array_length(column_names, 1) > 0 
+                THEN array_to_string(column_names, ', ')
+                ELSE '*'
+            END,
+            CASE WHEN group_by IS NOT NULL AND group_by != '' THEN format('GROUP BY %s', group_by) ELSE '' END,
+            CASE WHEN having_con IS NOT NULL AND having_con != '' THEN format('HAVING %s', having_con) ELSE '' END,
+            CASE WHEN order_by IS NOT NULL AND order_by != '' THEN format('ORDER BY %s', order_by) ELSE '' END,
+            CASE WHEN limit_count IS NOT NULL AND limit_count > 0 THEN format('LIMIT %s', limit_count) ELSE '' END,
+            CASE WHEN offset_count IS NOT NULL AND offset_count > 0 THEN format('OFFSET %s', offset_count) ELSE '' END
+        );
+    ELSE
+        query_sql = format('
+            SELECT row_to_json(t)
+            FROM (SELECT %s FROM %I.%I %s %s %s %s %s %s) AS t',
+            CASE 
+                WHEN array_length(column_names, 1) > 0 
+                THEN array_to_string(column_names, ', ')
+                ELSE '*'
+            END,
+            schema_name,
+            target_table_name,
+            CASE WHEN condition IS NOT NULL AND condition != '' THEN format('WHERE %s', condition) ELSE '' END,
+            CASE WHEN group_by IS NOT NULL AND group_by != '' THEN format('GROUP BY %s', group_by) ELSE '' END,
+            CASE WHEN having_con IS NOT NULL AND having_con != '' THEN format('HAVING %s', having_con) ELSE '' END,
+            CASE WHEN order_by IS NOT NULL AND order_by != '' THEN format('ORDER BY %s', order_by) ELSE '' END,
+            CASE WHEN limit_count IS NOT NULL AND limit_count > 0 THEN format('LIMIT %s', limit_count) ELSE '' END,
+            CASE WHEN offset_count IS NOT NULL AND offset_count > 0 THEN format('OFFSET %s', offset_count) ELSE '' END
+        );
+    END IF;
+
+    RETURN query_sql;
+END;
+$$ LANGUAGE plpgsql;
