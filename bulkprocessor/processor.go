@@ -171,7 +171,7 @@ func New(config Config) (*BulkProcessor, error) {
 
 	var bufferManager *BufferManager
 	if config.EnableDualBuffer {
-		bufferManager = NewBufferManager()
+		bufferManager = NewBufferManager(filePrefix, processId)
 	}
 
 	ctx, cancel = context.WithCancel(context.Background())
@@ -659,37 +659,25 @@ func (p *BulkProcessor) Flush() error {
 			p.bufferManager.bufferOperationsMutex.Lock()
 			currentBuffer := p.bufferManager.GetCurrentBuffer(isAux)
 			if currentBuffer != nil && currentBuffer.GetRecordCount() > 0 && p.bufferManager.IsActive(currentBuffer.ID) {
-				log.Printf("Force flushing current buffer: %s (records: %d)",
-					currentBuffer.ID, currentBuffer.GetRecordCount())
-
-				// set buffer status to frozen
+				// deactivate current buffer, create new buffer
 				p.bufferManager.SetBufferStatus(currentBuffer.ID, BufferStatusFrozen)
-
+				p.bufferManager.SetCurrentBuffer(nil, isAux)
 				p.bufferManager.bufferOperationsMutex.Unlock()
 
-				// deduplicate records
-				deletedRecords := currentBuffer.DeduplicateRecords(len(p.pkColumns) > 0, p.versionColIndex >= 0)
+				if err := p.SaveBufferToFileAndGenerateTask(currentBuffer, isAux); err != nil {
+					p.bufferManager.SetBufferStatus(currentBuffer.ID, BufferStatusFlushError)
+					feedbackKeysArray := p.getFeedbackValues()
+					feedbackKeysString := fmt.Sprintf("failed %s is [%s].", p.config.FeedbackColumn, strings.Join(feedbackKeysArray, ","))
 
-				// write to local file
-				if currentBuffer.GetRecordCount() > 0 {
-					columnNames := GetColumnNames(p.fields)
-					if err := currentBuffer.WriteToLocalFile(columnNames); err != nil {
-						p.bufferManager.SetBufferStatus(currentBuffer.ID, BufferStatusFlushError)
-
-						feedbackKeysArray := p.getFeedbackValues()
-						feedbackKeysString := fmt.Sprintf("failed %s is [%s].", p.config.FeedbackColumn, strings.Join(feedbackKeysArray, ","))
-						log.Printf("flush buffer %s failed before callback: %s", currentBuffer.ID, feedbackKeysString)
-						if p.config.ImportErrorCallback != nil {
-							p.config.ImportErrorCallback(p.config.FeedbackColumn, feedbackKeysArray, err, p.config.CallbackResource)
-						}
-
-						continue
+					if p.config.ImportErrorCallback != nil {
+						log.Printf("save file: %s failed before callback: %s", currentBuffer.ID, feedbackKeysString)
+						p.config.ImportErrorCallback(p.config.FeedbackColumn, feedbackKeysArray, err, p.config.CallbackResource)
+					} else {
+						log.Printf("save file: %s failed with no callback: %s", currentBuffer.ID, feedbackKeysString)
 					}
+					continue
 				}
 				p.bufferManager.SetBufferStatus(currentBuffer.ID, BufferStatusFlushed)
-				// create task and send to task queue
-				task := NewBufferTask(currentBuffer, deletedRecords)
-				p.bufferTaskQueue <- task
 			} else {
 				p.bufferManager.bufferOperationsMutex.Unlock()
 			}
@@ -1030,17 +1018,26 @@ func (p *BulkProcessor) BGWorkerThread() {
 			// Not canceled
 		}
 
+		// 1. recycle files and buffers. only recycle local files, not s3 files,
+		//	- S3 files can be set to automatically clean up.
+		//	- Back up local data to prevent data loss caused by local file loss.
 		importedFilepaths := p.fileManager.RecycleFiles(false)
 		importedFilepaths = append(importedFilepaths, p.bufferManager.RecycleBuffers()...)
 		if len(importedFilepaths) > 0 {
-			log.Printf("GC thread recycling files: %v", importedFilepaths)
+			log.Printf("GC thread recycling files, file number: %d", len(importedFilepaths))
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			if err := p.pgClient.DeleteDeltaCheckpointByProcessIdAndFilepaths(ctx, p.processId, importedFilepaths); err != nil {
 				log.Printf("Failed to delete delta checkpoint for recycled file: %v\n", err)
 			}
+			// delete completed delta checkpoint 24 hours ago
+			err := p.pgClient.DeleteCompletedDeltaCheckpoint(ctx, 24)
+			if err != nil {
+				log.Printf("Failed to delete completed delta checkpoint: %v", err)
+			}
 			cancel()
 		}
 
+		// 2. update load config
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		err := p.pgClient.UpdateLoadConfig(ctx, &p.config)
 		if err != nil {
@@ -1049,14 +1046,24 @@ func (p *BulkProcessor) BGWorkerThread() {
 		}
 		cancel()
 
-		// check the files in the fullPath directory
-		dirPath := p.bufferManager.GetCSVDir(p.config.LocalFilePrefix)
-		files, err := os.ReadDir(dirPath)
-		if err != nil {
-			log.Printf("Failed to read directory: %v", err)
-			time.Sleep(1 * time.Second)
+		// 3. check if the local csv directory files
+		dirPath := p.bufferManager.GetLocalCSVDir()
+		fullPath := filepath.Join(p.config.LocalFilePrefix, dirPath)
+		if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+			log.Printf("BGWORKER: Directory %s does not exist, skipping", fullPath)
 		} else {
-			log.Printf("BGWORKER: Found %d files in %s", len(files), dirPath)
+			files, err := os.ReadDir(fullPath)
+			if err != nil {
+				log.Printf("Failed to read directory: %v", err)
+			} else {
+				log.Printf("BGWORKER: Found %d files in %s", len(files), fullPath)
+			}
+		}
+
+		// 4. recycle local csv directory files, 2 days ago
+		deletedPaths := p.bufferManager.RecycleLocalDir(p.config.LocalFilePrefix, 2)
+		if len(deletedPaths) > 0 {
+			log.Printf("BGWORKER: Recycled %v old local directories", deletedPaths)
 		}
 
 		time.Sleep(time.Duration(p.config.BGWorkerInterval) * time.Second)
@@ -1363,6 +1370,27 @@ func (p *BulkProcessor) DeleteV2(fileID, routingID string, offset ...int64) erro
 	return nil
 }
 
+func (p *BulkProcessor) SaveBufferToFileAndGenerateTask(currentBuffer *Buffer, toAuxFile bool) error {
+	log.Printf("Buffer %s is full (records: %d), switching buffers",
+		currentBuffer.ID, currentBuffer.GetRecordCount())
+
+	// deduplicate records
+	deletedRecords := currentBuffer.DeduplicateRecords(len(p.pkColumns) > 0, p.versionColIndex >= 0)
+
+	columnNames := GetColumnNames(p.fields)
+
+	if err := currentBuffer.BufferWriteToFile(columnNames, p.s3Client, p.config.TuplesPrePartition, p.config.ImportStrategy == CopyFromS3); err != nil {
+		return err
+	}
+
+	// create task and send to task queue
+	task := NewBufferTask(currentBuffer, deletedRecords)
+	p.bufferTaskQueue <- task
+	p.lastFlushTime = time.Now()
+
+	return nil
+}
+
 // insert threadv2 for buffer
 func (p *BulkProcessor) InsertThreadV2() {
 	defer p.bufferThreadWg.Done()
@@ -1462,51 +1490,33 @@ func (p *BulkProcessor) InsertThreadV2() {
 			}
 
 			currentBuffer.AddRecord(record)
+			atomic.AddInt32(&p.recordsNum, -1)
 
 			if currentBuffer.IsFull() && p.bufferManager.IsActive(currentBuffer.ID) {
-				log.Printf("Buffer %s is full (records: %d), switching buffers",
-					currentBuffer.ID, currentBuffer.GetRecordCount())
+				versionMap = make(map[RecordIndex]string)
 
 				// deactivate current buffer, create new buffer
 				p.bufferManager.SetBufferStatus(currentBuffer.ID, BufferStatusFrozen)
 				p.bufferManager.SetCurrentBuffer(nil, toAuxFile)
 				p.bufferManager.bufferOperationsMutex.Unlock()
 
-				versionMap = make(map[RecordIndex]string)
+				if err := p.SaveBufferToFileAndGenerateTask(currentBuffer, toAuxFile); err != nil {
+					p.bufferManager.SetBufferStatus(currentBuffer.ID, BufferStatusFlushError)
+					feedbackKeysArray := p.getFeedbackValues()
+					feedbackKeysString := fmt.Sprintf("failed %s is [%s].", p.config.FeedbackColumn, strings.Join(feedbackKeysArray, ","))
 
-				// deduplicate records
-				deletedRecords := currentBuffer.DeduplicateRecords(len(p.pkColumns) > 0, p.versionColIndex >= 0)
-
-				// write to local file
-				if currentBuffer.GetRecordCount() > 0 {
-					columnNames := GetColumnNames(p.fields)
-					if err := currentBuffer.WriteToLocalFile(columnNames); err != nil {
-						p.bufferManager.SetBufferStatus(currentBuffer.ID, BufferStatusFlushError)
-
-						feedbackKeysArray := p.getFeedbackValues()
-						feedbackKeysString := fmt.Sprintf("failed %s is [%s].", p.config.FeedbackColumn, strings.Join(feedbackKeysArray, ","))
-						if p.config.ImportErrorCallback != nil {
-							log.Printf("WriteToLocalFile: %s failed before callback: %s", currentBuffer.ID, feedbackKeysString)
-							p.config.ImportErrorCallback(p.config.FeedbackColumn, feedbackKeysArray, err, p.config.CallbackResource)
-						} else {
-							log.Printf("WriteToLocalFile: %s failed with no callback: %s", currentBuffer.ID, feedbackKeysString)
-						}
-						atomic.AddInt32(&p.recordsNum, -1)
-						continue
+					if p.config.ImportErrorCallback != nil {
+						log.Printf("save file %s failed before callback: %s", currentBuffer.LocalFilePath, feedbackKeysString)
+						p.config.ImportErrorCallback(p.config.FeedbackColumn, feedbackKeysArray, err, p.config.CallbackResource)
+					} else {
+						log.Printf("save file %s failed with no callback: %s", currentBuffer.LocalFilePath, feedbackKeysString)
 					}
+					continue
 				}
 				p.bufferManager.SetBufferStatus(currentBuffer.ID, BufferStatusFlushed)
-
-				// create task and send to task queue
-				task := NewBufferTask(currentBuffer, deletedRecords)
-				p.bufferTaskQueue <- task
-				p.lastFlushTime = time.Now()
-
 			} else {
 				p.bufferManager.bufferOperationsMutex.Unlock()
 			}
-
-			atomic.AddInt32(&p.recordsNum, -1)
 		}
 	}
 }
@@ -1522,8 +1532,6 @@ func (p *BulkProcessor) ImporterThreadV2() {
 			log.Println("BufferTask thread context canceled, exiting...")
 			return
 		case task := <-p.bufferTaskQueue:
-			log.Printf("Processing buffer task: %s (records: %d)",
-				task.TaskId, task.RecordCount)
 
 			feedbackKeysArray := p.getFeedbackValues()
 
@@ -1551,12 +1559,13 @@ func (p *BulkProcessor) ImporterThreadV2() {
 					p.processBufferTask(t, wID, feedbackKeysArray)
 
 					duration := time.Since(startTime)
-					log.Printf("Parallel Worker %d finished processing task: %s, duration: %v", wID, t.TaskId, duration)
+					log.Printf("Parallel Worker %d finished import strategy is %d, processing task: %s, duration: %v", wID, p.config.ImportStrategy, t.TaskId, duration)
 				}(task, workerID)
 			} else {
 				startTime := time.Now()
+				log.Printf("Single Worker starting to process task: %s (records: %d)", task.TaskId, task.RecordCount)
 				p.processBufferTask(task, -1, feedbackKeysArray)
-				log.Printf("Single Worker finished processing task: %s, duration: %v", task.TaskId, time.Since(startTime))
+				log.Printf("Single Worker finished import strategy is %d, processing task: %s, duration: %v", p.config.ImportStrategy, task.TaskId, time.Since(startTime))
 			}
 		}
 	}
@@ -1564,8 +1573,6 @@ func (p *BulkProcessor) ImporterThreadV2() {
 
 // parallel process buffer task
 func (p *BulkProcessor) processBufferTask(task *BufferTask, workerID int, feedbackKeysArray []string) {
-	log.Printf("Worker %d starting to process buffer task: %s (records: %d)",
-		workerID, task.TaskId, task.RecordCount)
 
 	isFailed := true
 	maxLoopNum := p.config.ImportTimeout / p.config.ImportErrorSleepTime
@@ -1648,6 +1655,11 @@ func (p *BulkProcessor) processBufferTask(task *BufferTask, workerID int, feedba
 // processBufferTaskWithTransaction process buffer task with transaction, include delete and import
 func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask) error {
 
+	if task.RecordCount <= 0 {
+		log.Printf("task %s has no records, skip processing", task.TaskId)
+		return nil
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -1704,13 +1716,29 @@ func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask) error
 			targetTable += auxTableSuffix
 		}
 
-		if p.config.UseInsertOnConflict {
-			if err := p.pgClient.InsertIntoOnConflictFromFile(ctx, tx, task.LocalFile, targetTable, GetColumnNames(p.fields), p.config.UpdateOnConflict, p.config.InsertIntoBatchSize); err != nil {
-				return fmt.Errorf("Insert into on conflict from file failed: %w", err)
+		if p.config.ImportStrategy == InsertOnConflict {
+			if err := p.pgClient.InsertIntoOnConflictFromLocal(ctx, tx, GetLocalFileFullPath(task.LocalFile), targetTable,
+				GetColumnNames(p.fields), p.config.UpdateOnConflict, p.config.InsertIntoBatchSize); err != nil {
+				return fmt.Errorf("INSERT INTO failed: %w", err)
 			}
-		} else {
-			if err := p.pgClient.CopyFromFileInTransaction(ctx, tx, task.LocalFile, targetTable, GetColumnNames(p.fields), p.config.UpdateOnConflict); err != nil {
-				return fmt.Errorf("COPY failed: %w", err)
+		} else if p.config.ImportStrategy == CopyFromLocal {
+			if err := p.pgClient.CopyFromLocalOnConflict(ctx, tx, GetLocalFileFullPath(task.LocalFile), targetTable, GetColumnNames(p.fields), p.config.UpdateOnConflict); err != nil {
+				return fmt.Errorf("COPY FROM LOCAL failed: %w", err)
+			}
+		} else if p.config.ImportStrategy == CopyFromS3 {
+			s3Config, err := p.pgClient.GetLoadConfigFromDB(ctx, &p.config)
+			if err != nil {
+				return fmt.Errorf("failed to get S3 configuration: %w", err)
+			}
+
+			if err := p.pgClient.CopyFromS3OnConflict(ctx, tx, p.s3Client.GetS3URL(task.S3File), targetTable, GetColumnNames(p.fields), p.config.UpdateOnConflict, *s3Config); err != nil {
+				log.Printf("COPY FROM S3 failed for task %s: %v, falling back to INSERT ON CONFLICT", task.TaskId, err)
+
+				if err := p.pgClient.InsertIntoOnConflictFromLocal(ctx, tx, GetLocalFileFullPath(task.LocalFile), targetTable,
+					GetColumnNames(p.fields), p.config.UpdateOnConflict, p.config.InsertIntoBatchSize); err != nil {
+					return fmt.Errorf("fallback INSERT ON CONFLICT also failed: %w", err)
+				}
+				log.Printf("Successfully used fallback INSERT ON CONFLICT for task %s", task.TaskId)
 			}
 		}
 	}
@@ -1958,7 +1986,7 @@ func (p *BulkProcessor) SearchJsonRowsWithTimeoutV2(timeoutMs int, options *Sear
 	} else {
 		ctx, cancel = context.WithTimeout(p.ctx, time.Duration(timeoutMs)*time.Millisecond)
 	}
-	
+
 	defer cancel()
 
 	start := time.Now()
@@ -1970,7 +1998,7 @@ func (p *BulkProcessor) SearchJsonRowsWithTimeoutV2(timeoutMs int, options *Sear
 		if ctx.Err() == context.DeadlineExceeded {
 			return nil, errors.New(fmt.Sprintf("search timeout with time cost: %v", time.Since(start)))
 		}
-	
+
 		return nil, errors.Wrap(err, "failed to get columns with condition")
 	}
 

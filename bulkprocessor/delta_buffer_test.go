@@ -74,6 +74,9 @@ func NewProcessorV2(dbconfig DatabaseConfig, fileTimeout int, bufferSize int, ta
 
 	// create processor
 	processor, err := New(config)
+	if err != nil {
+		log.Fatalf("failed to create processor: %v", err)
+	}
 
 	if bufferSize > 0 {
 		processor.config.BufferMaxRecords = bufferSize
@@ -81,9 +84,6 @@ func NewProcessorV2(dbconfig DatabaseConfig, fileTimeout int, bufferSize int, ta
 
 	log.Printf("processor created, buffer max records: %d", processor.config.BufferMaxRecords)
 
-	if err != nil {
-		log.Fatalf("failed to create processor: %v", err)
-	}
 	return processor
 }
 
@@ -548,6 +548,7 @@ func TestBufferInsertWithSomeErrors(t *testing.T) {
 
 	// refresh all data and wait for import to complete
 	log.Println("refreshing data and waiting for import to complete...")
+	time.Sleep(time.Duration(10) * time.Second)
 	err = processor.Flush()
 	if err != nil {
 		log.Fatalf("failed to refresh data: %v", err)
@@ -648,7 +649,7 @@ func TestBufferInsertWithSleep(t *testing.T) {
 		if i%batchSize == 0 {
 			log.Printf("insert batch %d, contains %d records", i/batchSize, len(tests))
 			err := processor.InsertV2(fmt.Sprintf("%d", fileID), routingID, tests)
-			time.Sleep(time.Duration(fileTimeout+1) * time.Second) // sleep for 2 seconds before next insert
+			time.Sleep(time.Duration(fileTimeout+2) * time.Second) // sleep for 2 seconds before next insert
 			if err != nil {
 				t.Errorf("failed to insert data: %v", err)
 			}

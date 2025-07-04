@@ -46,6 +46,7 @@ CREATE OR REPLACE FUNCTION relyt_sys.get_columns_with_condition(
 DECLARE
     query TEXT;
     result JSON;
+    rec RECORD;
 BEGIN
 
     -- build base query based on have_aux_table parameter
@@ -56,8 +57,7 @@ BEGIN
                 UNION ALL
                 (SELECT * FROM %I.%I %s)
             )
-            SELECT row_to_json(t)
-            FROM (SELECT %s FROM combined_data %s %s %s %s %s) AS t',
+            SELECT %s FROM combined_data %s %s %s %s %s',
             -- main table
             schema_name,
             target_table_name,
@@ -80,8 +80,7 @@ BEGIN
         );
     ELSE
         query := format('
-            SELECT row_to_json(t)
-            FROM (SELECT %s FROM %I.%I %s %s %s %s %s %s) AS t',
+            SELECT %s FROM %I.%I %s %s %s %s %s %s',
             CASE 
                 WHEN array_length(column_names, 1) > 0 
                 THEN array_to_string(column_names, ', ')
@@ -101,7 +100,10 @@ BEGIN
     raise log 'get_columns_with_condition: query: %s', query;
 
     -- execute query and return result
-    RETURN QUERY EXECUTE query;
+    FOR rec IN EXECUTE query
+    LOOP
+        RETURN NEXT row_to_json(rec);
+    END LOOP;
 END;
 $$ LANGUAGE plpgsql;
 

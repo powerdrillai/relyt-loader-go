@@ -396,18 +396,18 @@ func TestSearchAdditional(t *testing.T) {
 		}
 	}
 
-	// SearchJsonV2 测试1：基本功能
+	// 14. select json: select id, routing_id, ext from test_routing_data where id in ($1) order by id asc
 	searchOptions = &SearchOptions{
 		Columns:   []string{"id", "routing_id", "ext"},
 		Condition: "id in ($1)",
-		OrderBy:   "id ASC",
+		OrderBy:   "id DESC",
 	}
-	jsonResults, err := processor.SearchJsonV2(searchOptions, []interface{}{1, 2, 5, 6})
+	jsonResults, err := processor.SearchJsonV2(searchOptions, []interface{}{1, 5, 2, 6})
 	if err != nil {
-		t.Errorf("SearchJsonV2 basic failed: %v", err)
+		t.Errorf("Test 14 failed: %v", err)
 	}
 	if len(jsonResults) != 4 {
-		t.Errorf("SearchJsonV2 basic expected 4 records, got %d", len(jsonResults))
+		t.Errorf("Test 14 expected 4 records, got %d", len(jsonResults))
 	}
 
 	// 解析每个JSON记录
@@ -415,52 +415,52 @@ func TestSearchAdditional(t *testing.T) {
 	for _, jsonResult := range jsonResults {
 		var record map[string]interface{}
 		if err := json.Unmarshal(jsonResult, &record); err != nil {
-			t.Errorf("SearchJsonV2 basic unmarshal failed: %v", err)
+			t.Errorf("Test 14 unmarshal failed: %v", err)
 		}
 		jsonRecords = append(jsonRecords, record)
 	}
 
-	log.Printf("SearchJsonV2 basic: %v", jsonRecords)
+	log.Printf("Test 14 result column: %v", jsonRecords)
 
-	// SearchJsonV2 测试2：空结果
+	// 15. select json: select id, routing_id, ext from test_routing_data where id in ($1) order by id asc
 	jsonResults, err = processor.SearchJsonV2(searchOptions, []interface{}{999, 1000})
 	if err != nil {
-		t.Errorf("SearchJsonV2 empty failed: %v", err)
+		t.Errorf("Test 15 failed: %v", err)
 	}
 	if len(jsonResults) != 0 {
-		t.Errorf("SearchJsonV2 empty expected empty array, got %d records", len(jsonResults))
+		t.Errorf("Test 15 expected empty array, got %d records", len(jsonResults))
 	}
-	log.Printf("SearchJsonV2 empty: %d records", len(jsonResults))
+	log.Printf("Test 15 result column: %v", jsonResults)
 
-	// SearchJsonRowsV2 测试1：基本功能
+	// 16. select json: select id, routing_id, ext from test_routing_data where id in ($1) order by id asc
 	rows, err := processor.SearchJsonRowsV2(searchOptions, []interface{}{1, 2, 5, 6})
 	if err != nil {
-		t.Errorf("SearchJsonRowsV2 basic failed: %v", err)
+		t.Errorf("Test 16 failed: %v", err)
 	}
 	defer rows.Close()
 	var rowCount int
 	for rows.Next() {
 		var resultJSON []byte
 		if err := rows.Scan(&resultJSON); err != nil {
-			t.Errorf("SearchJsonRowsV2 basic scan failed: %v", err)
+			t.Errorf("Test 16 scan failed: %v", err)
 			continue
 		}
 		var record map[string]interface{}
 		if err := json.Unmarshal(resultJSON, &record); err != nil {
-			t.Errorf("SearchJsonRowsV2 basic unmarshal failed: %v", err)
+			t.Errorf("Test 16 unmarshal failed: %v", err)
 			continue
 		}
 		rowCount++
-		log.Printf("SearchJsonRowsV2 basic row: %v", record)
+		log.Printf("Test 16 row: %v", record)
 	}
 	if rowCount != 4 {
-		t.Errorf("SearchJsonRowsV2 basic expected 4 rows, got %d", rowCount)
+		t.Errorf("Test 16 expected 4 rows, got %d", rowCount)
 	}
 
-	// SearchJsonRowsV2 测试2：空结果
+	// 17. select json: select id, routing_id, ext from test_routing_data where id in ($1) order by id asc
 	rows, err = processor.SearchJsonRowsV2(searchOptions, []interface{}{999, 1000})
 	if err != nil {
-		t.Errorf("SearchJsonRowsV2 empty failed: %v", err)
+		t.Errorf("Test 17 failed: %v", err)
 	}
 	defer rows.Close()
 	rowCount = 0
@@ -468,8 +468,8 @@ func TestSearchAdditional(t *testing.T) {
 		rowCount++
 	}
 	if rowCount != 0 {
-		t.Errorf("SearchJsonRowsV2 empty expected 0 rows, got %d", rowCount)
+		t.Errorf("Test 17 expected 0 rows, got %d", rowCount)
 	}
-	log.Printf("SearchJsonRowsV2 empty: %d rows", rowCount)
+	log.Printf("Test 17 result column: %v", rowCount)
 
 }
