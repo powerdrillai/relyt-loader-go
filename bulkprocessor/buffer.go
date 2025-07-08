@@ -327,12 +327,12 @@ func (pk *PrimaryKey) toString() string {
 	return strings.Join(pk.PKValues, "-")
 }
 
-func (b *Buffer) DeduplicateRecords(havePK, haveVersion bool) []RecordIndex {
+func (b *Buffer) DeduplicateRecords(havePK, haveVersion bool, asyncDelete bool) ([]RecordIndex, map[RecordIndex]string) {
 	b.BufferMutex.Lock()
 	defer b.BufferMutex.Unlock()
 
 	if len(b.Records) == 0 {
-		return []RecordIndex{}
+		return []RecordIndex{}, make(map[RecordIndex]string)
 	}
 
 	// records the delete records
@@ -431,7 +431,12 @@ func (b *Buffer) DeduplicateRecords(havePK, haveVersion bool) []RecordIndex {
 	for key := range deleteMap {
 		deletedIndices = append(deletedIndices, key)
 	}
-	return deletedIndices
+
+	if asyncDelete {
+		return deletedIndices, versionMap
+	}
+
+	return deletedIndices, nil
 }
 
 func CleanupLocalFile(filePath string) error {
@@ -554,16 +559,18 @@ type BufferTask struct {
 	RecordCount    int
 	CreatedAt      time.Time
 	DeletedRecords []RecordIndex
+	FileVersionMap map[RecordIndex]string
 	MaxOffset      int64 // Maximum offset in this buffer task
 }
 
 // NewBufferTask create a new buffer task
-func NewBufferTask(buffer *Buffer, deletedRecords []RecordIndex) *BufferTask {
+func NewBufferTask(buffer *Buffer, deletedRecords []RecordIndex, fileVersionMap map[RecordIndex]string) *BufferTask {
 	bufferTask := BufferTask{
 		TaskId:         buffer.ID,
 		LocalFile:      buffer.LocalFilePath,
 		S3File:         buffer.S3FilePath,
 		DeletedRecords: deletedRecords,
+		FileVersionMap: fileVersionMap,
 		RecordCount:    buffer.GetRecordCount(),
 		CreatedAt:      time.Now(),
 		MaxOffset:      buffer.GetMaxOffset(),
