@@ -227,7 +227,9 @@ func (c *PostgreSQLClient) GetLoadConfigFromDB(ctx context.Context, config *Conf
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'tuples_pre_partition' THEN CONFIG_VALUE END)::INT, 5000) as tuples_pre_partition,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'import_strategy' THEN CONFIG_VALUE END)::INT, 2) as import_strategy,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'max_concurrent_workers' THEN CONFIG_VALUE END)::INT, 1) as max_concurrent_workers,
-		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'insert_into_batch_size' THEN CONFIG_VALUE END)::INT, 100) as insert_into_batch_size
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'insert_into_batch_size' THEN CONFIG_VALUE END)::INT, 100) as insert_into_batch_size,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'async_delete' THEN CONFIG_VALUE END)::BOOLEAN, true) as async_delete,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'update_on_conflict' THEN CONFIG_VALUE END)::BOOLEAN, true) as update_on_conflict
 	FROM relyt_sys.SDK_LOADER_CONFIG
 	`
 
@@ -250,6 +252,8 @@ func (c *PostgreSQLClient) GetLoadConfigFromDB(ctx context.Context, config *Conf
 		&config.ImportStrategy,
 		&config.MaxConcurrentWorkers,
 		&config.InsertIntoBatchSize,
+		&config.AsyncDelete,
+		&config.UpdateOnConflict,
 	)
 
 	if err != nil {
@@ -269,7 +273,9 @@ func (c *PostgreSQLClient) UpdateLoadConfig(ctx context.Context, config *Config)
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'tuples_pre_partition' THEN CONFIG_VALUE END)::INT, 5000) as tuples_pre_partition,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'import_strategy' THEN CONFIG_VALUE END)::INT, 0) as import_strategy,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'max_concurrent_workers' THEN CONFIG_VALUE END)::INT, 1) as max_concurrent_workers,
-		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'insert_into_batch_size' THEN CONFIG_VALUE END)::INT, 100) as insert_into_batch_size
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'insert_into_batch_size' THEN CONFIG_VALUE END)::INT, 100) as insert_into_batch_size,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'async_delete' THEN CONFIG_VALUE END)::BOOLEAN, true) as async_delete,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'update_on_conflict' THEN CONFIG_VALUE END)::BOOLEAN, true) as update_on_conflict
 	FROM relyt_sys.SDK_LOADER_CONFIG
 	`
 
@@ -283,10 +289,12 @@ func (c *PostgreSQLClient) UpdateLoadConfig(ctx context.Context, config *Config)
 		&config.ImportStrategy,
 		&config.MaxConcurrentWorkers,
 		&config.InsertIntoBatchSize,
+		&config.AsyncDelete,
+		&config.UpdateOnConflict,
 	)
 
-	log.Printf("Update config result: ImportTimeout %d, ImportErrorSleepTime %d, EnableDualBuffer %t, BufferMaxRecords %d, TuplesPrePartition %d, ImportStrategy %d, MaxConcurrentWorkers %d, InsertIntoBatchSize %d",
-		config.ImportTimeout, config.ImportErrorSleepTime, config.EnableDualBuffer, config.BufferMaxRecords, config.TuplesPrePartition, config.ImportStrategy, config.MaxConcurrentWorkers, config.InsertIntoBatchSize)
+	log.Printf("Update config result: ImportTimeout %d, ImportErrorSleepTime %d, EnableDualBuffer %t, BufferMaxRecords %d, TuplesPrePartition %d, ImportStrategy %d, MaxConcurrentWorkers %d, InsertIntoBatchSize %d, AsyncDelete %t, UpdateOnConflict %t",
+		config.ImportTimeout, config.ImportErrorSleepTime, config.EnableDualBuffer, config.BufferMaxRecords, config.TuplesPrePartition, config.ImportStrategy, config.MaxConcurrentWorkers, config.InsertIntoBatchSize, config.AsyncDelete, config.UpdateOnConflict)
 
 	if err != nil {
 		return errors.Wrap(err, "failed to update load config")
@@ -1037,6 +1045,41 @@ func (c *PostgreSQLClient) CopyFromS3OnConflict(ctx context.Context, tx pgx.Tx, 
 	_, err := tx.Exec(ctx, copySQL)
 	if err != nil {
 		return fmt.Errorf("failed to execute COPY FROM S3: %w", err)
+	}
+
+	return nil
+}
+
+func (c *PostgreSQLClient) DeleteOutdatedFiles(ctx context.Context, tx pgx.Tx, table string, fileVersionMap map[RecordIndex]string) error {
+	// 如果没有版本映射，不需要删除
+	if len(fileVersionMap) == 0 {
+		return nil
+	}
+
+	// 构建批量删除的 SQL 语句
+	// 使用 EXISTS 子查询确保每个 file_id, routing_id 组合只删除小于对应版本的记录
+	sqlStatement := fmt.Sprintf(`
+		DELETE FROM %s.%s
+		WHERE EXISTS (
+			SELECT 1 FROM unnest($1::text[], $2::text[], $3::text[]) AS t(file_id_val, routing_id_val, version_val)
+			WHERE %s.%s.routing_id = t.routing_id_val
+			AND %s.%s.fileid = t.file_id_val::bigint
+			AND %s.%s.version < t.version_val::bigint
+		)
+		`, c.config.Schema, table, c.config.Schema, table, c.config.Schema, table, c.config.Schema, table)
+
+	// 准备批量删除的数据
+	var fileIDs, routingIDs, versions []string
+	for recordIndex, version := range fileVersionMap {
+		fileIDs = append(fileIDs, recordIndex.fileID)
+		routingIDs = append(routingIDs, recordIndex.routingID)
+		versions = append(versions, version)
+	}
+
+	// 执行批量删除
+	_, err := tx.Exec(ctx, sqlStatement, fileIDs, routingIDs, versions)
+	if err != nil {
+		return fmt.Errorf("failed to delete outdated files in batch: %w", err)
 	}
 
 	return nil

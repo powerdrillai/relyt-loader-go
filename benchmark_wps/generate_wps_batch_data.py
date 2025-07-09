@@ -107,14 +107,13 @@ def generate_csv_file(file_index, base_records_per_file, start_id, output_dir, d
     FIXED_FSIZE = 1024
     FIXED_PARENT_ID = 1000000
     FIXED_FTYPE = "text"
-    FIXED_VERSION = 1
     FIXED_INDEX_UPDATE_TIME = 1640995200
     FIXED_EXT_GROUP = "text"
     # 生成固定的1024维向量
-    FIXED_VECTOR = [0.1] * 1024  # 生成1024个0.1的固定向量
+    FIXED_VECTOR = [0.1] * 3  # 生成1024个0.1的固定向量
     
-    # 每一万条数据重新生成一次(routing_id, fileid)组合
-    RECORDS_PER_COMBINATION = 10000
+    # 每8000条数据重新生成一次(routing_id, fileid)组合
+    RECORDS_PER_COMBINATION = 8000
     
     filename = os.path.join(output_dir, f"wps_batch_data_{file_index}.csv")
     
@@ -134,6 +133,7 @@ def generate_csv_file(file_index, base_records_per_file, start_id, output_dir, d
         
         current_routing_id = None
         current_fileid = None
+        current_version = None
         
         # 第一步：生成所有基础数据
         print(f"[文件-{file_index}] 生成基础数据...")
@@ -142,19 +142,23 @@ def generate_csv_file(file_index, base_records_per_file, start_id, output_dir, d
         for i in range(base_records_per_file):
             current_id = start_id + i
             
-            # 每一万条数据重新生成一次(routing_id, fileid)组合
+            # 每RECORDS_PER_COMBINATION条数据重新生成一次(routing_id, fileid)组合
             if i % RECORDS_PER_COMBINATION == 0:
                 current_routing_id, current_fileid = generate_routing_fileid_pair()
+
+            # 每个(routing_id, fileid)组合内生成两个version
+            # 前RECORDS_PER_COMBINATION/2条记录用version 0，后RECORDS_PER_COMBINATION/2条记录用version 1
+            current_version = (i % RECORDS_PER_COMBINATION) // (RECORDS_PER_COMBINATION // 2)
             
             record = [
                 str(current_id),            # id (唯一递增)
-                current_routing_id,         # routing_id (每1万条更新一次)
+                current_routing_id,         # routing_id (每RECORDS_PER_COMBINATION条更新一次)
                 current_id,                 # chunk_id (与id相同)
                 FIXED_CHUNK_TYPE,           # chunk_type (固定)
                 FIXED_USER_ID,              # user_id (固定)
                 FIXED_CREATOR,              # creator (固定)
                 FIXED_SHARER,               # sharer (固定)
-                current_fileid,             # fileid (每1万条更新一次)
+                current_fileid,             # fileid (每RECORDS_PER_COMBINATION条更新一次)
                 FIXED_GROUP_ID,             # group_id (固定)
                 FIXED_CTIME,                # ctime (固定)
                 FIXED_MTIME,                # mtime (固定)
@@ -165,7 +169,7 @@ def generate_csv_file(file_index, base_records_per_file, start_id, output_dir, d
                 FIXED_FSIZE,                # fsize (固定)
                 FIXED_PARENT_ID,            # parent_id (固定)
                 FIXED_FTYPE,                # ftype (固定)
-                FIXED_VERSION,              # version (固定)
+                current_version,            # version (每RECORDS_PER_COMBINATION条更新一次)
                 FIXED_INDEX_UPDATE_TIME,    # index_update_time (固定)
                 FIXED_EXT_GROUP,            # ext_group (固定)
                 FIXED_VECTOR                # vector (固定)
@@ -180,6 +184,8 @@ def generate_csv_file(file_index, base_records_per_file, start_id, output_dir, d
         for i in range(duplicate_count):
             # 随机选择一个基础数据的主键
             base_id, base_routing_id, base_fileid = rand.choice(base_records_info)
+            # 为重复数据生成随机version (0或1)
+            current_version = rand.randint(0, 1)
             
             # 创建重复主键的记录，其他字段保持固定
             duplicate_record = [
@@ -201,7 +207,7 @@ def generate_csv_file(file_index, base_records_per_file, start_id, output_dir, d
                 FIXED_FSIZE,                # fsize (固定)
                 FIXED_PARENT_ID,            # parent_id (固定)
                 FIXED_FTYPE,                # ftype (固定)
-                FIXED_VERSION,              # version (固定)
+                current_version,            # version (每RECORDS_PER_COMBINATION条更新一次)
                 FIXED_INDEX_UPDATE_TIME,    # index_update_time (固定)
                 FIXED_EXT_GROUP,            # ext_group (固定)
                 FIXED_VECTOR                # vector (固定)
@@ -246,7 +252,7 @@ def main():
     # 配置参数
     total_base_records = 100000
     base_records_per_file = 100000
-    duplicate_ratio = 0.1  # 重复数据比例(0-1)
+    duplicate_ratio = 0  # 重复数据比例(0-1)
     
     # 计算文件数量
     total_files = (total_base_records + base_records_per_file - 1) // base_records_per_file  # 向上取整

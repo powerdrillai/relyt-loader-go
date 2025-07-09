@@ -60,6 +60,7 @@ type Config struct {
 	TuplesPrePartition   int    // tuples pre partition, default: 5000
 	LocalFilePrefix      string // local file prefix, default: "/tmp"
 	MaxConcurrentWorkers int    // max concurrent workers, default: 1
+	AsyncDelete          bool   // async delete, default: true
 }
 
 // Validate validates the configuration
