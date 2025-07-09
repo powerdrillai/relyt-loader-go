@@ -113,7 +113,6 @@ func formatValue(val reflect.Value) string {
 		for i := 0; i < val.Len(); i++ {
 			result = append(result, formatValue(val.Index(i)))
 		}
-		log.Printf("result: %s", "{"+strings.Join(result, ",")+"}")
 		return "{" + strings.Join(result, ",") + "}"
 	default:
 		return fmt.Sprintf("%v", val.Interface())
