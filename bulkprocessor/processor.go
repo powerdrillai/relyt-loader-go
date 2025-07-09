@@ -1727,11 +1727,11 @@ func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask) error
 	if task.LocalFile != "" && task.RecordCount > 0 {
 		if p.config.ImportStrategy == InsertOnConflict {
 			if err := p.pgClient.InsertIntoOnConflictFromLocal(ctx, tx, GetLocalFileFullPath(task.LocalFile), targetTable,
-				GetColumnNames(p.fields), p.config.UpdateOnConflict && !p.config.AsyncDelete, p.config.InsertIntoBatchSize); err != nil {
+				GetColumnNames(p.fields), p.config.UpdateOnConflict && len(task.FileVersionMap) == 0, p.config.InsertIntoBatchSize); err != nil {
 				return fmt.Errorf("INSERT INTO failed: %w", err)
 			}
 		} else if p.config.ImportStrategy == CopyFromLocal {
-			if err := p.pgClient.CopyFromLocalOnConflict(ctx, tx, GetLocalFileFullPath(task.LocalFile), targetTable, GetColumnNames(p.fields), p.config.UpdateOnConflict && !p.config.AsyncDelete); err != nil {
+			if err := p.pgClient.CopyFromLocalOnConflict(ctx, tx, GetLocalFileFullPath(task.LocalFile), targetTable, GetColumnNames(p.fields), p.config.UpdateOnConflict && len(task.FileVersionMap) == 0); err != nil {
 				return fmt.Errorf("COPY FROM LOCAL failed: %w", err)
 			}
 		} else if p.config.ImportStrategy == CopyFromS3 {
@@ -1740,11 +1740,11 @@ func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask) error
 				return fmt.Errorf("failed to get S3 configuration: %w", err)
 			}
 
-			if err := p.pgClient.CopyFromS3OnConflict(ctx, tx, p.s3Client.GetS3URL(task.S3File), targetTable, GetColumnNames(p.fields), p.config.UpdateOnConflict && !p.config.AsyncDelete, *s3Config); err != nil {
+			if err := p.pgClient.CopyFromS3OnConflict(ctx, tx, p.s3Client.GetS3URL(task.S3File), targetTable, GetColumnNames(p.fields), p.config.UpdateOnConflict && len(task.FileVersionMap) == 0, *s3Config); err != nil {
 				log.Printf("COPY FROM S3 failed for task %s: %v, falling back to INSERT ON CONFLICT", task.TaskId, err)
 
 				if err := p.pgClient.InsertIntoOnConflictFromLocal(ctx, tx, GetLocalFileFullPath(task.LocalFile), targetTable,
-					GetColumnNames(p.fields), p.config.UpdateOnConflict && !p.config.AsyncDelete, p.config.InsertIntoBatchSize); err != nil {
+					GetColumnNames(p.fields), p.config.UpdateOnConflict && len(task.FileVersionMap) == 0, p.config.InsertIntoBatchSize); err != nil {
 					return fmt.Errorf("fallback INSERT ON CONFLICT also failed: %w", err)
 				}
 				log.Printf("Successfully used fallback INSERT ON CONFLICT for task %s", task.TaskId)
