@@ -1,1 +1,5 @@
-v1.0.14
+2025-07-09 v1.0.14
+
+main change:
+1. Increase delete robustness and support lazy delete when the server is unavailable
+2. Delete the outdated version of the file first when inserting new data
