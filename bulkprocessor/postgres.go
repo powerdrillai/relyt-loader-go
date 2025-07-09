@@ -1057,27 +1057,27 @@ func (c *PostgreSQLClient) DeleteOutdatedFiles(ctx context.Context, tx pgx.Tx, t
 	}
 
 	// 构建批量删除的 SQL 语句
-	// 使用 EXISTS 子查询确保每个 file_id, routing_id 组合只删除小于对应版本的记录
-	sqlStatement := fmt.Sprintf(`
-		DELETE FROM %s.%s
-		WHERE EXISTS (
-			SELECT 1 FROM unnest($1::text[], $2::text[], $3::text[]) AS t(file_id_val, routing_id_val, version_val)
-			WHERE %s.%s.routing_id = t.routing_id_val
-			AND %s.%s.fileid = t.file_id_val::bigint
-			AND %s.%s.version < t.version_val::bigint
-		)
-		`, c.config.Schema, table, c.config.Schema, table, c.config.Schema, table, c.config.Schema, table)
+	// 遍历 fileVersionMap 构建 AND/OR 条件
+	var conditions []string
+	var args []interface{}
+	argIndex := 1
 
-	// 准备批量删除的数据
-	var fileIDs, routingIDs, versions []string
 	for recordIndex, version := range fileVersionMap {
-		fileIDs = append(fileIDs, recordIndex.fileID)
-		routingIDs = append(routingIDs, recordIndex.routingID)
-		versions = append(versions, version)
+		// 每个条件组合：routing_id = ? AND fileid = ? AND version < ?
+		condition := fmt.Sprintf("(routing_id = $%d AND fileid = $%d AND version < $%d)",
+			argIndex, argIndex+1, argIndex+2)
+
+		conditions = append(conditions, condition)
+		args = append(args, recordIndex.routingID, recordIndex.fileID, version)
+		argIndex += 3
 	}
 
+	// 使用 OR 连接所有条件组合
+	whereClause := strings.Join(conditions, " OR ")
+	sqlStatement := fmt.Sprintf("DELETE FROM %s.%s WHERE %s", c.config.Schema, table, whereClause)
+
 	// 执行批量删除
-	_, err := tx.Exec(ctx, sqlStatement, fileIDs, routingIDs, versions)
+	_, err := tx.Exec(ctx, sqlStatement, args...)
 	if err != nil {
 		return fmt.Errorf("failed to delete outdated files in batch: %w", err)
 	}

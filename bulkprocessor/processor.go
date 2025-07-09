@@ -1442,9 +1442,6 @@ func (p *BulkProcessor) InsertThreadV2() {
 				if _, exists := p.feedbackKeys[values[index]]; !exists {
 					// Add the feedback column value to the map
 					p.feedbackKeys[values[index]] = true
-				} else {
-					// If it already exists, we can skip adding it again
-					log.Printf("Feedback key already exists: %s", values[index])
 				}
 				p.feedbackKeysMutex.Unlock()
 			}
@@ -1657,6 +1654,8 @@ func (p *BulkProcessor) processBufferTask(task *BufferTask, workerID int, feedba
 // processBufferTaskWithTransaction process buffer task with transaction, include delete and import
 func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask) error {
 
+	asyncDelete := p.config.AsyncDelete
+
 	if task.RecordCount <= 0 && len(task.DeletedRecords) == 0 {
 		log.Printf("task %s has no records, skip processing", task.TaskId)
 		return nil
@@ -1675,6 +1674,11 @@ func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask) error
 	targetTable := p.config.PostgreSQL.Table
 	if isAuxFile {
 		targetTable += auxTableSuffix
+	}
+
+	updateOnConflict := p.config.UpdateOnConflict
+	if asyncDelete && len(task.FileVersionMap) > 0 {
+		updateOnConflict = false
 	}
 
 	tx, err := conn.Begin(ctx)
@@ -1717,7 +1721,7 @@ func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask) error
 	}
 
 	// 2. delete outdated files
-	if len(task.FileVersionMap) > 0 {
+	if len(task.FileVersionMap) > 0 && asyncDelete {
 		if err := p.pgClient.DeleteOutdatedFiles(ctx, tx, targetTable, task.FileVersionMap); err != nil {
 			return fmt.Errorf("failed to delete outdated files: %w", err)
 		}
@@ -1727,11 +1731,11 @@ func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask) error
 	if task.LocalFile != "" && task.RecordCount > 0 {
 		if p.config.ImportStrategy == InsertOnConflict {
 			if err := p.pgClient.InsertIntoOnConflictFromLocal(ctx, tx, GetLocalFileFullPath(task.LocalFile), targetTable,
-				GetColumnNames(p.fields), p.config.UpdateOnConflict && len(task.FileVersionMap) == 0, p.config.InsertIntoBatchSize); err != nil {
+				GetColumnNames(p.fields), updateOnConflict, p.config.InsertIntoBatchSize); err != nil {
 				return fmt.Errorf("INSERT INTO failed: %w", err)
 			}
 		} else if p.config.ImportStrategy == CopyFromLocal {
-			if err := p.pgClient.CopyFromLocalOnConflict(ctx, tx, GetLocalFileFullPath(task.LocalFile), targetTable, GetColumnNames(p.fields), p.config.UpdateOnConflict && len(task.FileVersionMap) == 0); err != nil {
+			if err := p.pgClient.CopyFromLocalOnConflict(ctx, tx, GetLocalFileFullPath(task.LocalFile), targetTable, GetColumnNames(p.fields), updateOnConflict); err != nil {
 				return fmt.Errorf("COPY FROM LOCAL failed: %w", err)
 			}
 		} else if p.config.ImportStrategy == CopyFromS3 {
@@ -1740,11 +1744,11 @@ func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask) error
 				return fmt.Errorf("failed to get S3 configuration: %w", err)
 			}
 
-			if err := p.pgClient.CopyFromS3OnConflict(ctx, tx, p.s3Client.GetS3URL(task.S3File), targetTable, GetColumnNames(p.fields), p.config.UpdateOnConflict && len(task.FileVersionMap) == 0, *s3Config); err != nil {
+			if err := p.pgClient.CopyFromS3OnConflict(ctx, tx, p.s3Client.GetS3URL(task.S3File), targetTable, GetColumnNames(p.fields), updateOnConflict, *s3Config); err != nil {
 				log.Printf("COPY FROM S3 failed for task %s: %v, falling back to INSERT ON CONFLICT", task.TaskId, err)
 
 				if err := p.pgClient.InsertIntoOnConflictFromLocal(ctx, tx, GetLocalFileFullPath(task.LocalFile), targetTable,
-					GetColumnNames(p.fields), p.config.UpdateOnConflict && len(task.FileVersionMap) == 0, p.config.InsertIntoBatchSize); err != nil {
+					GetColumnNames(p.fields), updateOnConflict, p.config.InsertIntoBatchSize); err != nil {
 					return fmt.Errorf("fallback INSERT ON CONFLICT also failed: %w", err)
 				}
 				log.Printf("Successfully used fallback INSERT ON CONFLICT for task %s", task.TaskId)
