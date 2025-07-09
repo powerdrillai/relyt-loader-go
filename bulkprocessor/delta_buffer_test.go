@@ -1744,9 +1744,6 @@ func TestBufferInsertWithDuplicate(t *testing.T) {
 	row1Str := fmt.Sprintf("%v", results.Rows[1])
 	expectedRow0Str := "[100 100]"
 	expectedRow1Str := "[120 120]"
-	if processor.config.AsyncDelete {
-		expectedRow1Str = "[110 110]"
-	}
 
 	if row0Str != expectedRow0Str {
 		t.Errorf("expected results: %v, got: %v", expectedRow0Str, row0Str)

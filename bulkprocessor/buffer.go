@@ -432,7 +432,7 @@ func (b *Buffer) DeduplicateRecords(havePK, haveVersion bool, asyncDelete bool) 
 		deletedIndices = append(deletedIndices, key)
 	}
 
-	if asyncDelete {
+	if asyncDelete && haveVersion {
 		return deletedIndices, versionMap
 	}
 
