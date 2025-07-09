@@ -260,6 +260,11 @@ func (c *PostgreSQLClient) GetLoadConfigFromDB(ctx context.Context, config *Conf
 		return nil, errors.Wrap(err, "failed to retrieve S3 configuration from database")
 	}
 
+	if config.TuplesPrePartition < 0 && config.ImportStrategy == CopyFromS3 {
+		log.Printf("TuplesPrePartition is less than 0, set to 5000")
+		config.TuplesPrePartition = 5000
+	}
+
 	return &s3Config, nil
 }
 
@@ -270,7 +275,7 @@ func (c *PostgreSQLClient) UpdateLoadConfig(ctx context.Context, config *Config)
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'import_error_sleep_time' THEN CONFIG_VALUE END)::INT, 10) as import_error_sleep_time,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'enable_dual_buffer' THEN CONFIG_VALUE END)::BOOLEAN, true) as enable_dual_buffer,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'buffer_max_records' THEN CONFIG_VALUE END)::INT, 5000) as buffer_max_records,
-		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'tuples_pre_partition' THEN CONFIG_VALUE END)::INT, 5000) as tuples_pre_partition,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'tuples_pre_partition' THEN CONFIG_VALUE END)::INT, -1) as tuples_pre_partition,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'import_strategy' THEN CONFIG_VALUE END)::INT, 0) as import_strategy,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'max_concurrent_workers' THEN CONFIG_VALUE END)::INT, 1) as max_concurrent_workers,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'insert_into_batch_size' THEN CONFIG_VALUE END)::INT, 100) as insert_into_batch_size,
@@ -298,6 +303,11 @@ func (c *PostgreSQLClient) UpdateLoadConfig(ctx context.Context, config *Config)
 
 	if err != nil {
 		return errors.Wrap(err, "failed to update load config")
+	}
+
+	if config.TuplesPrePartition < 0 && config.ImportStrategy == CopyFromS3 {
+		log.Printf("TuplesPrePartition is less than 0, set to 5000")
+		config.TuplesPrePartition = 5000
 	}
 
 	return nil

@@ -38,6 +38,13 @@
 # 3. vector为3维的向量
 # 4. 除了(routing_id, fileid, id)，为了效率其余字段可固定
 
+# -- 查找具有多个version的routing_id和fileid组合
+# SELECT routing_id, fileid, COUNT(DISTINCT version) as version_count,
+# count(*) FROM content_personal_vector_semantic_insight_vector_bge_m3_dense
+# GROUP BY routing_id, fileid
+# HAVING COUNT(DISTINCT version) > 0
+# ORDER BY version_count DESC;
+
 import random
 import string
 import time
@@ -177,15 +184,13 @@ def generate_csv_file(file_index, base_records_per_file, start_id, output_dir, d
             data_batch.append(record)
             
             # 保存基础数据的主键信息，用于生成重复数据
-            base_records_info.append((str(current_id), current_routing_id, current_fileid))
+            base_records_info.append((str(current_id), current_routing_id, current_fileid, current_version))
         
         # 第二步：生成重复数据
         print(f"[文件-{file_index}] 生成重复数据...")
         for i in range(duplicate_count):
             # 随机选择一个基础数据的主键
-            base_id, base_routing_id, base_fileid = rand.choice(base_records_info)
-            # 为重复数据生成随机version (0或1)
-            current_version = rand.randint(0, 1)
+            base_id, base_routing_id, base_fileid, base_version = rand.choice(base_records_info)
             
             # 创建重复主键的记录，其他字段保持固定
             duplicate_record = [
@@ -207,7 +212,7 @@ def generate_csv_file(file_index, base_records_per_file, start_id, output_dir, d
                 FIXED_FSIZE,                # fsize (固定)
                 FIXED_PARENT_ID,            # parent_id (固定)
                 FIXED_FTYPE,                # ftype (固定)
-                current_version,            # version (每RECORDS_PER_COMBINATION条更新一次)
+                base_version,               # version (与基础数据重复)
                 FIXED_INDEX_UPDATE_TIME,    # index_update_time (固定)
                 FIXED_EXT_GROUP,            # ext_group (固定)
                 FIXED_VECTOR                # vector (固定)
@@ -250,9 +255,9 @@ def main():
     - 每个文件包含110万条记录（100万基础 + 10万重复）
     """
     # 配置参数
-    total_base_records = 100000
-    base_records_per_file = 100000
-    duplicate_ratio = 0  # 重复数据比例(0-1)
+    total_base_records = 80000
+    base_records_per_file = 100000 # 每个文件的基础记录数
+    duplicate_ratio = 0.1  # 重复数据比例(0-1)
     
     # 计算文件数量
     total_files = (total_base_records + base_records_per_file - 1) // base_records_per_file  # 向上取整

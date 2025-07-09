@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os/exec"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func setupTestDatabase(t *testing.T) (*sql.DB, *BulkProcessor) {
@@ -84,6 +87,139 @@ func InitTestTables(db *sql.DB) error {
 		return fmt.Errorf("failed to insert data to test_routing_data_relyt_massive_group for routing_id 100: %w", err)
 	}
 
+	return nil
+}
+
+func CreateTestWPSDataTaleWithAux(db *sql.DB, withAux bool) error {
+	// This function is a placeholder for creating the test table in PostgreSQL.
+	// You can implement the logic to create the necessary table structure here.
+	// For example, you might use a SQL command like:
+	// CREATE TABLE test_data (id SERIAL PRIMARY KEY, ext TEXT, vector TEXT);
+	log.Println("Creating test table with auxin PostgreSQL...")
+	query := `
+		CREATE TABLE IF NOT EXISTS content_personal_vector_semantic_insight_vector_bge_m3_dense (
+		id VARCHAR, -- 唯一标识（fileid_chunkid）
+		routing_id VARCHAR NOT NULL, -- 对应 ES 的 routing
+		chunk_id INT NOT NULL, -- 文档内容块的 ID
+		chunk_type VARCHAR NOT NULL, -- 文档内容块的类型
+		user_id BIGINT NOT NULL, -- 用户 ID
+		creator BIGINT NOT NULL, -- 创建者 ID
+		sharer BIGINT NOT NULL, -- 分享者 ID
+		fileid BIGINT NOT NULL, -- 文档唯一标记
+		group_id BIGINT NOT NULL, -- 圈子 ID
+		ctime BIGINT NOT NULL, -- 创建时间
+		mtime BIGINT NOT NULL, -- 最后修改时间
+		y INT NOT NULL, -- 修改日期（年）
+		ym INT NOT NULL, -- 修改日期（年月）
+		ymd INT NOT NULL, -- 修改日期（年月日）
+		ext VARCHAR(10) NOT NULL, -- 文件格式
+		fsize BIGINT NOT NULL, -- 文件大小
+		parent_id BIGINT NOT NULL, -- 目录 ID
+		ftype VARCHAR(50) NOT NULL, -- 文件类型
+		version BIGINT NOT NULL, -- 文件版本号
+		index_update_time BIGINT NOT NULL, -- 全文更新时间
+		ext_group VARCHAR(50) NOT NULL, -- 格式组
+		vector vecf16(3) NOT NULL, -- 文档内容段的向量
+		PRIMARY KEY (routing_id, fileid, id) 
+		) using heap distributed BY (routing_id, fileid);
+
+		ALTER TABLE content_personal_vector_semantic_insight_vector_bge_m3_dense ALTER COLUMN vector SET STORAGE PLAIN;
+		CREATE INDEX insight_idx_fileid ON content_personal_vector_semantic_insight_vector_bge_m3_dense (fileid);
+		CREATE INDEX insight_idx_group_id ON content_personal_vector_semantic_insight_vector_bge_m3_dense (group_id);
+		CREATE INDEX insight_idx_vector ON content_personal_vector_semantic_insight_vector_bge_m3_dense 
+		using vectors(vector vecf16_l2_ops) 
+		WITH (options = $$
+			optimizing.optimizing_threads = 3
+			segment.max_growing_segment_size = 20000
+			segment.max_sealed_segment_size = 10000000
+			[indexing.hnsw]
+			m=30
+			ef_construction=100
+			quantization.product.ratio = "x16"
+		$$);
+
+		CREATE TABLE IF NOT EXISTS content_personal_vector_semantic_insight_vector_bge_m3_dense_relyt_massive_group (
+		id VARCHAR, -- 唯一标识（fileid_chunkid）
+		routing_id VARCHAR NOT NULL, -- 对应 ES 的 routing
+		chunk_id INT NOT NULL, -- 文档内容块的 ID
+		chunk_type VARCHAR NOT NULL, -- 文档内容块的类型
+		user_id BIGINT NOT NULL, -- 用户 ID
+		creator BIGINT NOT NULL, -- 创建者 ID
+		sharer BIGINT NOT NULL, -- 分享者 ID
+		fileid BIGINT NOT NULL, -- 文档唯一标记
+		group_id BIGINT NOT NULL, -- 圈子 ID
+		ctime BIGINT NOT NULL, -- 创建时间
+		mtime BIGINT NOT NULL, -- 最后修改时间
+		y INT NOT NULL, -- 修改日期（年）
+		ym INT NOT NULL, -- 修改日期（年月）
+		ymd INT NOT NULL, -- 修改日期（年月日）
+		ext VARCHAR(10) NOT NULL, -- 文件格式
+		fsize BIGINT NOT NULL, -- 文件大小
+		parent_id BIGINT NOT NULL, -- 目录 ID
+		ftype VARCHAR(50) NOT NULL, -- 文件类型
+		version BIGINT NOT NULL, -- 文件版本号
+		index_update_time BIGINT NOT NULL, -- 全文更新时间
+		ext_group VARCHAR(50) NOT NULL, -- 格式组
+		vector vecf16(3) NOT NULL, -- 文档内容段的向量
+		PRIMARY KEY (routing_id, fileid, id) 
+		) using heap distributed BY (routing_id, fileid);
+
+		ALTER TABLE content_personal_vector_semantic_insight_vector_bge_m3_dense_relyt_massive_group ALTER COLUMN vector SET STORAGE PLAIN;
+		CREATE INDEX insight_idx_fileid_relyt_massive_group ON content_personal_vector_semantic_insight_vector_bge_m3_dense_relyt_massive_group (fileid);
+		CREATE INDEX insight_idx_group_id_relyt_massive_group ON content_personal_vector_semantic_insight_vector_bge_m3_dense_relyt_massive_group (group_id);
+		CREATE INDEX insight_idx_vector_relyt_massive_group ON content_personal_vector_semantic_insight_vector_bge_m3_dense_relyt_massive_group 
+		using vectors(vector vecf16_l2_ops) 
+		WITH (options = $$
+			optimizing.optimizing_threads = 3
+			segment.max_growing_segment_size = 20000
+			segment.max_sealed_segment_size = 10000000
+			[indexing.hnsw]
+			m=30
+			ef_construction=100
+			quantization.product.ratio = "x16"
+		$$);
+	`
+
+	if withAux {
+		query += `
+		CREATE TABLE IF NOT EXISTS relyt_sys.content_personal_vector_semantic_insight_vector_bge_m3_dense_relyt_routing (
+		routing_id text PRIMARY KEY,
+		store_table_name TEXT NOT NULL
+	) USING heap DISTRIBUTED NONE;
+	`
+	}
+
+	_, err := db.Exec(query)
+	if err != nil {
+		return fmt.Errorf("failed to create test table: %w", err)
+	}
+	log.Println("Test table created successfully.")
+	return nil
+}
+
+func DropTestWPSDataTaleWithAux(db *sql.DB) error {
+	query := `
+	DROP TABLE IF EXISTS content_personal_vector_semantic_insight_vector_bge_m3_dense;
+	DROP TABLE IF EXISTS content_personal_vector_semantic_insight_vector_bge_m3_dense_relyt_massive_group;
+	DROP TABLE IF EXISTS relyt_sys.content_personal_vector_semantic_insight_vector_bge_m3_dense_relyt_routing;
+	`
+	_, err := db.Exec(query)
+	if err != nil {
+		return fmt.Errorf("failed to drop test table: %w", err)
+	}
+	log.Println("Test table dropped successfully.")
+	return nil
+}
+
+func InsertTestWPSDataTaleWithAux(db *sql.DB) error {
+	gen_bash := `
+	python3 ../examples/gen_wps_data.py
+	`
+	_, err := exec.Command("bash", "-c", gen_bash).Output()
+	if err != nil {
+		return fmt.Errorf("failed to insert test data: %w", err)
+	}
+	log.Println("Test data inserted successfully.")
 	return nil
 }
 
@@ -168,11 +304,312 @@ func TestSearchBasic(t *testing.T) {
 
 }
 
+func TestNewSearchFunc(t *testing.T) {
+	dbConfig := InitDatabaseConfig("127.0.0.1", 7000, "postgres", "", "postgres")
+	db, err := SetupDataBase(dbConfig)
+	if err != nil {
+		t.Fatalf("failed to setup database: %v", err)
+	}
+	defer db.Close()
+	if err != nil {
+		t.Fatalf("failed to setup database: %v", err)
+	}
+
+	err = DropTestWPSDataTaleWithAux(db)
+	if err != nil {
+		t.Fatalf("failed to drop test table: %v", err)
+	}
+
+	err = CreateTestWPSDataTaleWithAux(db, true)
+	if err != nil {
+		t.Fatalf("failed to create test table: %v", err)
+	}
+
+	err = InsertTestWPSDataTaleWithAux(db)
+	if err != nil {
+		t.Fatalf("failed to insert test data: %v", err)
+	}
+
+	processor := NewProcessor(dbConfig, 6, "content_personal_vector_semantic_insight_vector_bge_m3_dense")
+	defer processor.Shutdown()
+
+	// test 1: select id, chunk_id from content_personal_vector_semantic_insight_vector_bge_m3_dense where group_id in (1, 11) and routing_id in ('1', '11') order by id asc limit 16;
+	searchOptions := &SearchOptions{
+		Columns:   []string{"id", "chunk_id"},
+		Condition: "group_id IN (1, 11) AND routing_id IN ('1', '11')",
+		OrderBy:   "id ASC",
+		Limit:     16,
+	}
+	result, err := processor.SearchV2(searchOptions)
+	if err != nil {
+		t.Errorf("failed to search data: %v", err)
+		return
+	}
+
+	if len(result.Rows) != 2 {
+		t.Errorf("expected 2 rows, but got %d", len(result.Rows))
+	}
+
+	log.Printf("TestNewSearchFunc test 1 result size: %d, result: %v", len(result.Rows), result)
+
+	// test 2: with window function
+	// select id, mtime, COUNT(*) OVER() AS total, vector <-> '[0.76,0.49, 0.67]' as score
+	// from content_personal_vector_semantic_insight_vector_bge_m3_dense where group_id in (1, 11) and routing_id in ('1', '11') order by score ASC, mtime DESC LIMIT 16;
+	searchOptions = &SearchOptions{
+		Columns:   []string{"id", "group_id", "mtime", "COUNT(*) OVER()", "vector <-> '[0.76,0.49, 0.67]' as score"},
+		Condition: "group_id IN (1, 11) AND routing_id IN ('1', '11')",
+		OrderBy:   "score ASC, mtime DESC",
+		Limit:     2,
+	}
+	result, err = processor.SearchV2(searchOptions)
+	if err != nil {
+		t.Errorf("failed to search data: %v", err)
+		return
+	}
+	log.Printf("TestNewSearchFunc test 2 result size: %d, result: %v", len(result.Rows), result)
+
+	// test 3: without window function
+	// select id, mtime vector <-> '[0.76,0.49, 0.67]' as score
+	// from content_personal_vector_semantic_insight_vector_bge_m3_dense where group_id in (1, 11) and routing_id in ('1', '11') order by score ASC, mtime DESC LIMIT 2;
+	searchOptions = &SearchOptions{
+		Columns:   []string{"id", "group_id", "mtime", "vector <-> '[0.76,0.49, 0.67]' as score"},
+		Condition: "group_id IN (1, 11) AND routing_id IN ('1', '11')",
+		OrderBy:   "score ASC, mtime DESC",
+		Limit:     2,
+	}
+	result, err = processor.SearchV2(searchOptions)
+	if err != nil {
+		t.Errorf("failed to search data: %v", err)
+		return
+	}
+	log.Printf("TestNewSearchFunc test 3 result size: %d, result: %v", len(result.Rows), result)
+
+	// test 4: order by score desc
+	// select id, mtime vector <-> '[0.76,0.49, 0.67]' as score
+	// from content_personal_vector_semantic_insight_vector_bge_m3_dense where group_id in (1, 11) and routing_id in ('1', '11') order by score DESC LIMIT 2;
+	searchOptions = &SearchOptions{
+		Columns:   []string{"id", "group_id", "mtime", "vector <-> '[0.76,0.49, 0.67]' as score"},
+		Condition: "group_id IN (1, 11) AND routing_id IN ('1', '11')",
+		OrderBy:   "score DESC",
+		Limit:     2,
+	}
+
+	_, err = processor.SearchV2(searchOptions)
+	if err == nil {
+		t.Errorf("expected error, but got nil")
+		return
+	}
+	log.Printf("TestNewSearchFunc test 4 error: %v", err)
+
+	// test 5: order by without vector
+	// select id, mtime vector <-> '[0.76,0.49, 0.67]' as score
+	// from content_personal_vector_semantic_insight_vector_bge_m3_dense where group_id in (1, 11) and routing_id in ('1', '11') order by mtime DESC LIMIT 2;
+	searchOptions = &SearchOptions{
+		Columns:   []string{"id", "group_id", "COUNT(*) OVER() as count", "mtime", "vector <-> '[0.76,0.49, 0.67]' as score"},
+		Condition: "group_id IN (1, 11) AND routing_id IN ('1', '11')",
+		OrderBy:   "mtime DESC",
+		Limit:     2,
+	}
+	_, err = processor.SearchV2(searchOptions)
+	if err != nil {
+		t.Errorf("TestNewSearchFunc test 5 error: %v", err)
+		return
+	}
+	log.Printf("TestNewSearchFunc test 5 result size: %d, result: %v", len(result.Rows), result)
+
+	// test 6: group by not support
+	// select group_id, count(*) from content_personal_vector_semantic_insight_vector_bge_m3_dense where group_id in (1, 11) and routing_id in ('1', '11') group by group_id;
+	searchOptions = &SearchOptions{
+		Columns:   []string{"group_id", "count(*)"},
+		Condition: "group_id IN (1, 11) AND routing_id IN ('1', '11')",
+		GroupBy:   "group_id",
+	}
+	_, err = processor.SearchV2(searchOptions)
+	if err == nil {
+		t.Errorf("TestNewSearchFunc test 6 error: %v", err)
+		return
+	}
+	log.Printf("TestNewSearchFunc test 6 error: %v", err)
+
+	// test 7: syntax error
+	searchOptions = &SearchOptions{
+		Columns:   []string{"id", "chunk_id"},
+		Condition: "and group_id IN (1, 11) AND routing_id IN ('1', '11')",
+		OrderBy:   "id ASC",
+		Limit:     16,
+	}
+	rows, err := processor.SearchJsonRowsWithTimeoutV2(10000, searchOptions)
+	if err != nil {
+		if pgErr, ok := err.(*pgconn.PgError); ok {
+			log.Printf("TestNewSearchFunc test 7 PostgreSQL error: %s", pgErr.Message)
+		} else {
+			log.Printf("TestNewSearchFunc test 7 error: %v", err)
+		}
+		return
+	}
+
+	for rows.Next() {
+		var jsonData []byte
+		err = rows.Scan(&jsonData)
+		if err != nil {
+			log.Printf("TestNewSearchFunc test 7 scan error: %v", err)
+			continue
+		}
+
+		// 解析 JSON 数据
+		var row map[string]interface{}
+		if err := json.Unmarshal(jsonData, &row); err != nil {
+			log.Printf("TestNewSearchFunc test 7 JSON unmarshal error: %v", err)
+			continue
+		}
+
+		// 方法1: 直接访问字段（推荐）
+		if id, exists := row["id"]; exists {
+			log.Printf("TestNewSearchFunc test 7 result: id=%v", id)
+		}
+
+		// 方法2: 类型断言获取具体类型
+		if chunkId, exists := row["chunk_id"]; exists {
+			if chunkIdInt, ok := chunkId.(float64); ok {
+				// JSON 中的数字默认解析为 float64
+				log.Printf("TestNewSearchFunc test 7 result: chunk_id=%d", int(chunkIdInt))
+			} else {
+				log.Printf("TestNewSearchFunc test 7 result: chunk_id=%v (type: %T)", chunkId, chunkId)
+			}
+		}
+
+		// 方法3: 获取所有字段
+		log.Printf("TestNewSearchFunc test 7 full result: %v", row)
+	}
+
+	if err := rows.Err(); err != nil {
+		if pgErr, ok := err.(*pgconn.PgError); ok {
+			log.Printf("TestNewSearchFunc test 7 PostgreSQL error: %s", pgErr.Message)
+		} else {
+			log.Printf("TestNewSearchFunc test 7 error: %v", err)
+		}
+	}
+
+	// test 8: count(*)
+	searchOptions = &SearchOptions{
+		Columns:   []string{"count(*)"},
+		Condition: "group_id IN (1, 11) AND routing_id IN ('1', '11')",
+	}
+	_, err = processor.SearchJsonRowsWithTimeoutV2(10000, searchOptions)
+
+	if err == nil {
+		t.Errorf("TestNewSearchFunc test 8 error: %v", err)
+		return
+	}
+	log.Printf("TestNewSearchFunc test 8 error: %v", err)
+
+	// test 9: select * from content_personal_vector_semantic_insight_vector_bge_m3_dense where group_id in (1, 11) and routing_id in ('1', '11');
+	searchOptions = &SearchOptions{
+		Columns:   []string{"*"},
+		Condition: "group_id IN (1, 11) AND routing_id IN ('1', '11')",
+	}
+	_, err = processor.SearchJsonRowsWithTimeoutV2(10000, searchOptions)
+	if err != nil {
+		log.Printf("TestNewSearchFunc test 9 error: %v", err)
+	}
+
+	// test 10: select id, group_id, mtime, count(*) over() as count, vector <-> '[0.76,0.49, 0.67]' as score from test_table where group_id in (1, 11) and routing_id in ('1', '11') order by score ASC, mtime DESC limit 2;
+	searchOptions = &SearchOptions{
+		Columns:   []string{"id", "group_id", "mtime", "COUNT(*) OVER() as count", "vector <-> '[0.76,0.49, 0.67]' as score"},
+		Condition: "group_id IN (1, 11) AND routing_id IN ('1', '11')",
+		OrderBy:   "score ASC, mtime DESC",
+		Limit:     2,
+	}
+	rows, err = processor.SearchJsonRowsWithTimeoutV2(10000, searchOptions)
+	if err != nil {
+		if pgErr, ok := err.(*pgconn.PgError); ok {
+			log.Printf("TestNewSearchFunc test 10 PostgreSQL error: %s, %s", pgErr.Message, pgErr.Detail)
+		} else {
+			log.Printf("TestNewSearchFunc test 10 error: %v", err)
+		}
+		return
+	}
+
+	for rows.Next() {
+		var jsonData []byte
+		err = rows.Scan(&jsonData)
+		if err != nil {
+			t.Errorf("TestNewSearchFunc test 10 rows.Scan error: %v", err)
+
+		}
+
+		log.Printf("TestNewSearchFunc test 10 jsonData: %v", string(jsonData))
+
+		// 解析 JSON 数据
+		var row map[string]interface{}
+		if err := json.Unmarshal(jsonData, &row); err != nil {
+			t.Errorf("TestNewSearchFunc test 10 JSON unmarshal error: %v", err)
+			continue
+		}
+
+		// 获取具体的字段值
+		id, idExists := row["id"]
+		chunkId, chunkIdExists := row["group_id"]
+		mtime, mtimeExists := row["mtime"]
+		count, countExists := row["count"]
+		score, scoreExists := row["score"]
+
+		if idExists && chunkIdExists && mtimeExists && scoreExists && countExists {
+			log.Printf("TestNewSearchFunc test 10 result: id=%v, group_id=%v, mtime=%v, score=%v, count=%v", id, chunkId, mtime, score, count)
+		} else {
+			log.Printf("TestNewSearchFunc test 10 result: %v (missing fields)", row)
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		if pgErr, ok := err.(*pgconn.PgError); ok {
+			log.Printf("TestNewSearchFunc test 10 PostgreSQL error: %s, %s", pgErr.Message, pgErr.Detail)
+		} else {
+			log.Printf("TestNewSearchFunc test 10 error: %v", err)
+		}
+	}
+
+	// test 11: select id, group_id, count(*) over() count, mtime, vector <-> '[0.76,0.49, 0.67]' score from test_table where group_id in (1, 11) and routing_id in ('1', '11') order by score ASC, mtime DESC limit 2;
+	searchOptions = &SearchOptions{
+		Columns:   []string{"id", "group_id", "COUNT(*) OVER() Count", "mtime", "vector <-> '[0.76,0.49, 0.67]' score"},
+		Condition: "group_id IN (1, 11) AND routing_id IN ('1', '11')",
+		OrderBy:   "score ASC, mtime DESC",
+		Limit:     2,
+	}
+	rows, err = processor.SearchJsonRowsWithTimeoutV2(10000, searchOptions)
+	if err != nil {
+		if pgErr, ok := err.(*pgconn.PgError); ok {
+			log.Printf("TestNewSearchFunc test 11 PostgreSQL error: %s, %s", pgErr.Message, pgErr.Detail)
+		} else {
+			log.Printf("TestNewSearchFunc test 11 error: %v", err)
+		}
+		return
+	}
+
+	for rows.Next() {
+		var jsonData []byte
+		err = rows.Scan(&jsonData)
+		if err != nil {
+			t.Errorf("TestNewSearchFunc test 11 rows.Scan error: %v", err)
+
+		}
+
+		log.Printf("TestNewSearchFunc test 11 jsonData: %v", string(jsonData))
+	}
+
+	if err := rows.Err(); err != nil {
+		if pgErr, ok := err.(*pgconn.PgError); ok {
+			log.Printf("TestNewSearchFunc test 11 PostgreSQL error: %s, %s", pgErr.Message, pgErr.Detail)
+		} else {
+			log.Printf("TestNewSearchFunc test 11 error: %v", err)
+		}
+	}
+}
+
 func TestSearchAdditional(t *testing.T) {
 	db, processor := setupTestDatabase(t)
 	defer db.Close()
 	defer processor.Shutdown()
-
 	// 1. 基本查询：select id, routing_id, ext, vector from test_routing_data where id in (1, 2, 5, 6) order by id asc limit 5
 	searchOptions := &SearchOptions{
 		Columns:   []string{"id", "routing_id", "ext", "vector"},

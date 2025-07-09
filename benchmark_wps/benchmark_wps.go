@@ -148,10 +148,19 @@ func GetCountFromTable(db *sql.DB) (int, error) {
 	return count, nil
 }
 
+func TruncateTable(db *sql.DB) error {
+	query := `TRUNCATE TABLE content_personal_vector_semantic_insight_vector_bge_m3_dense;`
+	_, err := db.Exec(query)
+	if err != nil {
+		return fmt.Errorf("failed to truncate table: %w", err)
+	}
+	return nil
+}
+
 // fork multiple go routines to insert data use only one processor
 func main() {
 	// Initialize database connection
-	dbConfig := InitDatabaseConfig("127.0.0.1", 5432, "postgres", "", "postgres")
+	dbConfig := InitDatabaseConfig("127.0.0.1", 7000, "postgres", "", "postgres")
 	db, err := SetupDataBase(dbConfig)
 	if err != nil {
 		log.Fatalf("failed to setup database: %v", err)
@@ -165,13 +174,18 @@ func main() {
 		log.Fatalf("failed to start processor: %v", err)
 	}
 
+	err = TruncateTable(db)
+	if err != nil {
+		log.Fatalf("failed to truncate table: %v", err)
+	}
+
 	// 配置
 	dataDir := "./generated_data" // 数据目录
 	// filePrefix := "wps_data_version_" // 文件名前缀
 	filePrefix := "wps_batch_data_" // 文件名前缀
 	multiThread := true             // 是否多线程
-	totalVersions := 10             // 文件数
-	totalThread := 10               // 设置线程数量
+	totalVersions := 1              // 文件数
+	totalThread := 1                // 设置线程数量
 
 	if multiThread {
 		log.Printf("Starting multi-threaded data insertion with %d threads for %d versions", totalThread, totalVersions)
