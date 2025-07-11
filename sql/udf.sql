@@ -167,14 +167,17 @@ def build_query(schema_name, target_table_name, column_names, condition, order_b
     limit_clause = f"LIMIT {limit_count}" if limit_count and limit_count > 0 else ""
     offset_clause = f"OFFSET {offset_count}" if offset_count and offset_count > 0 else ""
     
+    # 根据vector_order_clause是否为空决定WITH子句中的limit_clause
+    with_limit_clause = limit_clause if vector_order_clause else ""
+    
     if have_aux_table:
         # 带辅助表的查询：使用 UNION ALL
         aux_table = f"{target_table_name}_relyt_massive_group"
         query = f"""
             WITH combined_data AS (
-                (SELECT {inner_select} FROM {schema_name}.{target_table_name} {where_clause} {vector_order_clause} {limit_clause})
+                (SELECT {inner_select} FROM {schema_name}.{target_table_name} {where_clause} {vector_order_clause} {with_limit_clause})
                 UNION ALL
-                (SELECT {inner_select} FROM {schema_name}.{aux_table} {where_clause} {vector_order_clause} {limit_clause})
+                (SELECT {inner_select} FROM {schema_name}.{aux_table} {where_clause} {vector_order_clause} {with_limit_clause})
             )
             SELECT * FROM combined_data {order_clause} {limit_clause} {offset_clause}
         """

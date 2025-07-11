@@ -57,6 +57,7 @@ type Buffer struct {
 	BufferMutex   sync.RWMutex
 	status        BufferStatus
 	MaxOffset     int64 // Maximum offset in this buffer
+	MaxVersionMap map[RecordIndex]string
 }
 
 type BufferManager struct {
@@ -109,6 +110,7 @@ func (bm *BufferManager) NewBuffer(localFilePrefix string, maxRecords int, isAux
 		S3FilePath:    s3FilePath,
 		CreatedAt:     time.Now(),
 		status:        BufferStatusActive,
+		MaxVersionMap: make(map[RecordIndex]string),
 	}
 	bm.mutex.Lock()
 	defer bm.mutex.Unlock()
@@ -379,7 +381,8 @@ func (b *Buffer) DeduplicateRecords(havePK, haveVersion bool, asyncDelete bool) 
 							keepMap[i] = false
 						} else {
 							//InsertThreadV2 have filter the records which have the smaller version
-							log.Printf("NOTICE: The record versions in the buffer are in descending order")
+							Error("HavePK and haveVersion, but the record versions in the buffer are in descending order")
+							keepMap[i] = false
 						}
 					} else {
 						versionMap[key] = record.Version
@@ -404,7 +407,8 @@ func (b *Buffer) DeduplicateRecords(havePK, haveVersion bool, asyncDelete bool) 
 						} else if record.Version < version {
 							keepMap[i] = false
 						} else {
-							log.Printf("NOTICE: The record versions in the buffer are in descending order")
+							Error("!HavePK and haveVersion, but the record versions in the buffer are in descending order")
+							keepMap[i] = false
 						}
 					} else {
 						versionMap[key] = record.Version
@@ -443,7 +447,7 @@ func CleanupLocalFile(filePath string) error {
 	if filePath == "" {
 		return nil
 	}
-	log.Printf("Removing temporary directory %s", filePath)
+	Debug("Removing temporary directory %s", filePath)
 	return os.RemoveAll(filePath)
 }
 
@@ -464,13 +468,13 @@ func (b *Buffer) BufferWriteToFile(headers []string, s3Client *S3Client, tuplesP
 
 	// ensure the directory exists
 	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
-		return fmt.Errorf("failed to create directory: %w", err)
+		return fmt.Errorf("Write buffer to local file failed: %w", err)
 	}
 
 	// Write to local file
 	file, err := os.Create(fullPath)
 	if err != nil {
-		return fmt.Errorf("failed to create local file: %w", err)
+		return fmt.Errorf("Write buffer to local file failed: %w", err)
 	}
 	defer file.Close()
 
@@ -489,11 +493,11 @@ func (b *Buffer) BufferWriteToFile(headers []string, s3Client *S3Client, tuplesP
 	// Write all valid records to local file
 	for _, record := range validRecords {
 		if err := writer.Write(record.Values); err != nil {
-			return fmt.Errorf("failed to write record to local file: %w", err)
+			return fmt.Errorf("Write buffer to local file failed: %w", err)
 		}
 	}
 
-	log.Printf("Buffer %s wrote %d records to local file: %s", b.ID, len(validRecords), fullPath)
+	Debug("Buffer %s wrote %d records to local file: %s", b.ID, len(validRecords), fullPath)
 
 	// Write to S3 in multiple partitions using streaming:
 	// 1. Lower memory usage: data flows through pipe without buffering entire file
@@ -521,7 +525,7 @@ func (b *Buffer) BufferWriteToFile(headers []string, s3Client *S3Client, tuplesP
 			// Create streaming writer for S3
 			s3Writer, err := s3Client.NewStreamingWriter(s3PartitionPath)
 			if err != nil {
-				return fmt.Errorf("failed to create S3 streaming writer for partition %d: %w", i+1, err)
+				return fmt.Errorf("Upload buffer to s3 failed: create S3 streaming writer for partition %d: %w", i+1, err)
 			}
 
 			// Create CSV writer for S3
@@ -531,7 +535,7 @@ func (b *Buffer) BufferWriteToFile(headers []string, s3Client *S3Client, tuplesP
 			for j := start; j < end; j++ {
 				if err := csvWriter.Write(validRecords[j].Values); err != nil {
 					s3Writer.Close()
-					return fmt.Errorf("failed to write record to S3 partition %d: %w", i+1, err)
+					return fmt.Errorf("Upload buffer to s3 failed: failed to write record to S3 partition %d: %w", i+1, err)
 				}
 			}
 
@@ -539,11 +543,11 @@ func (b *Buffer) BufferWriteToFile(headers []string, s3Client *S3Client, tuplesP
 			csvWriter.Flush()
 			if err := csvWriter.Error(); err != nil {
 				s3Writer.Close()
-				return fmt.Errorf("CSV writer error for S3 partition %d: %w", i+1, err)
+				return fmt.Errorf("Upload buffer to s3 failed: CSV writer error for S3 partition %d: %w", i+1, err)
 			}
 
 			if err := s3Writer.Close(); err != nil {
-				return fmt.Errorf("failed to close S3 writer for partition %d: %w", i+1, err)
+				return fmt.Errorf("Upload buffer to s3 failed: failed to close S3 writer for partition %d: %w", i+1, err)
 			}
 		}
 	}
@@ -561,10 +565,11 @@ type BufferTask struct {
 	DeletedRecords []RecordIndex
 	FileVersionMap map[RecordIndex]string
 	MaxOffset      int64 // Maximum offset in this buffer task
+	ImportStrategy int   // Import strategy
 }
 
 // NewBufferTask create a new buffer task
-func NewBufferTask(buffer *Buffer, deletedRecords []RecordIndex, fileVersionMap map[RecordIndex]string) *BufferTask {
+func NewBufferTask(buffer *Buffer, deletedRecords []RecordIndex, fileVersionMap map[RecordIndex]string, importStrategy int) *BufferTask {
 	bufferTask := BufferTask{
 		TaskId:         buffer.ID,
 		LocalFile:      buffer.LocalFilePath,
@@ -574,8 +579,10 @@ func NewBufferTask(buffer *Buffer, deletedRecords []RecordIndex, fileVersionMap 
 		RecordCount:    buffer.GetRecordCount(),
 		CreatedAt:      time.Now(),
 		MaxOffset:      buffer.GetMaxOffset(),
+		ImportStrategy: importStrategy,
 	}
 	buffer.Records = nil
+	buffer.MaxVersionMap = nil
 	return &bufferTask
 }
 

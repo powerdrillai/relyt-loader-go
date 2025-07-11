@@ -61,6 +61,14 @@ type Config struct {
 	LocalFilePrefix      string // local file prefix, default: "/tmp"
 	MaxConcurrentWorkers int    // max concurrent workers, default: 1
 	AsyncDelete          bool   // async delete, default: true
+
+	// `NeedSelectAuxTable` only can be used in select, the value will be updated in the bgworker.
+	// Insert and update need to use `hasRoutingTable`, which needs to be initialized when the SDK
+	// is started, because this involves the creation of triggers on the routing table.
+	NeedSelectAuxTable bool
+
+	// LogLevel sets the logging level (LOG, WARNING, ERROR)
+	LogLevel LogLevel
 }
 
 // Validate validates the configuration
@@ -136,6 +144,10 @@ func (c *Config) Validate() error {
 
 	if c.MaxConcurrentWorkers <= 0 {
 		c.MaxConcurrentWorkers = 1
+	}
+
+	if c.LogLevel < DEBUG || c.LogLevel > ERROR {
+		c.LogLevel = LOG // Default to LOG level
 	}
 
 	return nil

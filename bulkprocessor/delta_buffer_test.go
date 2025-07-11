@@ -22,6 +22,7 @@ type TestDataWithAuxV2 struct {
 	RoutingID string `relyt:"routing_id"`
 	Ext       string `relyt:"ext"`
 	Vector    string `relyt:"vector"`
+	Version   int    `relyt:"version"`
 }
 
 // TestDataWithCopyOnConflict 包含版本字段的测试数据结构
@@ -108,14 +109,16 @@ func CreateTestDataTaleWithAuxV2(db *sql.DB) error {
 		fileid bigint NOT NULL,
 		routing_id text NOT NULL,
 		ext text NOT NULL,
-		vector vecf16(3) NOT NULL
+		vector vecf16(3) NOT NULL,
+		version bigint
 	);
 	CREATE TABLE IF NOT EXISTS test_routing_data_v2_relyt_massive_group (
 		id bigint NOT NULL PRIMARY KEY,
 		fileid bigint NOT NULL,
 		routing_id text NOT NULL,
 		ext text NOT NULL,
-		vector vecf16(3) NOT NULL
+		vector vecf16(3) NOT NULL,
+		version bigint
 	);
 	CREATE TABLE IF NOT EXISTS relyt_sys.test_routing_data_v2_relyt_routing (
 		routing_id text PRIMARY KEY,
@@ -152,8 +155,8 @@ func InitTestDataTableWithAuxV2(db *sql.DB) error {
 
 	// insert data to test_routing_data
 	query := `
-	INSERT INTO test_routing_data_v2 (id, fileid, routing_id, ext, vector)
-	VALUES ($1, $2, $3, $4, $5);
+	INSERT INTO test_routing_data_v2 (id, fileid, routing_id, ext, vector, version)
+	VALUES ($1, $2, $3, $4, $5, $6);
 	`
 	// create random number generator for vector values
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -165,8 +168,9 @@ func InitTestDataTableWithAuxV2(db *sql.DB) error {
 			fileID := routingID
 			ext := fmt.Sprintf("ext_%d", id)
 			vector := fmt.Sprintf("[%f,%f,%f]", r.Float32(), r.Float32(), r.Float32())
+			version := 1
 
-			_, err := db.Exec(query, id, fileID, routingID, ext, vector)
+			_, err := db.Exec(query, id, fileID, routingID, ext, vector, version)
 			if err != nil {
 				return fmt.Errorf("failed to insert data for routing_id %d: %w", routingID, err)
 			}
@@ -180,8 +184,9 @@ func InitTestDataTableWithAuxV2(db *sql.DB) error {
 			fileID := routingID
 			ext := fmt.Sprintf("ext_%d", id)
 			vector := fmt.Sprintf("[%f,%f,%f]", r.Float32(), r.Float32(), r.Float32())
+			version := 1
 
-			_, err := db.Exec(query, id, fileID, routingID, ext, vector)
+			_, err := db.Exec(query, id, fileID, routingID, ext, vector, version)
 			if err != nil {
 				return fmt.Errorf("failed to insert data for routing_id %d: %w", routingID, err)
 			}
@@ -242,7 +247,8 @@ func CreateTestDataTaleWithOutAux(db *sql.DB) error {
 		fileid bigint NOT NULL,
 		routing_id text NOT NULL,
 		ext text NOT NULL,
-		vector vecf16(3) NOT NULL
+		vector vecf16(3) NOT NULL,
+		version bigint NOT NULL
 	);
 	`
 	_, err := db.Exec(query)
@@ -466,16 +472,23 @@ func TestBufferInsertBasic(t *testing.T) {
 		if len(record) < 5 {
 			t.Errorf("record does not contain enough fields: %v", record)
 		} else {
-			log.Printf("record %d: id=%d, file_id=%d, routing_id=%s, ext=%s, vector=%s", i, id, fileID, routingID, record[3], record[4])
+			log.Printf("record %d: id=%d, file_id=%d, routing_id=%s, ext=%s, vector=%s, version=%s", i, id, fileID, routingID, record[3], record[4], record[5])
 		}
 		ext := record[3]
 		vector := record[4]
+
+		version, err := strconv.Atoi(record[5])
+		if err != nil {
+			t.Errorf("failed to parse version: %v", err)
+		}
+
 		tests = append(tests, TestDataWithAuxV2{
 			ID:        id,
 			FileID:    fileID,
 			RoutingID: routingID,
 			Ext:       ext,
 			Vector:    vector,
+			Version:   version,
 		})
 		i++
 
@@ -587,16 +600,22 @@ func TestBufferInsertWithSomeErrors(t *testing.T) {
 		if len(record) < 5 {
 			t.Errorf("record does not contain enough fields: %v", record)
 		} else {
-			log.Printf("record %d: id=%d, file_id=%d, routing_id=%s, ext=%s, vector=%s", i, id, fileID, routingID, record[3], record[4])
+			log.Printf("record %d: id=%d, file_id=%d, routing_id=%s, ext=%s, vector=%s, version=%s", i, id, fileID, routingID, record[3], record[4], record[5])
 		}
 		ext := record[3]
 		vector := record[4]
+		version, err := strconv.Atoi(record[5])
+		if err != nil {
+			t.Errorf("failed to parse version: %v", err)
+		}
+
 		tests = append(tests, TestDataWithAuxV2{
 			ID:        id,
 			FileID:    fileID,
 			RoutingID: routingID,
 			Ext:       ext,
 			Vector:    vector,
+			Version:   version,
 		})
 		i++
 
@@ -696,16 +715,22 @@ func TestBufferInsertWithSleep(t *testing.T) {
 		if len(record) < 5 {
 			t.Errorf("record does not contain enough fields: %v", record)
 		} else {
-			log.Printf("record %d: id=%d, file_id=%d, routing_id=%s, ext=%s, vector=%s", i, id, fileID, routingID, record[3], record[4])
+			log.Printf("record %d: id=%d, file_id=%d, routing_id=%s, ext=%s, vector=%s, version=%s", i, id, fileID, routingID, record[3], record[4], record[5])
 		}
 		ext := record[3]
 		vector := record[4]
+		version, err := strconv.Atoi(record[5])
+		if err != nil {
+			t.Errorf("failed to parse version: %v", err)
+		}
+
 		tests = append(tests, TestDataWithAuxV2{
 			ID:        id,
 			FileID:    fileID,
 			RoutingID: routingID,
 			Ext:       ext,
 			Vector:    vector,
+			Version:   version,
 		})
 		i++
 
@@ -827,19 +852,25 @@ func TestBufferInsertWithPgRecovery(t *testing.T) {
 			t.Errorf("failed to parse file_id: %v", err)
 		}
 		routingID := record[2]
-		if len(record) < 5 {
-			t.Errorf("record does not contain enough fields: %v", record)
-		} else {
-			log.Printf("record %d: id=%d, file_id=%d, routing_id=%s, ext=%s, vector=%s", i, id, fileID, routingID, record[3], record[4])
-		}
 		ext := record[3]
 		vector := record[4]
+		version, err := strconv.Atoi(record[5])
+		if err != nil {
+			t.Errorf("failed to parse version: %v", err)
+		}
+		if len(record) < 6 {
+			t.Errorf("record does not contain enough fields: %v", record)
+		} else {
+			log.Printf("record %d: id=%d, file_id=%d, routing_id=%s, ext=%s, vector=%s, version=%d", i, id, fileID, routingID, record[3], record[4], version)
+		}
+
 		tests = append(tests, TestDataWithAuxV2{
 			ID:        id,
 			FileID:    fileID,
 			RoutingID: routingID,
 			Ext:       ext,
 			Vector:    vector,
+			Version:   version,
 		})
 		i++
 
@@ -999,19 +1030,26 @@ func TestBufferInsertWithMigration(t *testing.T) {
 			t.Errorf("failed to parse file_id: %v", err)
 		}
 		routingID := record[2]
-		if len(record) < 5 {
-			t.Errorf("record does not contain enough fields: %v", record)
-		} else {
-			log.Printf("record %d: id=%d, file_id=%d, routing_id=%s, ext=%s, vector=%s", i, id, fileID, routingID, record[3], record[4])
-		}
 		ext := record[3]
 		vector := record[4]
+		version, err := strconv.Atoi(record[5])
+		if err != nil {
+			t.Errorf("failed to parse version: %v", err)
+		}
+
+		if len(record) < 6 {
+			t.Errorf("record does not contain enough fields: %v", record)
+		} else {
+			log.Printf("record %d: id=%d, file_id=%d, routing_id=%s, ext=%s, vector=%s, version=%d", i, id, fileID, routingID, record[3], record[4], version)
+		}
+
 		tests = append(tests, TestDataWithAuxV2{
 			ID:        id,
 			FileID:    fileID,
 			RoutingID: routingID,
 			Ext:       ext,
 			Vector:    vector,
+			Version:   version,
 		})
 		i++
 
@@ -1200,16 +1238,21 @@ func TestBufferInsertWithMixedOperations(t *testing.T) {
 		if len(record) < 5 {
 			t.Errorf("record does not contain enough fields: %v", record)
 		} else {
-			log.Printf("record %d: id=%d, file_id=%d, routing_id=%s, ext=%s, vector=%s", i, id, fileID, routingID, record[3], record[4])
+			log.Printf("record %d: id=%d, file_id=%d, routing_id=%s, ext=%s, vector=%s, version=%s", i, id, fileID, routingID, record[3], record[4], record[5])
 		}
 		ext := record[3]
 		vector := record[4]
+		version, err := strconv.Atoi(record[5])
+		if err != nil {
+			t.Errorf("failed to parse version: %v", err)
+		}
 		tests = append(tests, TestDataWithAuxV2{
 			ID:        id,
 			FileID:    fileID,
 			RoutingID: routingID,
 			Ext:       ext,
 			Vector:    vector,
+			Version:   version,
 		})
 		i++
 
@@ -1526,16 +1569,21 @@ func TestBufferDeleteSync(t *testing.T) {
 		if len(record) < 5 {
 			t.Errorf("record does not contain enough fields: %v", record)
 		} else {
-			log.Printf("record %d: id=%d, file_id=%d, routing_id=%s, ext=%s, vector=%s", i, id, fileID, routingID, record[3], record[4])
+			log.Printf("record %d: id=%d, file_id=%d, routing_id=%s, ext=%s, vector=%s, version=%s", i, id, fileID, routingID, record[3], record[4], record[5])
 		}
 		ext := record[3]
 		vector := record[4]
+		version, err := strconv.Atoi(record[5])
+		if err != nil {
+			t.Errorf("failed to parse version: %v", err)
+		}
 		tests = append(tests, TestDataWithAuxV2{
 			ID:        id,
 			FileID:    fileID,
 			RoutingID: routingID,
 			Ext:       ext,
 			Vector:    vector,
+			Version:   version,
 		})
 		i++
 
@@ -1577,7 +1625,7 @@ func TestBufferDeleteSync(t *testing.T) {
 
 	// select count(*) from test_routing_data where fileid = 120 and routing_id = 120
 	searchOptions := &SearchOptions{
-		Columns:   []string{"count(*)"},
+		Columns:   []string{"count(*) over() as count"},
 		Condition: "fileid = $1 and routing_id = $2",
 	}
 
@@ -1674,16 +1722,21 @@ func TestBufferInsertWithDuplicate(t *testing.T) {
 		if len(record) < 5 {
 			t.Errorf("record does not contain enough fields: %v", record)
 		} else {
-			log.Printf("record %d: id=%d, file_id=%d, routing_id=%s, ext=%s, vector=%s", i, id, fileID, routingID, record[3], record[4])
+			log.Printf("record %d: id=%d, file_id=%d, routing_id=%s, ext=%s, vector=%s, version=%s", i, id, fileID, routingID, record[3], record[4], record[5])
 		}
 		ext := record[3]
 		vector := record[4]
+		version, err := strconv.Atoi(record[5])
+		if err != nil {
+			t.Errorf("failed to parse version: %v", err)
+		}
 		tests = append(tests, TestDataWithAuxV2{
 			ID:        id,
 			FileID:    fileID,
 			RoutingID: routingID,
 			Ext:       ext,
 			Vector:    vector,
+			Version:   version,
 		})
 		i++
 
@@ -1731,7 +1784,7 @@ func TestBufferInsertWithDuplicate(t *testing.T) {
 
 	// Check that the records are correct
 	searchOptions := &SearchOptions{
-		Columns:   []string{"fileid", "routing_id"},
+		Columns:   []string{"fileid", "routing_id", "id"},
 		Condition: "id in (1001, 1006)",
 		OrderBy:   "id ASC",
 	}
@@ -1742,8 +1795,8 @@ func TestBufferInsertWithDuplicate(t *testing.T) {
 
 	row0Str := fmt.Sprintf("%v", results.Rows[0])
 	row1Str := fmt.Sprintf("%v", results.Rows[1])
-	expectedRow0Str := "[100 100]"
-	expectedRow1Str := "[120 120]"
+	expectedRow0Str := "[100 100 1001]"
+	expectedRow1Str := "[120 120 1006]"
 
 	if row0Str != expectedRow0Str {
 		t.Errorf("expected results: %v, got: %v", expectedRow0Str, row0Str)
@@ -1970,7 +2023,7 @@ func TestAsyncDelete(t *testing.T) {
 		if len(record) < 6 {
 			t.Errorf("record does not contain enough fields: %v", record)
 		} else {
-			log.Printf("record %d: id=%d, file_id=%d, routing_id=%s, ext=%s, vector=%s", i, id, fileID, routingID, record[3], record[4])
+			log.Printf("record %d: id=%d, file_id=%d, routing_id=%s, ext=%s, vector=%s, version=%s", i, id, fileID, routingID, record[3], record[4], record[5])
 		}
 		ext := record[3]
 		vector := record[4]

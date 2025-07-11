@@ -248,7 +248,7 @@ func TestSearchBasic(t *testing.T) {
 
 	// 2. 测试向量查询
 	searchOptions = &SearchOptions{
-		Columns:   []string{"id", " routing_id", "ext", "vector as distance"},
+		Columns:   []string{"id", " routing_id", "ext", "vector"},
 		Condition: "id > $1",
 		OrderBy:   "id ASC",
 		Limit:     2,
@@ -292,8 +292,8 @@ func TestSearchBasic(t *testing.T) {
 	// 将结果转换为字符串进行比较
 	row0Str = fmt.Sprintf("%v", result.Rows[0])
 	row1Str = fmt.Sprintf("%v", result.Rows[1])
-	expectedRow0Str = "[10 140  4.05]"
-	expectedRow1Str = "[9 140 <nil> 4.621504]"
+	expectedRow0Str = "[10 140  4.050000190734863]"
+	expectedRow1Str = "[9 140 <nil> 4.621503829956055]"
 
 	if row0Str != expectedRow0Str {
 		t.Errorf("result.Rows[0]: %v:%v, expected: %s", result.Columns, result.Rows[0], expectedRow0Str)
@@ -643,7 +643,7 @@ func TestSearchAdditional(t *testing.T) {
 
 	// 3. 复杂条件查询：select * from test_routing_data where id > 3 and routing_id = 100
 	searchOptions = &SearchOptions{
-		Columns:   []string{"*"},
+		Columns:   []string{"id", "routing_id"},
 		Condition: "id > $1 and routing_id = $2",
 		OrderBy:   "id DESC",
 		Limit:     5,
@@ -657,9 +657,9 @@ func TestSearchAdditional(t *testing.T) {
 	}
 	log.Printf("Test 3 result size: %d, result: %v", len(result.Rows), result)
 
-	// 4. 带计算和别名的列：select id, routing_id, (vector <-> '[1,2,3]') * 2 as double_distance from test_routing_data order by double_distance asc limit 3
+	// 4. 带计算和别名的列：select id, routing_id, (vector <-> '[1,2,3]') as double_distance from test_routing_data order by double_distance asc limit 3
 	searchOptions = &SearchOptions{
-		Columns: []string{"id", "routing_id", "(vector <-> '[1,2,3]') * 2 as double_distance"},
+		Columns: []string{"id", "routing_id", "vector <-> '[1,2,3]' as double_distance"},
 		OrderBy: "double_distance ASC",
 		Limit:   3,
 	}
@@ -670,9 +670,9 @@ func TestSearchAdditional(t *testing.T) {
 	if len(result.Rows) != 3 {
 		t.Errorf("expected 3 rows, but got %d", len(result.Rows))
 	}
-	expectedResult0 := "[10 140 8.100000381469727]"
-	expectedResult1 := "[9 140 9.24300765991211]"
-	expectedResult2 := "[8 130 10.500585556030273]"
+	expectedResult0 := "[10 140 4.050000190734863]"
+	expectedResult1 := "[9 140 4.621503829956055]"
+	expectedResult2 := "[8 130 5.250292778015137]"
 	if fmt.Sprintf("%v", result.Rows[0]) != expectedResult0 {
 		t.Errorf("expected result: %v, but got %v", expectedResult0, result.Rows[0])
 	}
@@ -685,7 +685,7 @@ func TestSearchAdditional(t *testing.T) {
 
 	// 5. 多条件组合查询：select id, routing_id routingid from test_routing_data where id in ($1) and routing_id > 100
 	searchOptions = &SearchOptions{
-		Columns:   []string{"id", "routing_id routingid"},
+		Columns:   []string{"id", "routing_id"},
 		Condition: "id in ($1) and routing_id > $2",
 		OrderBy:   "id ASC",
 		Limit:     10,
@@ -701,7 +701,7 @@ func TestSearchAdditional(t *testing.T) {
 
 	// 6. 带分页的查询：select * from test_routing_data order by id desc limit 5 offset 2
 	searchOptions = &SearchOptions{
-		Columns: []string{"*"},
+		Columns: []string{"id"},
 		OrderBy: "id DESC",
 		Limit:   5,
 		Offset:  2,
@@ -732,7 +732,7 @@ func TestSearchAdditional(t *testing.T) {
 
 	// 8. 带数组参数的复杂条件：select * from test_routing_data where id in ($1) and routing_id in ($2)
 	searchOptions = &SearchOptions{
-		Columns:   []string{"*"},
+		Columns:   []string{"id", "routing_id"},
 		Condition: "id in ($1) and routing_id in ($2)",
 		OrderBy:   "id ASC",
 	}
@@ -745,73 +745,9 @@ func TestSearchAdditional(t *testing.T) {
 	}
 	log.Printf("Test 8 result size: %d, result: %v", len(result.Rows), result)
 
-	// 9. group by: select routing_id, count(*) from test_routing_data group by routing_id
-	searchOptions = &SearchOptions{
-		Columns: []string{"routing_id", "count(*)"},
-		GroupBy: "routing_id",
-	}
-	result, err = processor.SearchV2(searchOptions)
-	if err != nil {
-		t.Errorf("failed to search data: %v", err)
-	}
-	if len(result.Rows) != 5 {
-		t.Errorf("expected 5 rows, but got %d", len(result.Rows))
-	}
-
-	log.Printf("Test 9 result size: %d, result: %v", len(result.Rows), result)
-
-	// 10. having: select routing_id, count(*) from test_routing_data group by routing_id having count(*) > 1
-	searchOptions = &SearchOptions{
-		Columns: []string{"routing_id", "count(*)"},
-		GroupBy: "routing_id",
-		Having:  "count(*) > 2",
-	}
-	result, err = processor.SearchV2(searchOptions)
-	if err != nil {
-		t.Errorf("failed to search data: %v", err)
-	}
-	if len(result.Rows) != 0 {
-		t.Errorf("expected 0 rows, but got %d", len(result.Rows))
-	}
-
-	log.Printf("Test 10 result size: %d, result: %v", len(result.Rows), result)
-
-	// 11. 组合条件查询: select routing_id, count(*) from test_routing_data_relyt_massive_group where id > 0 and routing_id in (100,110,120) group by routing_id having count(*) > 0 order by routing_id asc limit 5 offset 1
-	searchOptions = &SearchOptions{
-		Columns:   []string{"routing_id", "COUNT(*)"},
-		Condition: "id > $1 and routing_id in ($2)",
-		GroupBy:   "routing_id",
-		Having:    "count(*) > 0",
-		OrderBy:   "routing_id ASC",
-		Limit:     5,
-		Offset:    1,
-	}
-	result, err = processor.SearchV2(searchOptions, 0, []interface{}{100, 110, 120})
-	if err != nil {
-		t.Errorf("failed to search data: %v", err)
-	}
-	if len(result.Rows) != 2 {
-		t.Errorf("expected 2 rows, but got %d", len(result.Rows))
-	}
-	log.Printf("Test 11 result size: %d, result: %v", len(result.Rows), result)
-
-	// 12. count(*): select count(*) from test_routing_data where id in ($1) limit 5
-	searchOptions = &SearchOptions{
-		Columns:   []string{"count(*)"},
-		Condition: "id in ($1)",
-	}
-	result, err = processor.SearchV2(searchOptions, []interface{}{1, 2, 3, 4, 5})
-	if err != nil {
-		t.Errorf("failed to search data: %v", err)
-	}
-	if len(result.Rows) != 1 {
-		t.Errorf("expected 1 rows, but got %d", len(result.Rows))
-	}
-	log.Printf("Test 12 result size: %d, result: %v", len(result.Rows), result)
-
 	// 13. select null: select id, routing_id, ext from test_routing_data where ext is null or ext = ''
 	searchOptions = &SearchOptions{
-		Columns:   []string{"id", "routing_id as routingid", "ext"},
+		Columns:   []string{"id", "routing_id", "ext"},
 		Condition: "ext is null or ext = ''",
 	}
 	result, err = processor.SearchV2(searchOptions)

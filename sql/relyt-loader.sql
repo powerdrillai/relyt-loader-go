@@ -24,6 +24,7 @@ INSERT INTO relyt_sys.SDK_LOADER_CONFIG (CONFIG_NAME, CONFIG_VALUE) VALUES ('imp
 INSERT INTO relyt_sys.SDK_LOADER_CONFIG (CONFIG_NAME, CONFIG_VALUE) VALUES ('max_concurrent_workers', '1') ON CONFLICT (CONFIG_NAME) DO UPDATE SET CONFIG_VALUE = EXCLUDED.CONFIG_VALUE;
 INSERT INTO relyt_sys.SDK_LOADER_CONFIG (CONFIG_NAME, CONFIG_VALUE) VALUES ('insert_into_batch_size', '100') ON CONFLICT (CONFIG_NAME) DO UPDATE SET CONFIG_VALUE = EXCLUDED.CONFIG_VALUE;
 INSERT INTO relyt_sys.SDK_LOADER_CONFIG (CONFIG_NAME, CONFIG_VALUE) VALUES ('async_delete', 'true') ON CONFLICT (CONFIG_NAME) DO UPDATE SET CONFIG_VALUE = EXCLUDED.CONFIG_VALUE;
+INSERT INTO relyt_sys.SDK_LOADER_CONFIG (CONFIG_NAME, CONFIG_VALUE) VALUES ('file_write_timeout', '3') ON CONFLICT (CONFIG_NAME) DO UPDATE SET CONFIG_VALUE = EXCLUDED.CONFIG_VALUE;
 
 -- revoke all permission from public
 REVOKE ALL ON relyt_sys.SDK_LOADER_CONFIG FROM public;
@@ -67,8 +68,8 @@ GRANT SELECT,INSERT ON relyt_sys.relyt_loader_delta_checkpoint TO public;
 
 -- create a table to store the routing table
 --
--- CREATE TABLE IF NOT EXISTS relyt_sys.XXXX_routing (
+-- CREATE TABLE IF NOT EXISTS relyt_sys.XXXX_relyt_routing (
 --     routing_id bigint PRIMARY KEY,
 --     store_table_name TEXT NOT NULL
 -- ) USING heap DISTRIBUTED NONE;
--- GRANT SELECT,INSERT ON relyt_sys.XXXX_routing TO public;
+-- GRANT SELECT,INSERT ON relyt_sys.XXXX_relyt_routing TO public;
