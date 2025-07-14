@@ -74,7 +74,6 @@ func NewProcessor(dbconfig DatabaseConfig, fileTimeout int, extinfo string) *Bul
 			Username: dbconfig.Username,
 			Password: dbconfig.Password, // use your own password
 			Database: dbconfig.Database, // use your own database
-			Table:    "test_data",
 			Schema:   "public",
 		},
 		BatchSize:           10, // number of records per file
@@ -86,13 +85,17 @@ func NewProcessor(dbconfig DatabaseConfig, fileTimeout int, extinfo string) *Bul
 		BGWorkerInterval:    10,          // set GC interval
 	}
 
-	if extinfo == "auxtest" {
+	if extinfo == "null" {
+		log.Printf("table name is set to null")
+	} else if extinfo == "auxtest" {
 		config.PostgreSQL.Table = "test_routing_data"
 	} else if extinfo == "content_personal_vector_semantic_insight_vector_bge_m3_dense" {
 		config.PostgreSQL.Table = "content_personal_vector_semantic_insight_vector_bge_m3_dense"
 	} else if extinfo == "importtimeout" {
 		config.ImportTimeout = 5
 		config.ImportErrorSleepTime = 5
+	} else {
+		config.PostgreSQL.Table = "test_data"
 	}
 
 	// create processor

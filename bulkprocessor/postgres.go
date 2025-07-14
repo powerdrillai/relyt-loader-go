@@ -267,13 +267,6 @@ func (c *PostgreSQLClient) GetLoadConfigFromDB(ctx context.Context, config *Conf
 		config.TuplesPrePartition = 5000
 	}
 
-	routingTableName := fmt.Sprintf("%s%s", config.PostgreSQL.Table, routingTableSuffix)
-	hasRoutingTable, err := c.HasRoutingTable(ctx, routingTableName)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to check if routing table exists")
-	}
-	config.NeedSelectAuxTable = hasRoutingTable
-
 	return &s3Config, nil
 }
 
@@ -317,13 +310,6 @@ func (c *PostgreSQLClient) UpdateLoadConfig(ctx context.Context, config *Config)
 		log.Printf("TuplesPrePartition is less than 0, set to 5000")
 		config.TuplesPrePartition = 5000
 	}
-
-	routingTableName := fmt.Sprintf("%s%s", config.PostgreSQL.Table, routingTableSuffix)
-	hasRoutingTable, err := c.HasRoutingTable(ctx, routingTableName)
-	if err != nil {
-		return errors.Wrap(err, "failed to check if routing table exists")
-	}
-	config.NeedSelectAuxTable = hasRoutingTable
 
 	return nil
 }

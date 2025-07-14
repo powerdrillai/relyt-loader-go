@@ -28,7 +28,7 @@ func setupTestDatabase(t *testing.T) (*sql.DB, *BulkProcessor) {
 		t.Fatalf("failed to truncate test table: %v", err)
 	}
 
-	err = InitTestTables(db)
+	err = InitTestTablesWithSingleTable(db)
 	if err != nil {
 		t.Fatalf("failed to init test data routing table: %v", err)
 	}
@@ -37,7 +37,43 @@ func setupTestDatabase(t *testing.T) (*sql.DB, *BulkProcessor) {
 	return db, processor
 }
 
-func InitTestTables(db *sql.DB) error {
+func setupTestDatabaseWithMultipleTables(t *testing.T) (*sql.DB, *BulkProcessor) {
+	dbConfig := InitDatabaseConfig("127.0.0.1", 7000, "postgres", "", "postgres")
+	db, err := SetupDataBase(dbConfig)
+	if err != nil {
+		t.Fatalf("failed to setup database: %v", err)
+	}
+
+	err = CreateTestDataTaleWithAux(db)
+	if err != nil {
+		t.Fatalf("failed to create test table: %v", err)
+	}
+
+	err = CreateTestDataTaleWithOutAux(db)
+	if err != nil {
+		t.Fatalf("failed to create test table: %v", err)
+	}
+
+	err = TruncateTestDataTableWithAux(db)
+	if err != nil {
+		t.Fatalf("failed to truncate test table: %v", err)
+	}
+
+	err = TruncateTestDataTaleWithOutAux(db)
+	if err != nil {
+		t.Fatalf("failed to truncate test table: %v", err)
+	}
+
+	err = InitTestTablesWithMultipleTables(db)
+	if err != nil {
+		t.Fatalf("failed to init test data routing table: %v", err)
+	}
+
+	processor := NewProcessor(dbConfig, 6, "auxtest")
+	return db, processor
+}
+
+func InitTestTablesWithSingleTable(db *sql.DB) error {
 	log.Println("Initializing test data in PostgreSQL...")
 
 	// insert data to test_routing_data_relyt_routing
@@ -85,6 +121,28 @@ func InitTestTables(db *sql.DB) error {
 	_, err = db.Exec(query)
 	if err != nil {
 		return fmt.Errorf("failed to insert data to test_routing_data_relyt_massive_group for routing_id 100: %w", err)
+	}
+
+	return nil
+}
+
+func InitTestTablesWithMultipleTables(db *sql.DB) error {
+	err := InitTestTablesWithSingleTable(db)
+	if err != nil {
+		return fmt.Errorf("failed to init test data routing table: %w", err)
+	}
+
+	query := `
+	INSERT INTO test_routing_data_without_aux (id, fileid, routing_id, ext, vector, version)
+	VALUES
+	(1, 100, '100', 'test1', '[0.1,0.2,0.3]', 1),
+	(2, 100, '100', 'test2', '[0.2,0.3,0.4]', 1),
+	(3, 110, '110', 'test3', '[0.3,0.4,0.5]', 1),
+	(4, 110, '110', 'test4', '[0.4,0.5,0.6]', 1);
+	`
+	_, err = db.Exec(query)
+	if err != nil {
+		return fmt.Errorf("failed to insert data to test_routing_data_without_aux for routing_id 100: %w", err)
 	}
 
 	return nil
@@ -233,6 +291,7 @@ func TestSearchBasic(t *testing.T) {
 	// 测试搜索功能
 	// 1. 测试基本搜索
 	searchOptions := &SearchOptions{
+		Table:     "test_routing_data",
 		Columns:   []string{"id", "routing_id", "ext"},
 		Condition: "id > $1",
 		OrderBy:   "id ASC",
@@ -248,6 +307,7 @@ func TestSearchBasic(t *testing.T) {
 
 	// 2. 测试向量查询
 	searchOptions = &SearchOptions{
+		Table:     "test_routing_data",
 		Columns:   []string{"id", " routing_id", "ext", "vector"},
 		Condition: "id > $1",
 		OrderBy:   "id ASC",
@@ -276,6 +336,7 @@ func TestSearchBasic(t *testing.T) {
 
 	// 3. 测试向量相似度搜索（使用参数化查询）
 	searchOptions = &SearchOptions{
+		Table:     "test_routing_data",
 		Columns:   []string{"id", "routing_id", "ext", "vector <-> $2 as distance"},
 		Condition: "id > $1",
 		OrderBy:   "distance ASC",
@@ -301,6 +362,20 @@ func TestSearchBasic(t *testing.T) {
 	if row1Str != expectedRow1Str {
 		t.Errorf("result.Rows[1]: %v:%v, expected: %s", result.Columns, result.Rows[1], expectedRow1Str)
 	}
+
+	// test 4: test with routing table
+	searchOptions = &SearchOptions{
+		Columns:   []string{"id", "routing_id", "ext", "vector"},
+		Condition: "id > $1",
+		OrderBy:   "id ASC",
+		Limit:     2,
+	}
+
+	_, err = processor.SearchV2(searchOptions, 2)
+	if err == nil {
+		t.Errorf("expected error, but got nil")
+	}
+	log.Printf("TestSearchBasic test 4 error: %v", err)
 
 }
 
@@ -330,11 +405,12 @@ func TestNewSearchFunc(t *testing.T) {
 		t.Fatalf("failed to insert test data: %v", err)
 	}
 
-	processor := NewProcessor(dbConfig, 6, "content_personal_vector_semantic_insight_vector_bge_m3_dense")
+	processor := NewProcessor(dbConfig, 6, "null")
 	defer processor.Shutdown()
 
 	// test 1: select id, chunk_id from content_personal_vector_semantic_insight_vector_bge_m3_dense where group_id in (1, 11) and routing_id in ('1', '11') order by id asc limit 16;
 	searchOptions := &SearchOptions{
+		Table:     "content_personal_vector_semantic_insight_vector_bge_m3_dense",
 		Columns:   []string{"id", "chunk_id"},
 		Condition: "group_id IN (1, 11) AND routing_id IN ('1', '11')",
 		OrderBy:   "id ASC",
@@ -356,6 +432,7 @@ func TestNewSearchFunc(t *testing.T) {
 	// select id, mtime, COUNT(*) OVER() AS total, vector <-> '[0.76,0.49, 0.67]' as score
 	// from content_personal_vector_semantic_insight_vector_bge_m3_dense where group_id in (1, 11) and routing_id in ('1', '11') order by score ASC, mtime DESC LIMIT 16;
 	searchOptions = &SearchOptions{
+		Table:     "content_personal_vector_semantic_insight_vector_bge_m3_dense",
 		Columns:   []string{"id", "group_id", "mtime", "COUNT(*) OVER()", "vector <-> '[0.76,0.49, 0.67]' as score"},
 		Condition: "group_id IN (1, 11) AND routing_id IN ('1', '11')",
 		OrderBy:   "score ASC, mtime DESC",
@@ -372,6 +449,7 @@ func TestNewSearchFunc(t *testing.T) {
 	// select id, mtime vector <-> '[0.76,0.49, 0.67]' as score
 	// from content_personal_vector_semantic_insight_vector_bge_m3_dense where group_id in (1, 11) and routing_id in ('1', '11') order by score ASC, mtime DESC LIMIT 2;
 	searchOptions = &SearchOptions{
+		Table:     "content_personal_vector_semantic_insight_vector_bge_m3_dense",
 		Columns:   []string{"id", "group_id", "mtime", "vector <-> '[0.76,0.49, 0.67]' as score"},
 		Condition: "group_id IN (1, 11) AND routing_id IN ('1', '11')",
 		OrderBy:   "score ASC, mtime DESC",
@@ -388,6 +466,7 @@ func TestNewSearchFunc(t *testing.T) {
 	// select id, mtime vector <-> '[0.76,0.49, 0.67]' as score
 	// from content_personal_vector_semantic_insight_vector_bge_m3_dense where group_id in (1, 11) and routing_id in ('1', '11') order by score DESC LIMIT 2;
 	searchOptions = &SearchOptions{
+		Table:     "content_personal_vector_semantic_insight_vector_bge_m3_dense",
 		Columns:   []string{"id", "group_id", "mtime", "vector <-> '[0.76,0.49, 0.67]' as score"},
 		Condition: "group_id IN (1, 11) AND routing_id IN ('1', '11')",
 		OrderBy:   "score DESC",
@@ -405,6 +484,7 @@ func TestNewSearchFunc(t *testing.T) {
 	// select id, mtime vector <-> '[0.76,0.49, 0.67]' as score
 	// from content_personal_vector_semantic_insight_vector_bge_m3_dense where group_id in (1, 11) and routing_id in ('1', '11') order by mtime DESC LIMIT 2;
 	searchOptions = &SearchOptions{
+		Table:     "content_personal_vector_semantic_insight_vector_bge_m3_dense",
 		Columns:   []string{"id", "group_id", "COUNT(*) OVER() as count", "mtime", "vector <-> '[0.76,0.49, 0.67]' as score"},
 		Condition: "group_id IN (1, 11) AND routing_id IN ('1', '11')",
 		OrderBy:   "mtime DESC",
@@ -420,6 +500,7 @@ func TestNewSearchFunc(t *testing.T) {
 	// test 6: group by not support
 	// select group_id, count(*) from content_personal_vector_semantic_insight_vector_bge_m3_dense where group_id in (1, 11) and routing_id in ('1', '11') group by group_id;
 	searchOptions = &SearchOptions{
+		Table:     "content_personal_vector_semantic_insight_vector_bge_m3_dense",
 		Columns:   []string{"group_id", "count(*)"},
 		Condition: "group_id IN (1, 11) AND routing_id IN ('1', '11')",
 		GroupBy:   "group_id",
@@ -433,6 +514,7 @@ func TestNewSearchFunc(t *testing.T) {
 
 	// test 7: syntax error
 	searchOptions = &SearchOptions{
+		Table:     "content_personal_vector_semantic_insight_vector_bge_m3_dense",
 		Columns:   []string{"id", "chunk_id"},
 		Condition: "and group_id IN (1, 11) AND routing_id IN ('1', '11')",
 		OrderBy:   "id ASC",
@@ -492,6 +574,7 @@ func TestNewSearchFunc(t *testing.T) {
 
 	// test 8: count(*)
 	searchOptions = &SearchOptions{
+		Table:     "content_personal_vector_semantic_insight_vector_bge_m3_dense",
 		Columns:   []string{"count(*)"},
 		Condition: "group_id IN (1, 11) AND routing_id IN ('1', '11')",
 	}
@@ -505,6 +588,7 @@ func TestNewSearchFunc(t *testing.T) {
 
 	// test 9: select * from content_personal_vector_semantic_insight_vector_bge_m3_dense where group_id in (1, 11) and routing_id in ('1', '11');
 	searchOptions = &SearchOptions{
+		Table:     "content_personal_vector_semantic_insight_vector_bge_m3_dense",
 		Columns:   []string{"*"},
 		Condition: "group_id IN (1, 11) AND routing_id IN ('1', '11')",
 	}
@@ -515,6 +599,7 @@ func TestNewSearchFunc(t *testing.T) {
 
 	// test 10: select id, group_id, mtime, count(*) over() as count, vector <-> '[0.76,0.49, 0.67]' as score from test_table where group_id in (1, 11) and routing_id in ('1', '11') order by score ASC, mtime DESC limit 2;
 	searchOptions = &SearchOptions{
+		Table:     "content_personal_vector_semantic_insight_vector_bge_m3_dense",
 		Columns:   []string{"id", "group_id", "mtime", "COUNT(*) OVER() as count", "vector <-> '[0.76,0.49, 0.67]' as score"},
 		Condition: "group_id IN (1, 11) AND routing_id IN ('1', '11')",
 		OrderBy:   "score ASC, mtime DESC",
@@ -571,6 +656,7 @@ func TestNewSearchFunc(t *testing.T) {
 
 	// test 11: select id, group_id, count(*) over() count, mtime, vector <-> '[0.76,0.49, 0.67]' score from test_table where group_id in (1, 11) and routing_id in ('1', '11') order by score ASC, mtime DESC limit 2;
 	searchOptions = &SearchOptions{
+		Table:     "content_personal_vector_semantic_insight_vector_bge_m3_dense",
 		Columns:   []string{"id", "group_id", "COUNT(*) OVER() Count", "mtime", "vector <-> '[0.76,0.49, 0.67]' score"},
 		Condition: "group_id IN (1, 11) AND routing_id IN ('1', '11')",
 		OrderBy:   "score ASC, mtime DESC",
@@ -612,6 +698,7 @@ func TestSearchAdditional(t *testing.T) {
 	defer processor.Shutdown()
 	// 1. 基本查询：select id, routing_id, ext, vector from test_routing_data where id in (1, 2, 5, 6) order by id asc limit 5
 	searchOptions := &SearchOptions{
+		Table:     "test_routing_data",
 		Columns:   []string{"id", "routing_id", "ext", "vector"},
 		Condition: "id in ($1)",
 		OrderBy:   "id ASC",
@@ -628,6 +715,7 @@ func TestSearchAdditional(t *testing.T) {
 
 	// 2. 带别名的列表达式：select id, routing_id, vector <-> '[1,2,3]' as distance from test_routing_data order by distance asc limit 3
 	searchOptions = &SearchOptions{
+		Table:   "test_routing_data",
 		Columns: []string{"id", "routing_id", "vector <-> '[1,2,3]' as distance"},
 		OrderBy: "distance ASC",
 		Limit:   3,
@@ -643,6 +731,7 @@ func TestSearchAdditional(t *testing.T) {
 
 	// 3. 复杂条件查询：select * from test_routing_data where id > 3 and routing_id = 100
 	searchOptions = &SearchOptions{
+		Table:     "test_routing_data",
 		Columns:   []string{"id", "routing_id"},
 		Condition: "id > $1 and routing_id = $2",
 		OrderBy:   "id DESC",
@@ -659,6 +748,7 @@ func TestSearchAdditional(t *testing.T) {
 
 	// 4. 带计算和别名的列：select id, routing_id, (vector <-> '[1,2,3]') as double_distance from test_routing_data order by double_distance asc limit 3
 	searchOptions = &SearchOptions{
+		Table:   "test_routing_data",
 		Columns: []string{"id", "routing_id", "vector <-> '[1,2,3]' as double_distance"},
 		OrderBy: "double_distance ASC",
 		Limit:   3,
@@ -685,6 +775,7 @@ func TestSearchAdditional(t *testing.T) {
 
 	// 5. 多条件组合查询：select id, routing_id routingid from test_routing_data where id in ($1) and routing_id > 100
 	searchOptions = &SearchOptions{
+		Table:     "test_routing_data",
 		Columns:   []string{"id", "routing_id"},
 		Condition: "id in ($1) and routing_id > $2",
 		OrderBy:   "id ASC",
@@ -701,6 +792,7 @@ func TestSearchAdditional(t *testing.T) {
 
 	// 6. 带分页的查询：select * from test_routing_data order by id desc limit 5 offset 2
 	searchOptions = &SearchOptions{
+		Table:   "test_routing_data",
 		Columns: []string{"id"},
 		OrderBy: "id DESC",
 		Limit:   5,
@@ -717,6 +809,7 @@ func TestSearchAdditional(t *testing.T) {
 
 	// 7. 带 NULL 值处理的查询：select id, routing_id from test_routing_data where ext is not null
 	searchOptions = &SearchOptions{
+		Table:     "test_routing_data",
 		Columns:   []string{"id", "routing_id"},
 		Condition: "ext is not null",
 		OrderBy:   "id ASC",
@@ -732,6 +825,7 @@ func TestSearchAdditional(t *testing.T) {
 
 	// 8. 带数组参数的复杂条件：select * from test_routing_data where id in ($1) and routing_id in ($2)
 	searchOptions = &SearchOptions{
+		Table:     "test_routing_data",
 		Columns:   []string{"id", "routing_id"},
 		Condition: "id in ($1) and routing_id in ($2)",
 		OrderBy:   "id ASC",
@@ -747,6 +841,7 @@ func TestSearchAdditional(t *testing.T) {
 
 	// 13. select null: select id, routing_id, ext from test_routing_data where ext is null or ext = ''
 	searchOptions = &SearchOptions{
+		Table:     "test_routing_data",
 		Columns:   []string{"id", "routing_id", "ext"},
 		Condition: "ext is null or ext = ''",
 	}
@@ -771,6 +866,7 @@ func TestSearchAdditional(t *testing.T) {
 
 	// 14. select json: select id, routing_id, ext from test_routing_data where id in ($1) order by id asc
 	searchOptions = &SearchOptions{
+		Table:     "test_routing_data",
 		Columns:   []string{"id", "routing_id", "ext"},
 		Condition: "id in ($1)",
 		OrderBy:   "id DESC",
@@ -845,4 +941,71 @@ func TestSearchAdditional(t *testing.T) {
 	}
 	log.Printf("Test 17 result column: %v", rowCount)
 
+}
+
+func TestSearchMultipleTables(t *testing.T) {
+	db, processor := setupTestDatabaseWithMultipleTables(t)
+	defer db.Close()
+	defer processor.Shutdown()
+
+	// 1. 基本查询：select id, routing_id, ext, vector from test_routing_data where id in (1, 2, 5, 6) order by id asc limit 5
+	searchOptions := &SearchOptions{
+		Table:     "test_routing_data",
+		Columns:   []string{"id", "routing_id", "ext"},
+		Condition: "id in ($1)",
+		OrderBy:   "id ASC",
+		Limit:     5,
+	}
+	result, err := processor.SearchV2(searchOptions, []interface{}{1, 2, 5, 6})
+	if err != nil {
+		t.Errorf("failed to search data: %v", err)
+	}
+	if len(result.Rows) != 4 {
+		t.Errorf("expected 4 rows, but got %d", len(result.Rows))
+	}
+	log.Printf("Test 1 result size: %d, result: %v", len(result.Rows), result)
+	expectedResult0 := "[1 100 test1]"
+	expectedResult1 := "[2 100 test2]"
+	expectedResult2 := "[5 120 test5]"
+	expectedResult3 := "[6 120 test6]"
+	if fmt.Sprintf("%v", result.Rows[0]) != expectedResult0 {
+		t.Errorf("expected result: %v, but got %v", expectedResult0, result.Rows[0])
+	}
+	if fmt.Sprintf("%v", result.Rows[1]) != expectedResult1 {
+		t.Errorf("expected result: %v, but got %v", expectedResult1, result.Rows[1])
+	}
+	if fmt.Sprintf("%v", result.Rows[2]) != expectedResult2 {
+		t.Errorf("expected result: %v, but got %v", expectedResult2, result.Rows[2])
+	}
+	if fmt.Sprintf("%v", result.Rows[3]) != expectedResult3 {
+		t.Errorf("expected result: %v, but got %v", expectedResult3, result.Rows[3])
+	}
+
+	// 2. 带别名的列表达式：select id, routing_id, vector <-> '[1,2,3]' as distance from test_routing_data order by distance asc limit 3
+	searchOptions = &SearchOptions{
+		Table:   "test_routing_data_without_aux",
+		Columns: []string{"id", "routing_id", "vector <-> '[1,2,3]' as distance"},
+		OrderBy: "distance ASC",
+		Limit:   3,
+	}
+	result, err = processor.SearchV2(searchOptions)
+	if err != nil {
+		t.Errorf("failed to search data: %v", err)
+	}
+	if len(result.Rows) != 3 {
+		t.Errorf("expected 3 rows, but got %d", len(result.Rows))
+	}
+	log.Printf("Test 2 result size: %d, result: %v", len(result.Rows), result)
+	expectedResult0 = "[4 110 8.369647979736328]"
+	expectedResult1 = "[3 110 9.300244331359863]"
+	expectedResult2 = "[2 100 10.290419578552246]"
+	if fmt.Sprintf("%v", result.Rows[0]) != expectedResult0 {
+		t.Errorf("expected result: %v, but got %v", expectedResult0, result.Rows[0])
+	}
+	if fmt.Sprintf("%v", result.Rows[1]) != expectedResult1 {
+		t.Errorf("expected result: %v, but got %v", expectedResult1, result.Rows[1])
+	}
+	if fmt.Sprintf("%v", result.Rows[2]) != expectedResult2 {
+		t.Errorf("expected result: %v, but got %v", expectedResult2, result.Rows[2])
+	}
 }

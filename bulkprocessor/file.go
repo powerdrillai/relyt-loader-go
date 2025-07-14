@@ -77,7 +77,7 @@ type FileManager struct {
 }
 
 // NewFileManager creates a new file manager
-func NewFileManager(s3Client *S3Client, filePrefix string, maxRecords int, processId string, batchImportSize int) (*FileManager, error) {
+func NewFileManager(s3Client *S3Client, filePrefix string, maxRecords int, processId string, batchImportSize int) *FileManager {
 	// Create a unique batch directory identifier
 	batchDir := fmt.Sprintf("%s_%s", BatchPrefixNormal, uuid.New().String()[:8])
 	auxBatchDir := fmt.Sprintf("%s_%s", BatchPrefixAux, uuid.New().String()[:8])
@@ -90,7 +90,7 @@ func NewFileManager(s3Client *S3Client, filePrefix string, maxRecords int, proce
 		processId:   processId,
 		fileInfo:    FileInfo{currentFile: nil, currentBatchDir: batchDir, batchCounter: 0, batchImportSize: batchImportSize},
 		auxFileInfo: FileInfo{currentFile: nil, currentBatchDir: auxBatchDir, batchCounter: 0, batchImportSize: batchImportSize},
-	}, nil
+	}
 }
 
 // CreateFile creates a new file
