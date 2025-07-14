@@ -84,7 +84,7 @@ func NewBufferManager(filePrefix string, processId string) *BufferManager {
 
 func (bm *BufferManager) GetLocalCSVDir() string {
 	datePath := time.Now().Format("2006-01-02")
-	fullPath := filepath.Join(datePath, bm.processId, bm.filePrefix)
+	fullPath := filepath.Join(datePath, bm.filePrefix, bm.processId)
 	return fullPath
 }
 
