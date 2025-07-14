@@ -229,7 +229,8 @@ func (c *PostgreSQLClient) GetLoadConfigFromDB(ctx context.Context, config *Conf
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'max_concurrent_workers' THEN CONFIG_VALUE END)::INT, 1) as max_concurrent_workers,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'insert_into_batch_size' THEN CONFIG_VALUE END)::INT, 100) as insert_into_batch_size,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'async_delete' THEN CONFIG_VALUE END)::BOOLEAN, true) as async_delete,
-		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'update_on_conflict' THEN CONFIG_VALUE END)::BOOLEAN, true) as update_on_conflict
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'update_on_conflict' THEN CONFIG_VALUE END)::BOOLEAN, true) as update_on_conflict,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'file_write_timeout' THEN CONFIG_VALUE END)::INT, 3) as file_write_timeout
 	FROM relyt_sys.SDK_LOADER_CONFIG
 	`
 
@@ -254,11 +255,24 @@ func (c *PostgreSQLClient) GetLoadConfigFromDB(ctx context.Context, config *Conf
 		&config.InsertIntoBatchSize,
 		&config.AsyncDelete,
 		&config.UpdateOnConflict,
+		&config.FileWriteTimeout,
 	)
 
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to retrieve S3 configuration from database")
 	}
+
+	if config.TuplesPrePartition < 0 && config.ImportStrategy == CopyFromS3 {
+		log.Printf("TuplesPrePartition is less than 0, set to 5000")
+		config.TuplesPrePartition = 5000
+	}
+
+	routingTableName := fmt.Sprintf("%s%s", config.PostgreSQL.Table, routingTableSuffix)
+	hasRoutingTable, err := c.HasRoutingTable(ctx, routingTableName)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to check if routing table exists")
+	}
+	config.NeedSelectAuxTable = hasRoutingTable
 
 	return &s3Config, nil
 }
@@ -270,12 +284,13 @@ func (c *PostgreSQLClient) UpdateLoadConfig(ctx context.Context, config *Config)
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'import_error_sleep_time' THEN CONFIG_VALUE END)::INT, 10) as import_error_sleep_time,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'enable_dual_buffer' THEN CONFIG_VALUE END)::BOOLEAN, true) as enable_dual_buffer,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'buffer_max_records' THEN CONFIG_VALUE END)::INT, 5000) as buffer_max_records,
-		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'tuples_pre_partition' THEN CONFIG_VALUE END)::INT, 5000) as tuples_pre_partition,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'tuples_pre_partition' THEN CONFIG_VALUE END)::INT, -1) as tuples_pre_partition,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'import_strategy' THEN CONFIG_VALUE END)::INT, 0) as import_strategy,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'max_concurrent_workers' THEN CONFIG_VALUE END)::INT, 1) as max_concurrent_workers,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'insert_into_batch_size' THEN CONFIG_VALUE END)::INT, 100) as insert_into_batch_size,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'async_delete' THEN CONFIG_VALUE END)::BOOLEAN, true) as async_delete,
-		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'update_on_conflict' THEN CONFIG_VALUE END)::BOOLEAN, true) as update_on_conflict
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'update_on_conflict' THEN CONFIG_VALUE END)::BOOLEAN, true) as update_on_conflict,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'file_write_timeout' THEN CONFIG_VALUE END)::INT, 3) as file_write_timeout
 	FROM relyt_sys.SDK_LOADER_CONFIG
 	`
 
@@ -291,14 +306,24 @@ func (c *PostgreSQLClient) UpdateLoadConfig(ctx context.Context, config *Config)
 		&config.InsertIntoBatchSize,
 		&config.AsyncDelete,
 		&config.UpdateOnConflict,
+		&config.FileWriteTimeout,
 	)
-
-	log.Printf("Update config result: ImportTimeout %d, ImportErrorSleepTime %d, EnableDualBuffer %t, BufferMaxRecords %d, TuplesPrePartition %d, ImportStrategy %d, MaxConcurrentWorkers %d, InsertIntoBatchSize %d, AsyncDelete %t, UpdateOnConflict %t",
-		config.ImportTimeout, config.ImportErrorSleepTime, config.EnableDualBuffer, config.BufferMaxRecords, config.TuplesPrePartition, config.ImportStrategy, config.MaxConcurrentWorkers, config.InsertIntoBatchSize, config.AsyncDelete, config.UpdateOnConflict)
 
 	if err != nil {
 		return errors.Wrap(err, "failed to update load config")
 	}
+
+	if config.TuplesPrePartition < 0 && config.ImportStrategy == CopyFromS3 {
+		log.Printf("TuplesPrePartition is less than 0, set to 5000")
+		config.TuplesPrePartition = 5000
+	}
+
+	routingTableName := fmt.Sprintf("%s%s", config.PostgreSQL.Table, routingTableSuffix)
+	hasRoutingTable, err := c.HasRoutingTable(ctx, routingTableName)
+	if err != nil {
+		return errors.Wrap(err, "failed to check if routing table exists")
+	}
+	config.NeedSelectAuxTable = hasRoutingTable
 
 	return nil
 }

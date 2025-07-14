@@ -11,18 +11,20 @@ testv1:
 	go test -v ./bulkprocessor -run TestInsertWithMigration 
 
 testv2:
-	go test -v ./bulkprocessor -run TestBufferInsertBasic
-	go test -v ./bulkprocessor -run TestBufferInsertWithSomeErrors
-	go test -v ./bulkprocessor -run TestBufferInsertWithSleep
-	go test -v ./bulkprocessor -run TestBufferInsertWithPgRecovery
-	go test -v ./bulkprocessor -run TestBufferInsertWithImportTimeout
-	go test -v ./bulkprocessor -run TestBufferInsertWithMigration
-	go test -v ./bulkprocessor -run TestBufferInsertWithMixedOperations
-	go test -v ./bulkprocessor -run TestBufferInsertWithOffset
-	go test -v ./bulkprocessor -run TestBufferDeleteSync
-	go test -v ./bulkprocessor -run TestBufferInsertWithDuplicate
-	go test -v ./bulkprocessor -run TestBufferInsertWithCopyOnConflict
-	go test -v ./bulkprocessor -run TestAsyncDelete
+	go test -v -count=1 ./bulkprocessor -run TestBufferInsertBasic
+	go test -v -count=1 ./bulkprocessor -run TestBufferInsertWithSomeErrors
+	go test -v -count=1 ./bulkprocessor -run TestBufferInsertWithSleep
+	go test -v -count=1 ./bulkprocessor -run TestBufferInsertWithPgRecovery
+	go test -v -count=1 ./bulkprocessor -run TestBufferInsertWithImportTimeout
+	go test -v -count=1 ./bulkprocessor -run TestBufferInsertWithMigration
+	go test -v -count=1 ./bulkprocessor -run TestBufferInsertWithMixedOperations
+	go test -v -count=1 ./bulkprocessor -run TestBufferInsertWithOffset
+	go test -v -count=1 ./bulkprocessor -run TestBufferDeleteSync
+	go test -v -count=1 ./bulkprocessor -run TestBufferInsertWithDuplicate
+	go test -v -count=1 ./bulkprocessor -run TestBufferInsertWithCopyOnConflict
+	go test -v -count=1 ./bulkprocessor -run TestAsyncDelete
+
 testselect:
-	go test -v ./bulkprocessor -run TestSearchBasic
-	go test -v ./bulkprocessor -run TestSearchAdditional
+	go test -v -count=1 ./bulkprocessor -run TestSearchBasic
+	go test -v -count=1 ./bulkprocessor -run TestSearchAdditional
+	go test -v -count=1 ./bulkprocessor -run TestNewSearchFunc

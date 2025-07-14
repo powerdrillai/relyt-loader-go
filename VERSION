@@ -1,7 +1,15 @@
+2025-07-11 v1.0.16
+
+main change:
+1. add log_level config to control the log level, default is LOG (option: DEBUG, LOG, WARNING, ERROR)
+2. bug fix for ListenThread to modify routingHashSet
+3. bug fix for MaxVersionMap, when have massive data
+4. optimizer search UDF
+
 2025-07-09 v1.0.15
 
 main change:
-buf fix for insert into table without version
+bug fix for insert into table without version
 
 
 2025-07-09 v1.0.14

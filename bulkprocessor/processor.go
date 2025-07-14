@@ -38,6 +38,7 @@ type BulkProcessor struct {
 	fileQueue         chan string    // Queue of file IDs to be imported
 	batchQueue        chan string    // Queue of batch directories to be imported
 	routingQueue      chan bool      // channel to notify the routing table is updated
+	routingQueueV2    chan bool      // channel to notify the routing table is updated
 	pendingBatchFiles map[string]int // Map of batch directory to count of pending files
 	pendingBatchMutex sync.RWMutex
 
@@ -101,6 +102,8 @@ func New(config Config) (*BulkProcessor, error) {
 		return nil, err
 	}
 
+	SetLogLevel(config.LogLevel)
+
 	// Generate a unique process ID
 	processId := uuid.New().String()
 
@@ -156,7 +159,7 @@ func New(config Config) (*BulkProcessor, error) {
 	routingHashSet := make(map[string]struct{})
 	if hasRoutingTable {
 		routingHashSet, err = pgClient.RefreshRoutingTable(ctx, routingTableName)
-		log.Printf("Init: routingHashSet size: %d", len(routingHashSet))
+		Log("Init: routingHashSet size: %d", len(routingHashSet))
 		if err != nil {
 			pgClient.Close()
 			return nil, errors.Wrap(err, "failed to initialize routing table")
@@ -187,6 +190,7 @@ func New(config Config) (*BulkProcessor, error) {
 		fileQueue:         make(chan string, 1000), // Buffer for file queue
 		batchQueue:        make(chan string, 1000), // Buffer for batch queue
 		routingQueue:      make(chan bool, 10),     // Buffer for routing table updated
+		routingQueueV2:    make(chan bool, 10),     // Buffer for routing table updated
 		pendingBatchFiles: make(map[string]int),    // Tracks files pending in each batch
 		feedbackKeys:      make(map[string]bool),   // Tracks error keys for failed imports
 		recordsQueue:      make(chan []string, 10000),
@@ -199,7 +203,7 @@ func New(config Config) (*BulkProcessor, error) {
 		pkColumns:         pkColumns,
 		pkColumnsIndex:    nil,
 		bufferManager:     bufferManager,
-		bufferTaskQueue:   make(chan *BufferTask, 100),
+		bufferTaskQueue:   make(chan *BufferTask, 200),
 		bufferThreadWg:    sync.WaitGroup{},
 		recordQueueV2:     make(chan *Record, 10000),
 		workerWg:          sync.WaitGroup{},
@@ -647,7 +651,7 @@ func (p *BulkProcessor) Flush() error {
 		if atomic.LoadInt32(&p.recordsNum) == 0 {
 			break
 		}
-		log.Printf("Flush wait for recordsNum to be 0, current recordsNum: %d", atomic.LoadInt32(&p.recordsNum))
+		Log("Flush wait for recordsNum to be 0, current recordsNum: %d", atomic.LoadInt32(&p.recordsNum))
 		time.Sleep(time.Duration(1) * time.Second)
 	}
 
@@ -670,10 +674,10 @@ func (p *BulkProcessor) Flush() error {
 					feedbackKeysString := fmt.Sprintf("failed %s is [%s].", p.config.FeedbackColumn, strings.Join(feedbackKeysArray, ","))
 
 					if p.config.ImportErrorCallback != nil {
-						log.Printf("save file: %s failed before callback: %s", currentBuffer.ID, feedbackKeysString)
+						Warning("save file: %s failed before callback: %s", currentBuffer.ID, feedbackKeysString)
 						p.config.ImportErrorCallback(p.config.FeedbackColumn, feedbackKeysArray, err, p.config.CallbackResource)
 					} else {
-						log.Printf("save file: %s failed with no callback: %s", currentBuffer.ID, feedbackKeysString)
+						Warning("save file: %s failed with no callback: %s", currentBuffer.ID, feedbackKeysString)
 					}
 					continue
 				}
@@ -694,7 +698,7 @@ func (p *BulkProcessor) Flush() error {
 		// Flush current file if it has records
 		currentFile := p.fileManager.GetCurrentFile(isAux)
 		if currentFile != nil && currentFile.State == FileStateOpen && currentFile.NumRecords > 0 {
-			log.Printf("Flushing current file: %s", currentFile.S3Key)
+			Debug("Flushing current file: %s", currentFile.S3Key)
 			if err := currentFile.Flush(); err != nil {
 				p.fileManager.fileOperationsMutex.Unlock()
 				return err
@@ -731,7 +735,7 @@ func (p *BulkProcessor) Flush() error {
 	for dir, count := range p.pendingBatchFiles {
 		if count > 0 {
 			sendDirectory = true
-			log.Printf("Queuing batch directory for import: %s with %d files", dir, count)
+			Debug("Queuing batch directory for import: %s with %d files", dir, count)
 			batchDir = dir
 			p.batchQueue <- dir
 		}
@@ -744,7 +748,7 @@ func (p *BulkProcessor) Flush() error {
 
 	// if no directory send to import, return ASAP
 	if !sendDirectory && len(needFlushBufferIds) == 0 {
-		log.Printf("flush without any data")
+		Debug("flush without any data")
 		return nil
 	}
 
@@ -799,7 +803,7 @@ func (p *BulkProcessor) Flush() error {
 
 		// If no files are pending, we're done
 		if len(frozenFiles) == 0 && len(importingFiles) == 0 && len(flushingBuffers) == 0 {
-			log.Println("No files to import, exiting...")
+			Debug("No files to import, exiting...")
 			return nil
 		}
 
@@ -994,13 +998,12 @@ func (p *BulkProcessor) AutoFlushThread() {
 			// Not canceled
 		}
 		fileTimeoutDuration := time.Duration(p.config.FileWriteTimeout) * time.Second
-		log.Printf("AutoFlush thread checking autoflush, last flush time: %v, timeout: %v", p.lastFlushTime, fileTimeoutDuration)
 		if time.Since(p.lastFlushTime) >= fileTimeoutDuration {
-			log.Printf("AutoFlush thread doing flush")
+			Debug("AutoFlush thread doing flush (last flush: %v)", p.lastFlushTime)
 			p.Flush()
 		} else {
 			timeSleep := fileTimeoutDuration - time.Since(p.lastFlushTime)
-			log.Printf("AutoFlush thread waiting for autoflush, sleep %v seconds", timeSleep)
+			Debug("AutoFlush thread waiting for autoflush (last flush: %v)", p.lastFlushTime)
 			time.Sleep(time.Duration(timeSleep))
 		}
 	}
@@ -1024,15 +1027,15 @@ func (p *BulkProcessor) BGWorkerThread() {
 		importedFilepaths := p.fileManager.RecycleFiles(false)
 		importedFilepaths = append(importedFilepaths, p.bufferManager.RecycleBuffers()...)
 		if len(importedFilepaths) > 0 {
-			log.Printf("GC thread recycling files, file number: %d", len(importedFilepaths))
+			Log("BGWORKER: recycling files, file number: %d", len(importedFilepaths))
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			if err := p.pgClient.DeleteDeltaCheckpointByProcessIdAndFilepaths(ctx, p.processId, importedFilepaths); err != nil {
-				log.Printf("Failed to delete delta checkpoint for recycled file: %v\n", err)
+				Debug("Failed to delete delta checkpoint for recycled file: %v\n", err)
 			}
 			// delete completed delta checkpoint 24 hours ago
 			err := p.pgClient.DeleteCompletedDeltaCheckpoint(ctx, 24)
 			if err != nil {
-				log.Printf("Failed to delete completed delta checkpoint: %v", err)
+				Debug("Failed to delete completed delta checkpoint: %v", err)
 			}
 			cancel()
 		}
@@ -1041,7 +1044,7 @@ func (p *BulkProcessor) BGWorkerThread() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		err := p.pgClient.UpdateLoadConfig(ctx, &p.config)
 		if err != nil {
-			log.Printf("Failed to update load config: %v", err)
+			Debug("Failed to update load config: %v", err)
 			time.Sleep(1 * time.Second)
 		}
 		cancel()
@@ -1050,20 +1053,20 @@ func (p *BulkProcessor) BGWorkerThread() {
 		dirPath := p.bufferManager.GetLocalCSVDir()
 		fullPath := filepath.Join(p.config.LocalFilePrefix, dirPath)
 		if _, err := os.Stat(fullPath); os.IsNotExist(err) {
-			log.Printf("BGWORKER: Directory %s does not exist, skipping", fullPath)
+			Debug("BGWORKER: Directory %s does not exist, skipping", fullPath)
 		} else {
 			files, err := os.ReadDir(fullPath)
 			if err != nil {
-				log.Printf("Failed to read directory: %v", err)
+				Error("Failed to read directory: %v", err)
 			} else {
-				log.Printf("BGWORKER: Found %d files in %s", len(files), fullPath)
+				Log("BGWORKER: Found %d files in %s", len(files), fullPath)
 			}
 		}
 
 		// 4. recycle local csv directory files, 2 days ago
 		deletedPaths := p.bufferManager.RecycleLocalDir(p.config.LocalFilePrefix, 2)
 		if len(deletedPaths) > 0 {
-			log.Printf("BGWORKER: Recycled %v old local directories", deletedPaths)
+			Log("BGWORKER: Recycled %v old local directories", deletedPaths)
 		}
 
 		time.Sleep(time.Duration(p.config.BGWorkerInterval) * time.Second)
@@ -1134,7 +1137,7 @@ func (p *BulkProcessor) ListenThread() {
 		default:
 			conn, err := p.pgClient.pool.Acquire(p.ctx)
 			if err != nil {
-				log.Printf("Error acquiring connection: %v", err)
+				Debug("Error acquiring connection: %v", err)
 				time.Sleep(5 * time.Second)
 				continue
 			}
@@ -1143,7 +1146,7 @@ func (p *BulkProcessor) ListenThread() {
 			_, err = conn.Exec(p.ctx, listenChannelName)
 			if err != nil {
 				conn.Release()
-				log.Printf("Error listening to routing table changes: %v", err)
+				Debug("Error listening to routing table changes: %v", err)
 				time.Sleep(5 * time.Second)
 				continue
 			}
@@ -1153,7 +1156,7 @@ func (p *BulkProcessor) ListenThread() {
 				select {
 				case <-p.ctx.Done():
 					conn.Release()
-					log.Println("Listener thread context canceled, exiting...")
+					Log("Listener thread context canceled, exiting...")
 					return
 				default:
 					// Wait for notification
@@ -1161,11 +1164,11 @@ func (p *BulkProcessor) ListenThread() {
 					if err != nil {
 						if err == context.Canceled {
 							conn.Release()
-							log.Println("Listener thread context canceled, exiting...")
+							Log("Listener thread context canceled, exiting...")
 							return
 						}
 						// Connection error, release current connection and break inner loop to reconnect
-						log.Printf("Listener Connection error, will reconnect: %v", err)
+						Debug("Listener Connection error, will reconnect: %v", err)
 						time.Sleep(1 * time.Second)
 						conn.Release()
 						goto reconnect
@@ -1174,7 +1177,7 @@ func (p *BulkProcessor) ListenThread() {
 					// Get updated routing table data after receiving notification
 					newRoutingHashSet, err := p.pgClient.RefreshRoutingTable(p.ctx, p.GetRoutingTableName())
 					if err != nil {
-						log.Printf("Error getting updated routing table: %v", err)
+						Debug("Error getting updated routing table: %v", err)
 						continue
 					}
 
@@ -1185,7 +1188,8 @@ func (p *BulkProcessor) ListenThread() {
 					p.routingHashSet = newRoutingHashSet
 					p.routingMutex.Unlock()
 					p.routingQueue <- true
-					log.Printf("Routing table updated, old size is: %d, new size is: %d, and exec force flush", oldsize, newsize)
+					p.routingQueueV2 <- true
+					Debug("Routing table updated, old size is: %d, new size is: %d, and exec force flush", oldsize, newsize)
 					p.Flush()
 				}
 			}
@@ -1265,7 +1269,7 @@ func (p *BulkProcessor) InsertV2(fileID, routingID string, records interface{}, 
 			for i, columnName := range p.pkColumns {
 				p.pkColumnsIndex[i] = GetColumnIndex(p.fields, columnName)
 			}
-			log.Printf("pkColumnsIndex: %v", p.pkColumnsIndex)
+			Debug("pkColumnsIndex: %v", p.pkColumnsIndex)
 		}
 	}
 
@@ -1322,7 +1326,7 @@ func (p *BulkProcessor) DeleteSyncV2(fileID, routingID string) error {
 	_, err := p.pgClient.DeleteTablesWithCondition(p.ctx, p.config.PostgreSQL.Schema, p.config.PostgreSQL.Table, fileID, routingID, p.hasRoutingTable)
 	if err != nil {
 		if p.config.AsyncDelete {
-			log.Printf("Failed to delete file %s with routingID %s sync: %v, will retry in async mode", fileID, routingID, err)
+			Debug("Failed to delete file %s with routingID %s sync: %v, will retry in async mode", fileID, routingID, err)
 			return nil
 		}
 		return fmt.Errorf("failed to delete tables with condition: %w", err)
@@ -1375,7 +1379,7 @@ func (p *BulkProcessor) DeleteV2(fileID, routingID string, offset ...int64) erro
 }
 
 func (p *BulkProcessor) SaveBufferToFileAndGenerateTask(currentBuffer *Buffer, toAuxFile bool) error {
-	log.Printf("Buffer %s is full (records: %d), switching buffers",
+	Debug("Buffer %s is full (records: %d), switching buffers",
 		currentBuffer.ID, currentBuffer.GetRecordCount())
 
 	// deduplicate records
@@ -1383,12 +1387,22 @@ func (p *BulkProcessor) SaveBufferToFileAndGenerateTask(currentBuffer *Buffer, t
 
 	columnNames := GetColumnNames(p.fields)
 
-	if err := currentBuffer.BufferWriteToFile(columnNames, p.s3Client, p.config.TuplesPrePartition, p.config.ImportStrategy == CopyFromS3); err != nil {
-		return err
+	taskImportStrategy := p.config.ImportStrategy
+
+	if err := currentBuffer.BufferWriteToFile(columnNames, p.s3Client, p.config.TuplesPrePartition, taskImportStrategy == CopyFromS3); err != nil {
+		// if import strategy is CopyFromS3, and upload buffer to s3 failed, try to use InsertOnConflict
+		if strings.Contains(err.Error(), "Upload buffer to s3 failed") {
+			if taskImportStrategy == CopyFromS3 {
+				Debug("%v, fallback to InsertOnConflict", err)
+				taskImportStrategy = InsertOnConflict
+			}
+		} else {
+			return err
+		}
 	}
 
 	// create task and send to task queue
-	task := NewBufferTask(currentBuffer, deletedRecords, versionMap)
+	task := NewBufferTask(currentBuffer, deletedRecords, versionMap, taskImportStrategy)
 	p.bufferTaskQueue <- task
 	p.lastFlushTime = time.Now()
 
@@ -1403,14 +1417,13 @@ func (p *BulkProcessor) InsertThreadV2() {
 
 	var localRoutingInited = false
 	var localRoutingHashSet map[string]struct{}
-	versionMap := make(map[RecordIndex]string)
 
 	for {
 		select {
 		case <-p.ctx.Done():
 			log.Println("InsertThreadV2 context canceled, exiting...")
 			return
-		case <-p.routingQueue:
+		case <-p.routingQueueV2:
 			p.routingMutex.Lock()
 			localRoutingHashSet = p.routingHashSet
 			localRoutingInited = true
@@ -1422,17 +1435,6 @@ func (p *BulkProcessor) InsertThreadV2() {
 			recordIndex := RecordIndex{
 				fileID:    record.FileID,
 				routingID: record.RoutingID,
-			}
-
-			// check version
-			if p.versionColIndex >= 0 && operation == OperationInsert {
-				record.Version = values[p.versionColIndex]
-
-				if version, exsit := versionMap[recordIndex]; exsit && version > record.Version {
-					atomic.AddInt32(&p.recordsNum, -1)
-					continue
-				}
-				versionMap[recordIndex] = record.Version
 			}
 
 			if p.feedFieldIndex >= 0 && operation == OperationInsert {
@@ -1471,7 +1473,7 @@ func (p *BulkProcessor) InsertThreadV2() {
 			currentBuffer := p.bufferManager.GetCurrentBuffer(toAuxFile)
 			if currentBuffer == nil || !p.bufferManager.IsActive(currentBuffer.ID) {
 				currentBuffer = p.bufferManager.NewBuffer(p.config.LocalFilePrefix, p.config.BufferMaxRecords, toAuxFile)
-				log.Printf("New buffer created: %s, max records: %d", currentBuffer.ID, p.config.BufferMaxRecords)
+				Debug("New buffer created: %s, max records: %d", currentBuffer.ID, p.config.BufferMaxRecords)
 				p.bufferManager.SetCurrentBuffer(currentBuffer, toAuxFile)
 
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1488,12 +1490,22 @@ func (p *BulkProcessor) InsertThreadV2() {
 				}
 			}
 
+			// check version
+			if p.versionColIndex >= 0 && operation == OperationInsert {
+				record.Version = values[p.versionColIndex]
+
+				if version, exsit := currentBuffer.MaxVersionMap[recordIndex]; exsit && version > record.Version {
+					p.bufferManager.bufferOperationsMutex.Unlock()
+					atomic.AddInt32(&p.recordsNum, -1)
+					continue
+				}
+				currentBuffer.MaxVersionMap[recordIndex] = record.Version
+			}
+
 			currentBuffer.AddRecord(record)
 			atomic.AddInt32(&p.recordsNum, -1)
 
 			if currentBuffer.IsFull() && p.bufferManager.IsActive(currentBuffer.ID) {
-				versionMap = make(map[RecordIndex]string)
-
 				// deactivate current buffer, create new buffer
 				p.bufferManager.SetBufferStatus(currentBuffer.ID, BufferStatusFrozen)
 				p.bufferManager.SetCurrentBuffer(nil, toAuxFile)
@@ -1558,13 +1570,12 @@ func (p *BulkProcessor) ImporterThreadV2() {
 					p.processBufferTask(t, wID, feedbackKeysArray)
 
 					duration := time.Since(startTime)
-					log.Printf("Parallel Worker %d finished import strategy is %d, processing task: %s, duration: %v", wID, p.config.ImportStrategy, t.TaskId, duration)
+					Log("Parallel Worker %d finished import: strategy is %d, processing task: %s, duration: %v", wID, t.ImportStrategy, t.TaskId, duration)
 				}(task, workerID)
 			} else {
 				startTime := time.Now()
-				log.Printf("Single Worker starting to process task: %s (records: %d)", task.TaskId, task.RecordCount)
 				p.processBufferTask(task, -1, feedbackKeysArray)
-				log.Printf("Single Worker finished import strategy is %d, processing task: %s, duration: %v", p.config.ImportStrategy, task.TaskId, time.Since(startTime))
+				Log("Single Worker finished import: strategy is %d, processing task: %s, records: %d, duration: %v", task.ImportStrategy, task.TaskId, task.RecordCount, time.Since(startTime))
 			}
 		}
 	}
@@ -1579,13 +1590,14 @@ func (p *BulkProcessor) processBufferTask(task *BufferTask, workerID int, feedba
 
 	for i := 0; i < maxLoopNum; i++ {
 		if err := p.processBufferTaskWithTransaction(task); err != nil {
-			log.Printf("Worker %d failed to process buffer task %s: %v",
-				workerID, task.TaskId, err)
+
+			Warning("Server is busy, will retry to process buffer task %s after %d seconds",
+				task.TaskId, p.config.ImportErrorSleepTime)
 
 			// Update checkpoint with all error file
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			if err2 := p.pgClient.UpdateDeltaCheckpointStatus(ctx, p.processId, []string{task.LocalFile}, CheckpointStatusFailed, -1, err.Error()); err2 != nil {
-				fmt.Fprintf(os.Stderr, "Worker %d failed to update checkpoint for error file: %v\n", workerID, err2)
+				Debug("Worker %d failed to update checkpoint for error file: %v\n", workerID, err2)
 			}
 			cancel()
 
@@ -1601,11 +1613,11 @@ func (p *BulkProcessor) processBufferTask(task *BufferTask, workerID int, feedba
 			feedbackKeysString := fmt.Sprintf("failed %s is [%s].", p.config.FeedbackColumn, strings.Join(feedbackKeysArray, ","))
 
 			if p.config.ImportErrorCallback != nil {
-				log.Printf("Worker %d task %s failed before callback: %s",
+				Debug("Worker %d task %s failed before callback: %s",
 					workerID, task.TaskId, feedbackKeysString)
 				p.config.ImportErrorCallback(p.config.FeedbackColumn, feedbackKeysArray, err, p.config.CallbackResource)
 			} else {
-				log.Printf("Worker %d task %s failed with no callback: %s",
+				Debug("Worker %d task %s failed with no callback: %s",
 					workerID, task.TaskId, feedbackKeysString)
 			}
 
@@ -1620,7 +1632,7 @@ func (p *BulkProcessor) processBufferTask(task *BufferTask, workerID int, feedba
 	if isFailed {
 		p.bufferManager.SetBufferStatus(task.TaskId, BufferStatusImportError)
 		feedbackKeysString := fmt.Sprintf("failed %s is [%s].", p.config.FeedbackColumn, strings.Join(feedbackKeysArray, ","))
-		log.Printf("Worker %d import batch directory timeout: %s", workerID, feedbackKeysString)
+		Error("Worker %d import task %s failed: %s after retry %d times", workerID, task.TaskId, feedbackKeysString, maxLoopNum)
 		if p.config.ImportErrorCallback != nil {
 			p.config.ImportErrorCallback(p.config.FeedbackColumn, feedbackKeysArray, err, p.config.CallbackResource)
 		}
@@ -1630,14 +1642,14 @@ func (p *BulkProcessor) processBufferTask(task *BufferTask, workerID int, feedba
 	// remove local file and delta checkpoint
 	if task.LocalFile != "" {
 		if err := CleanupLocalFile(task.LocalFile); err != nil {
-			log.Printf("Worker %d failed to remove temporary file %s: %v",
+			Error("Worker %d failed to remove temporary file %s: %v",
 				workerID, task.LocalFile, err)
 		}
 
 		// Update checkpoint with all imported file
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		if err := p.pgClient.UpdateDeltaCheckpointStatus(ctx, p.processId, []string{task.LocalFile}, CheckpointStatusCompleted, 0, ""); err != nil {
-			fmt.Fprintf(os.Stderr, "Worker %d failed to update checkpoint for imported file: %v\n", workerID, err)
+			Debug("Worker %d failed to update checkpoint for imported file: %v\n", workerID, err)
 		}
 		cancel()
 	}
@@ -1657,7 +1669,7 @@ func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask) error
 	asyncDelete := p.config.AsyncDelete
 
 	if task.RecordCount <= 0 && len(task.DeletedRecords) == 0 {
-		log.Printf("task %s has no records, skip processing", task.TaskId)
+		Debug("task %s has no records, skip processing", task.TaskId)
 		return nil
 	}
 
@@ -1690,7 +1702,7 @@ func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask) error
 	defer func() {
 		if !success {
 			if rollbackErr := tx.Rollback(ctx); rollbackErr != nil {
-				log.Printf("task %s failed to rollback transaction: %v", task.TaskId, rollbackErr)
+				Error("task %s failed to rollback transaction: %v", task.TaskId, rollbackErr)
 			}
 		}
 	}()
@@ -1705,8 +1717,8 @@ func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask) error
 							$5   -- have_aux_table
 						)`
 
-		log.Printf("Executing delete SQL in transaction: relyt_sys.delete_tables_with_condition('%s', '%s', '%s', '%s', %t)",
-			p.config.PostgreSQL.Schema, p.config.PostgreSQL.Table, deletedRecord.fileID, deletedRecord.routingID, p.hasRoutingTable)
+		// log.Printf("Executing delete SQL in transaction: relyt_sys.delete_tables_with_condition('%s', '%s', '%s', '%s', %t)",
+		// 	p.config.PostgreSQL.Schema, p.config.PostgreSQL.Table, deletedRecord.fileID, deletedRecord.routingID, p.hasRoutingTable)
 
 		_, err := tx.Exec(ctx, deleteSQL,
 			p.config.PostgreSQL.Schema,
@@ -1729,16 +1741,16 @@ func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask) error
 
 	// 3. import file
 	if task.LocalFile != "" && task.RecordCount > 0 {
-		if p.config.ImportStrategy == InsertOnConflict {
+		if task.ImportStrategy == InsertOnConflict {
 			if err := p.pgClient.InsertIntoOnConflictFromLocal(ctx, tx, GetLocalFileFullPath(task.LocalFile), targetTable,
 				GetColumnNames(p.fields), updateOnConflict, p.config.InsertIntoBatchSize); err != nil {
 				return fmt.Errorf("INSERT INTO failed: %w", err)
 			}
-		} else if p.config.ImportStrategy == CopyFromLocal {
+		} else if task.ImportStrategy == CopyFromLocal {
 			if err := p.pgClient.CopyFromLocalOnConflict(ctx, tx, GetLocalFileFullPath(task.LocalFile), targetTable, GetColumnNames(p.fields), updateOnConflict); err != nil {
 				return fmt.Errorf("COPY FROM LOCAL failed: %w", err)
 			}
-		} else if p.config.ImportStrategy == CopyFromS3 {
+		} else if task.ImportStrategy == CopyFromS3 {
 			s3Config, err := p.pgClient.GetLoadConfigFromDB(ctx, &p.config)
 			if err != nil {
 				return fmt.Errorf("failed to get S3 configuration: %w", err)
@@ -1837,7 +1849,7 @@ func (p *BulkProcessor) SearchJsonRowsV2(options *SearchOptions, args ...interfa
 		processedHaving,
 		options.Limit,
 		options.Offset,
-		p.hasRoutingTable,
+		p.config.NeedSelectAuxTable,
 	}
 
 	// log.Printf("baseSQL: select * from get_columns_with_condition('%v', '%v', '%v', '%v', '%v', '%v', '%v', '%v', '%v', %t)", params...)
@@ -1986,7 +1998,7 @@ func (p *BulkProcessor) SearchJsonRowsWithTimeoutV2(timeoutMs int, options *Sear
 		processedHaving,
 		options.Limit,
 		options.Offset,
-		p.hasRoutingTable,
+		p.config.NeedSelectAuxTable,
 	}
 
 	// log.Printf("baseSQL: select * from get_columns_with_condition('%v', '%v', '%v', '%v', '%v', '%v', '%v', '%v', '%v', %t)", params...)

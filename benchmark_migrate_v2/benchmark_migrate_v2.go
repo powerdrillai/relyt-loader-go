@@ -22,6 +22,7 @@ type TestDataWithAuxV2 struct {
 	RoutingID string `relyt:"routing_id"`
 	Ext       string `relyt:"ext"`
 	Vector    string `relyt:"vector"`
+	Version   int    `relyt:"version"`
 }
 
 // 定义一个结构体，包含数据库连接信息
@@ -128,7 +129,8 @@ func CreateTestDataTaleV2(db *sql.DB) error {
 		fileid bigint NOT NULL,
 		routing_id text NOT NULL,
 		ext text,
-		vector vecf16(3) NOT NULL
+		vector vecf16(3) NOT NULL,
+		version bigint
 	) using heap;
 
 	CREATE TABLE IF NOT EXISTS relyt_migrate_insert_benchmark_v2_relyt_massive_group (
@@ -136,7 +138,8 @@ func CreateTestDataTaleV2(db *sql.DB) error {
 		fileid bigint NOT NULL,
 		routing_id text NOT NULL,
 		ext text,
-		vector vecf16(3) NOT NULL
+		vector vecf16(3) NOT NULL,
+		version bigint
 	) using heap;
 
 	CREATE TABLE IF NOT EXISTS relyt_sys.relyt_migrate_insert_benchmark_v2_relyt_routing (
@@ -171,8 +174,7 @@ func InitRoutingTableV2(db *sql.DB) error {
 	INSERT INTO relyt_sys.relyt_migrate_insert_benchmark_v2_relyt_routing (routing_id, store_table_name) 
 	VALUES 
 		('100', 'relyt_migrate_insert_benchmark_v2_relyt_massive_group'),
-		('200', 'relyt_migrate_insert_benchmark_v2_relyt_massive_group'),
-		('300', 'relyt_migrate_insert_benchmark_v2_relyt_massive_group');`
+		('200', 'relyt_migrate_insert_benchmark_v2_relyt_massive_group');`
 	_, err := db.Exec(query)
 	if err != nil {
 		return fmt.Errorf("failed to initialize routing table: %w", err)
@@ -207,7 +209,21 @@ func GetCountFromAuxTestDataTableV2(db *sql.DB) (int, error) {
 	return count, nil
 }
 
-func InsertDataV2(db *sql.DB, processor *bulkprocessor.BulkProcessor, filePath string, batchSize int, wg *sync.WaitGroup) error {
+func InsertRoutingTableV2(db *sql.DB) error {
+	log.Println("Inserting routing table...")
+	query := `
+	INSERT INTO relyt_sys.relyt_migrate_insert_benchmark_v2_relyt_routing (routing_id, store_table_name) 
+	VALUES 
+		('300', 'relyt_migrate_insert_benchmark_v2_relyt_massive_group') ON CONFLICT (routing_id) DO NOTHING;`
+	_, err := db.Exec(query)
+	if err != nil {
+		return fmt.Errorf("failed to insert routing table: %w", err)
+	}
+	log.Println("Routing table inserted successfully.")
+	return nil
+}
+
+func InsertDataV2(db *sql.DB, processor *bulkprocessor.BulkProcessor, filePath string, wg *sync.WaitGroup) error {
 	defer wg.Done()
 
 	var tests []TestDataWithAuxV2
@@ -220,7 +236,7 @@ func InsertDataV2(db *sql.DB, processor *bulkprocessor.BulkProcessor, filePath s
 
 	csvReader := csv.NewReader(csvFile)
 	csvReader.FieldsPerRecord = -1
-	csvReader.Comma = '\t'
+	csvReader.Comma = ','
 	csvReader.ReuseRecord = true
 
 	i := 0
@@ -251,34 +267,35 @@ func InsertDataV2(db *sql.DB, processor *bulkprocessor.BulkProcessor, filePath s
 		ext := record[3]
 		vector := record[4]
 
+		version, err := strconv.Atoi(record[5])
+		if err != nil {
+			log.Fatalf("failed to parse version: %v", err)
+		}
+
 		tests = append(tests, TestDataWithAuxV2{
 			ID:        id,
 			FileID:    fileID,
 			RoutingID: routingID,
 			Ext:       ext,
 			Vector:    vector,
+			Version:   version,
 		})
 		i++
 
-		// insert batch
-		if i%batchSize == 0 {
-			err := processor.InsertV2(fmt.Sprintf("%d", fileID), routingID, tests)
+		if i == 100 {
+			err = InsertRoutingTableV2(db)
 			if err != nil {
-				log.Fatalf("failed to insert data: %v", err)
+				log.Fatalf("failed to insert routing table: %v", err)
 			}
-
-			tests = nil // clear the list, prepare for the next batch
 		}
-	}
 
-	if len(tests) > 0 {
-		// Get fileID and routingID from the first record in tests
-		lastFileID := fmt.Sprintf("%d", tests[0].FileID)
-		lastRoutingID := tests[0].RoutingID
-		err := processor.InsertV2(lastFileID, lastRoutingID, tests)
+		// insert batch
+		err = processor.InsertV2(fmt.Sprintf("%d", fileID), routingID, tests)
 		if err != nil {
 			log.Fatalf("failed to insert data: %v", err)
 		}
+
+		tests = nil // clear the list, prepare for the next batch
 	}
 
 	log.Printf("inserted %d records for %s", i, filePath)
@@ -325,11 +342,10 @@ func main() {
 	}
 
 	var filePath string
-	batchSize := 10000
-	for i := 0; i < 10; i++ {
-		filePath = fmt.Sprintf("./benchmark_test_v2_a%c", 'a'+i)
+	for i := 0; i < 1; i++ {
+		filePath = fmt.Sprintf("./generated_data/wps_batch_data_%d.csv", i)
 		writeWg.Add(1)
-		go InsertDataV2(db, processor, filePath, batchSize, &writeWg)
+		go InsertDataV2(db, processor, filePath, &writeWg)
 	}
 	writeWg.Wait()
 

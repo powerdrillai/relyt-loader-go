@@ -1,49 +1,19 @@
 ## table schema
-# qsearch=# \d content_personal_vector_semantic_insight_vector_bge_m3_dense
-# Partitioned table "public.content_personal_vector_semantic_insight_vector_bge_m3_dense"
-#       Column       |         Type          | Collation | Nullable | Default
-# -------------------+-----------------------+-----------+----------+---------
-#  id                | character varying     |           | not null |
-#  routing_id        | character varying     |           | not null |
-#  chunk_id          | integer               |           | not null |
-#  chunk_type        | character varying     |           | not null |
-#  user_id           | bigint                |           | not null |
-#  creator           | bigint                |           | not null |
-#  sharer            | bigint                |           | not null |
-#  fileid            | bigint                |           | not null |
-#  group_id          | bigint                |           | not null |
-#  ctime             | bigint                |           | not null |
-#  mtime             | bigint                |           | not null |
-#  y                 | integer               |           | not null |
-#  ym                | integer               |           | not null |
-#  ymd               | integer               |           | not null |
-#  ext               | character varying(10) |           | not null |
-#  fsize             | bigint                |           | not null |
-#  parent_id         | bigint                |           | not null |
-#  ftype             | character varying(50) |           | not null |
-#  version           | bigint                |           | not null |
-#  index_update_time | bigint                |           | not null |
-#  ext_group         | character varying(50) |           | not null |
-#  vector            | vecf16(1024)          |           | not null |
-# Partition key: RANGE (routing_id)
-# Indexes:
-#     "content_personal_vector_semantic_insight_vector_bge_m3_dense_pkey" PRIMARY KEY, btree (routing_id, fileid, id)
-#     "insight_personal_idx_fileid" btree (fileid)
-#     "insight_personal_idx_group_id" btree ("group_id")
-# Distributed by: (routing_id, fileid)
+# CREATE TABLE IF NOT EXISTS relyt_migrate_insert_benchmark_v2 (
+# 	id bigint NOT NULL,
+# 	fileid bigint NOT NULL,
+# 	routing_id text NOT NULL,
+# 	ext text,
+# 	vector vecf16(3) NOT NULL,
+# 	version bigint,
+# 	PRIMARY KEY (routing_id, fileid, id)
+# ) using heap;
 
-# 用于生成测试数据插入content_personal_vector_semantic_insight_vector_bge_m3_dense中:
-# 1. 随机生成(routing_id, fileid)的组合，每一万条数据重新生成一次(routing_id, fileid)，每条数据的id都唯一（按照生成的数据顺序，从0开始，依次递增）
+# 用于生成测试数据插入relyt_migrate_insert_benchmark_v2中:
+# 1. 生成(routing_id, fileid)的组合，每一万条数据重新生成一次(routing_id, fileid, 其中routing_id=100,200,300的记录需要20000条，通过变化fileid来实现)，每条数据的id都唯一（按照生成的数据顺序，从0开始，依次递增）
 # 2. 数据总量为1亿条，每个csv文件包含100万条基础数据, 在基础数据基础上，额外生成10%主键重复的数据
-# 3. vector为3维的向量
+# 3. vector为3维的向量，每个向量都为[0.1, 0.1, 0.1]
 # 4. 除了(routing_id, fileid, id)，为了效率其余字段可固定
-
-# -- 查找具有多个version的routing_id和fileid组合
-# SELECT routing_id, fileid, COUNT(DISTINCT version) as version_count,
-# count(*) FROM content_personal_vector_semantic_insight_vector_bge_m3_dense
-# GROUP BY routing_id, fileid
-# HAVING COUNT(DISTINCT version) > 0
-# ORDER BY version_count DESC;
 
 import random
 import string
@@ -57,9 +27,6 @@ from functools import partial
 # 线程本地存储，用于确保每个线程有独立的随机数生成器
 thread_local = threading.local()
 
-# 每8000条数据重新生成一次(routing_id, fileid)组合
-RECORDS_PER_COMBINATION = 8000
-
 def get_thread_random():
     """获取线程本地的随机数生成器"""
     if not hasattr(thread_local, 'random'):
@@ -68,16 +35,39 @@ def get_thread_random():
         thread_local.random.seed(threading.current_thread().ident + int(time.time() * 1000000))
     return thread_local.random
 
+def generate_random_string(length=20):
+    """生成随机字符串（线程安全）"""
+    rand = get_thread_random()
+    return ''.join(rand.choices(string.ascii_letters + string.digits, k=length))
 
-def generate_routing_fileid_pair(current_id):
+def generate_routing_fileid_pair(record_count):
     """
     生成一个(routing_id, fileid)组合
+    每10000条数据重新生成一次(routing_id, fileid)组合
+    特殊处理：routing_id=100,200,300的记录需要20000条，通过变化fileid来实现
+    其他routing_id不能和100,200,300一样
     
+    Args:
+        record_count: 当前记录计数，用于决定生成策略
+        
     Returns:
         tuple: (routing_id, fileid)组合
     """
-    routing_id = str(current_id // (RECORDS_PER_COMBINATION * 10))
-    fileid = random.randint(1000000000, 9999999999)
+    rand = get_thread_random()
+    
+    # 特殊routing_id列表
+    special_routing_ids = ["100", "200", "300"]
+    
+    # 每10000条数据重新生成一次组合
+    combination_index = record_count // 10000
+    
+    if combination_index < len(special_routing_ids):
+        routing_id = special_routing_ids[combination_index]
+        fileid = rand.randint(1000000000, 9999999999)
+    else:
+        routing_id = generate_random_string(8)
+        fileid = rand.randint(1000000000, 9999999999)
+    
     return routing_id, fileid
 
 def generate_csv_file(file_index, base_records_per_file, start_id, output_dir, duplicate_ratio=0):
@@ -99,24 +89,12 @@ def generate_csv_file(file_index, base_records_per_file, start_id, output_dir, d
     start_time = time.time()
     
     # 固定值 - 为了效率，除了主键外的所有字段都固定
-    FIXED_CHUNK_TYPE = "text"
-    FIXED_USER_ID = 1000000
-    FIXED_CREATOR = 1000000
-    FIXED_SHARER = 1000000
-    FIXED_GROUP_ID = 1000000
-    FIXED_CTIME = 1640995200  # 2022-01-01
-    FIXED_MTIME = 1640995200  # 2022-01-01
-    FIXED_Y = 2022
-    FIXED_YM = 202201
-    FIXED_YMD = 20220101
     FIXED_EXT = "txt"
-    FIXED_FSIZE = 1024
-    FIXED_PARENT_ID = 1000000
-    FIXED_FTYPE = "text"
-    FIXED_INDEX_UPDATE_TIME = 1640995200
-    FIXED_EXT_GROUP = "text"
-    # 生成固定的1024维向量
-    FIXED_VECTOR = [0.1] * 1024  # 生成1024个0.1的固定向量
+    # 生成固定的3维向量
+    FIXED_VECTOR = "[0.1,0.1,0.1]"
+    
+    # 每8000条数据重新生成一次(routing_id, fileid)组合
+    RECORDS_PER_COMBINATION = 8000
     
     filename = os.path.join(output_dir, f"wps_batch_data_{file_index}.csv")
     
@@ -155,63 +133,33 @@ def generate_csv_file(file_index, base_records_per_file, start_id, output_dir, d
             
             record = [
                 str(current_id),            # id (唯一递增)
+                str(current_fileid),        # fileid (每RECORDS_PER_COMBINATION条更新一次)
                 current_routing_id,         # routing_id (每RECORDS_PER_COMBINATION条更新一次)
-                current_id,                 # chunk_id (与id相同)
-                FIXED_CHUNK_TYPE,           # chunk_type (固定)
-                FIXED_USER_ID,              # user_id (固定)
-                FIXED_CREATOR,              # creator (固定)
-                FIXED_SHARER,               # sharer (固定)
-                current_fileid,             # fileid (每RECORDS_PER_COMBINATION条更新一次)
-                FIXED_GROUP_ID,             # group_id (固定)
-                FIXED_CTIME,                # ctime (固定)
-                FIXED_MTIME,                # mtime (固定)
-                FIXED_Y,                    # y (固定)
-                FIXED_YM,                   # ym (固定)
-                FIXED_YMD,                  # ymd (固定)
                 FIXED_EXT,                  # ext (固定)
-                FIXED_FSIZE,                # fsize (固定)
-                FIXED_PARENT_ID,            # parent_id (固定)
-                FIXED_FTYPE,                # ftype (固定)
-                current_version,            # version (每RECORDS_PER_COMBINATION条更新一次)
-                FIXED_INDEX_UPDATE_TIME,    # index_update_time (固定)
-                FIXED_EXT_GROUP,            # ext_group (固定)
-                FIXED_VECTOR                # vector (固定)
+                FIXED_VECTOR,               # vector (固定)
+                str(current_version)        # version (每RECORDS_PER_COMBINATION条更新一次)
             ]
             data_batch.append(record)
             
             # 保存基础数据的主键信息，用于生成重复数据
-            base_records_info.append((str(current_id), current_routing_id, current_fileid, current_version))
+            base_records_info.append((str(current_id), current_routing_id, str(current_fileid)))
         
         # 第二步：生成重复数据
         print(f"[文件-{file_index}] 生成重复数据...")
         for i in range(duplicate_count):
             # 随机选择一个基础数据的主键
-            base_id, base_routing_id, base_fileid, base_version = rand.choice(base_records_info)
+            base_id, base_routing_id, base_fileid = rand.choice(base_records_info)
+            # 为重复数据生成随机version (0或1)
+            current_version = rand.randint(0, 1)
             
             # 创建重复主键的记录，其他字段保持固定
             duplicate_record = [
                 base_id,                    # id (与基础数据重复)
-                base_routing_id,            # routing_id (与基础数据重复)
-                int(base_id),               # chunk_id (与基础数据重复)
-                FIXED_CHUNK_TYPE,           # chunk_type (固定)
-                FIXED_USER_ID,              # user_id (固定)
-                FIXED_CREATOR,              # creator (固定)
-                FIXED_SHARER,               # sharer (固定)
                 base_fileid,                # fileid (与基础数据重复)
-                FIXED_GROUP_ID,             # group_id (固定)
-                FIXED_CTIME,                # ctime (固定)
-                FIXED_MTIME,                # mtime (固定)
-                FIXED_Y,                    # y (固定)
-                FIXED_YM,                   # ym (固定)
-                FIXED_YMD,                  # ymd (固定)
+                base_routing_id,            # routing_id (与基础数据重复)
                 FIXED_EXT,                  # ext (固定)
-                FIXED_FSIZE,                # fsize (固定)
-                FIXED_PARENT_ID,            # parent_id (固定)
-                FIXED_FTYPE,                # ftype (固定)
-                base_version,               # version (与基础数据重复)
-                FIXED_INDEX_UPDATE_TIME,    # index_update_time (固定)
-                FIXED_EXT_GROUP,            # ext_group (固定)
-                FIXED_VECTOR                # vector (固定)
+                FIXED_VECTOR,               # vector (固定)
+                str(current_version)        # version (随机0或1)
             ]
             data_batch.append(duplicate_record)
         
@@ -251,9 +199,9 @@ def main():
     - 每个文件包含110万条记录（100万基础 + 10万重复）
     """
     # 配置参数
-    total_base_records = 1000000
-    base_records_per_file = 80000 # 每个文件的基础记录数
-    duplicate_ratio = 0.1  # 重复数据比例(0-1)
+    total_base_records = 1000000  # 可配置，总基础数据量
+    base_records_per_file = 1000000  # 可配置，每个文件基础数据量
+    duplicate_ratio = 0  # 可配置，重复数据比例
     
     # 计算文件数量
     total_files = (total_base_records + base_records_per_file - 1) // base_records_per_file  # 向上取整

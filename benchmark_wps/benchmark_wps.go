@@ -93,6 +93,7 @@ func NewProcessorV2(dbconfig DatabaseConfig, fileTimeout int, bufferSize int) *b
 		CallbackResource:    resources,
 		FileWriteTimeout:    fileTimeout, // set file write timeout
 		EnableDualBuffer:    true,
+		LogLevel:            bulkprocessor.DEBUG,
 	}
 
 	// create processor
@@ -148,6 +149,34 @@ func GetCountFromTable(db *sql.DB) (int, error) {
 	return count, nil
 }
 
+func TruncateTable(db *sql.DB) error {
+	query := `TRUNCATE TABLE content_personal_vector_semantic_insight_vector_bge_m3_dense;`
+	_, err := db.Exec(query)
+	if err != nil {
+		return fmt.Errorf("failed to truncate table: %w", err)
+	}
+
+	query = `TRUNCATE TABLE content_personal_vector_semantic_insight_vector_bge_m3_dense_relyt_massive_group;`
+	_, err = db.Exec(query)
+	if err != nil {
+		return fmt.Errorf("failed to truncate table: %w", err)
+	}
+
+	query = `TRUNCATE TABLE relyt_sys.content_personal_vector_semantic_insight_vector_bge_m3_dense_relyt_routing;`
+	_, err = db.Exec(query)
+	if err != nil {
+		return fmt.Errorf("failed to truncate table: %w", err)
+	}
+
+	query = `insert into relyt_sys.content_personal_vector_semantic_insight_vector_bge_m3_dense_relyt_routing values(1,'content_personal_vector_semantic_insight_vector_bge_m3_dense_relyt_massive_group');`
+	_, err = db.Exec(query)
+	if err != nil {
+		return fmt.Errorf("failed to insert data: %w", err)
+	}
+
+	return nil
+}
+
 // fork multiple go routines to insert data use only one processor
 func main() {
 	// Initialize database connection
@@ -165,13 +194,18 @@ func main() {
 		log.Fatalf("failed to start processor: %v", err)
 	}
 
+	err = TruncateTable(db)
+	if err != nil {
+		log.Fatalf("failed to truncate table: %v", err)
+	}
+
 	// 配置
 	dataDir := "./generated_data" // 数据目录
 	// filePrefix := "wps_data_version_" // 文件名前缀
 	filePrefix := "wps_batch_data_" // 文件名前缀
 	multiThread := true             // 是否多线程
 	totalVersions := 10             // 文件数
-	totalThread := 10               // 设置线程数量
+	totalThread := 1                // 设置线程数量
 
 	if multiThread {
 		log.Printf("Starting multi-threaded data insertion with %d threads for %d versions", totalThread, totalVersions)
