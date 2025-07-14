@@ -1,6 +1,7 @@
 package bulkprocessor
 
 import (
+	"log"
 	"os"
 	"path/filepath"
 )
@@ -26,7 +27,7 @@ type PostgreSQLConfig struct {
 	Username    string // PostgreSQL username
 	Password    string // PostgreSQL password
 	Database    string // PostgreSQL database name
-	Table       string // Target table name
+	Table       string // Target table name, if null, this is search only mode
 	Schema      string // Schema name (default: public)
 	MaxPoolSize int    // Maximum number of connections to the database, default: 3
 }
@@ -62,11 +63,6 @@ type Config struct {
 	MaxConcurrentWorkers int    // max concurrent workers, default: 1
 	AsyncDelete          bool   // async delete, default: true
 
-	// `NeedSelectAuxTable` only can be used in select, the value will be updated in the bgworker.
-	// Insert and update need to use `hasRoutingTable`, which needs to be initialized when the SDK
-	// is started, because this involves the creation of triggers on the routing table.
-	NeedSelectAuxTable bool
-
 	// LogLevel sets the logging level (LOG, WARNING, ERROR)
 	LogLevel LogLevel
 }
@@ -86,7 +82,7 @@ func (c *Config) Validate() error {
 		return ErrPostgreSQLDatabaseRequired
 	}
 	if c.PostgreSQL.Table == "" {
-		return ErrPostgreSQLTableRequired
+		log.Printf("PostgreSQL.Table is null, this is search only mode")
 	}
 	if c.PostgreSQL.Schema == "" {
 		c.PostgreSQL.Schema = "public" // Default schema

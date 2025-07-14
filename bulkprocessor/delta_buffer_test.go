@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -51,11 +52,6 @@ func NewProcessorV2(dbconfig DatabaseConfig, fileTimeout int, bufferSize int, ta
 		log.Fatalf("Failed to open log file: %v", err)
 	}
 
-	tableName := "test_routing_data_v2"
-	if len(tablename) > 0 {
-		tableName = tablename[0]
-	}
-
 	// Create user-defined resource structure
 	resources := &ErrorHandlerResources{
 		LogFile: logFile,
@@ -70,7 +66,6 @@ func NewProcessorV2(dbconfig DatabaseConfig, fileTimeout int, bufferSize int, ta
 			Username: dbconfig.Username,
 			Password: dbconfig.Password, // use your own password
 			Database: dbconfig.Database, // use your own database
-			Table:    tableName,
 			Schema:   "public",
 		},
 		BatchSize:           10, // number of records per file
@@ -80,6 +75,10 @@ func NewProcessorV2(dbconfig DatabaseConfig, fileTimeout int, bufferSize int, ta
 		CallbackResource:    resources,
 		FileWriteTimeout:    fileTimeout, // set file write timeout
 		BGWorkerInterval:    10,          // set GC interval
+	}
+
+	if len(tablename) > 0 {
+		config.PostgreSQL.Table = tablename[0]
 	}
 
 	// create processor
@@ -430,7 +429,7 @@ func TestBufferInsertBasic(t *testing.T) {
 	defer db.Close()
 
 	fileTimeout := 3 // set file write timeout to 2 seconds
-	processor := NewProcessorV2(dbConfig, fileTimeout, 0)
+	processor := NewProcessorV2(dbConfig, fileTimeout, 0, "test_routing_data_v2")
 
 	filePath := "../examples/data/test_insert_v2_basic.csv"
 
@@ -557,7 +556,7 @@ func TestBufferInsertWithSomeErrors(t *testing.T) {
 	}
 	defer db.Close()
 
-	processor := NewProcessorV2(dbConfig, 6, 10)
+	processor := NewProcessorV2(dbConfig, 6, 10, "test_routing_data_v2")
 	defer processor.Shutdown()
 
 	filePath := "../examples/data/test_multiple_s3_file_error_v2.csv"
@@ -671,7 +670,7 @@ func TestBufferInsertWithSleep(t *testing.T) {
 	defer db.Close()
 
 	fileTimeout := 3 // set file write timeout to 3 seconds
-	processor := NewProcessorV2(dbConfig, fileTimeout, 0)
+	processor := NewProcessorV2(dbConfig, fileTimeout, 0, "test_routing_data_v2")
 	defer processor.Shutdown()
 
 	filePath := "../examples/data/test_insert_v2_basic.csv"
@@ -810,7 +809,7 @@ func TestBufferInsertWithPgRecovery(t *testing.T) {
 	defer db.Close()
 
 	fileTimeout := 6 // set file write timeout to 6 seconds
-	processor := NewProcessorV2(dbConfig, fileTimeout, 0)
+	processor := NewProcessorV2(dbConfig, fileTimeout, 0, "test_routing_data_v2")
 	defer processor.Shutdown()
 
 	filePath := "../examples/data/test_insert_v2_basic.csv"
@@ -989,7 +988,7 @@ func TestBufferInsertWithMigration(t *testing.T) {
 	defer db.Close()
 
 	fileTimeout := 3 // set file write timeout to 3 seconds
-	processor := NewProcessorV2(dbConfig, fileTimeout, 0)
+	processor := NewProcessorV2(dbConfig, fileTimeout, 0, "test_routing_data_v2")
 	defer processor.Shutdown()
 
 	filePath := "../examples/data/test_migration_v2.csv"
@@ -1193,7 +1192,7 @@ func TestBufferInsertWithMixedOperations(t *testing.T) {
 	defer db.Close()
 
 	fileTimeout := 3 // set file write timeout to 3 seconds
-	processor := NewProcessorV2(dbConfig, fileTimeout, 0)
+	processor := NewProcessorV2(dbConfig, fileTimeout, 0, "test_routing_data_v2")
 	defer processor.Shutdown()
 
 	filePath := "../examples/data/test_insert_v2_basic.csv"
@@ -1385,7 +1384,7 @@ func TestBufferInsertWithOffset(t *testing.T) {
 	defer db.Close()
 
 	fileTimeout := 3 // set file write timeout to 3 seconds
-	processor := NewProcessorV2(dbConfig, fileTimeout, 0)
+	processor := NewProcessorV2(dbConfig, fileTimeout, 0, "test_routing_data_v2")
 	defer processor.Shutdown()
 
 	// Test data structure
@@ -1625,6 +1624,7 @@ func TestBufferDeleteSync(t *testing.T) {
 
 	// select count(*) from test_routing_data where fileid = 120 and routing_id = 120
 	searchOptions := &SearchOptions{
+		Table:     "test_routing_data_without_aux",
 		Columns:   []string{"count(*) over() as count"},
 		Condition: "fileid = $1 and routing_id = $2",
 	}
@@ -1681,7 +1681,7 @@ func TestBufferInsertWithDuplicate(t *testing.T) {
 	defer db.Close()
 
 	fileTimeout := 3 // set file write timeout to 3 seconds
-	processor := NewProcessorV2(dbConfig, fileTimeout, 0)
+	processor := NewProcessorV2(dbConfig, fileTimeout, 0, "test_routing_data_v2")
 	defer processor.Shutdown()
 
 	filePath := "../examples/data/test_duplicate_v2.csv"
@@ -1784,6 +1784,7 @@ func TestBufferInsertWithDuplicate(t *testing.T) {
 
 	// Check that the records are correct
 	searchOptions := &SearchOptions{
+		Table:     "test_routing_data_v2",
 		Columns:   []string{"fileid", "routing_id", "id"},
 		Condition: "id in (1001, 1006)",
 		OrderBy:   "id ASC",
@@ -1791,6 +1792,9 @@ func TestBufferInsertWithDuplicate(t *testing.T) {
 	results, err := processor.SearchV2(searchOptions)
 	if err != nil {
 		t.Errorf("failed to search data: %v", err)
+	}
+	if len(results.Rows) != 2 {
+		t.Errorf("expected 2 rows, got %d", len(results.Rows))
 	}
 
 	row0Str := fmt.Sprintf("%v", results.Rows[0])
@@ -1945,6 +1949,7 @@ func TestBufferInsertWithCopyOnConflict(t *testing.T) {
 
 	// Check that the records are correct
 	searchOptions := &SearchOptions{
+		Table:     "test_routing_data_copy_on_conflict",
 		Columns:   []string{"fileid", "routing_id", "ext"},
 		Condition: "id = 1009",
 	}
@@ -2085,6 +2090,7 @@ func TestAsyncDelete(t *testing.T) {
 
 	// select count(*) from test_routing_data where fileid = 120 and routing_id = 120
 	searchOptions := &SearchOptions{
+		Table:     "test_routing_data_async_delete",
 		Columns:   []string{"routing_id", "version"},
 		Condition: "fileid IN (100, 110, 120)",
 		OrderBy:   "routing_id ASC",
@@ -2119,4 +2125,116 @@ func TestAsyncDelete(t *testing.T) {
 	if mainCount != 5 {
 		t.Errorf("expected main table count to be 5, got %d", mainCount)
 	}
+}
+
+// test case 1: table name is empty
+func TestErrorCaseEmptyTableName(t *testing.T) {
+	// Initialize database connection
+	dbConfig := InitDatabaseConfig("127.0.0.1", 7000, "postgres", "", "postgres")
+	db, err := SetupDataBase(dbConfig)
+	if err != nil {
+		log.Fatalf("failed to setup database: %v", err)
+	}
+
+	err = CreateTestDataTaleWithAuxV2(db)
+	if err != nil {
+		log.Fatalf("failed to create test table: %v", err)
+		return
+	}
+	err = TruncateTestDataTableWithAuxV2(db)
+	if err != nil {
+		log.Fatalf("failed to truncate test table: %v", err)
+		return
+	}
+	err = InitTestRoutingTable(db)
+	if err != nil {
+		log.Fatalf("failed to init test routing table: %v", err)
+		return
+	}
+
+	err = ClearRelytCheckpointTable(db)
+	if err != nil {
+		log.Fatalf("failed to clear relyt_checkpoint table: %v", err)
+		return
+	}
+
+	defer db.Close()
+
+	fileTimeout := 3 // set file write timeout to 2 seconds
+	processor := NewProcessorV2(dbConfig, fileTimeout, 0)
+
+	filePath := "../examples/data/test_insert_v2_basic.csv"
+
+	var tests []TestDataWithAuxV2
+
+	csvFile, err := os.Open(filePath)
+	if err != nil {
+		log.Fatalf("failed to open csv file: %v", err)
+	}
+	defer csvFile.Close()
+
+	csvReader := csv.NewReader(csvFile)
+	csvReader.FieldsPerRecord = -1
+	csvReader.Comma = '\t'
+	csvReader.ReuseRecord = true
+
+	i := 0
+	for {
+		record, err := csvReader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Errorf("failed to read csv file: %v", err)
+		}
+		id, err := strconv.Atoi(record[0])
+		if err != nil {
+			t.Errorf("failed to parse id: %v", err)
+		}
+		fileID, err := strconv.Atoi(record[1])
+		if err != nil {
+			t.Errorf("failed to parse file_id: %v", err)
+		}
+		routingID := record[2]
+		if err != nil {
+			t.Errorf("failed to parse routing_id: %v", err)
+		}
+		if len(record) < 5 {
+			t.Errorf("record does not contain enough fields: %v", record)
+		}
+		ext := record[3]
+		vector := record[4]
+
+		version, err := strconv.Atoi(record[5])
+		if err != nil {
+			t.Errorf("failed to parse version: %v", err)
+		}
+
+		tests = append(tests, TestDataWithAuxV2{
+			ID:        id,
+			FileID:    fileID,
+			RoutingID: routingID,
+			Ext:       ext,
+			Vector:    vector,
+			Version:   version,
+		})
+		i++
+
+		err = processor.InsertV2(fmt.Sprintf("%d", fileID), routingID, tests)
+		if err == nil {
+			t.Errorf("expected error, but got nil")
+		}
+
+		if strings.Contains(err.Error(), "PostgreSQL table is required") {
+			log.Printf("test finished, shutdown the processor...")
+			return
+		} else {
+			t.Errorf("expected error, but got %v", err)
+		}
+	}
+
+	processor.Flush()
+
+	time.Sleep(time.Duration(10) * time.Second)
+	processor.Shutdown()
 }

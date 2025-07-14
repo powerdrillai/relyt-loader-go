@@ -73,8 +73,12 @@ type BulkProcessor struct {
 	maxOffset int64
 
 	// parallel processing related fields
-	workerWg      sync.WaitGroup
-	activeWorkers int32 // atomic counter for active workers
+	workerWg          sync.WaitGroup
+	activeWorkers     int32 // atomic counter for active workers
+	routingTableCache map[string]struct {
+		lastCheckTime   time.Time
+		hasRoutingTable bool
+	}
 }
 
 // SearchResult
@@ -85,6 +89,7 @@ type SearchResult struct {
 
 // SearchOptions
 type SearchOptions struct {
+	Table     string   // table name
 	Columns   []string // column names, if empty, select all columns. support alias, like "vector <-> $1 as ds"
 	Condition string   // query condition, like "id = $1 AND name = $2"
 	OrderBy   string   // order by, like "id DESC, name ASC"
@@ -134,12 +139,7 @@ func New(config Config) (*BulkProcessor, error) {
 
 	// Create file manager
 	filePrefix := fmt.Sprintf("relyt_bulk_%s", strings.ReplaceAll(config.PostgreSQL.Table, ".", "_"))
-	fileManager, err := NewFileManager(s3Client, filePrefix, config.BatchSize, processId, config.BatchImportSize)
-	if err != nil {
-		// Make sure to close the clients if file manager creation fails
-		pgClient.Close()
-		return nil, err
-	}
+	fileManager := NewFileManager(s3Client, filePrefix, config.BatchSize, processId, config.BatchImportSize)
 
 	// Initialize checkpoint for this process
 	pgTable := fmt.Sprintf("%s.%s", config.PostgreSQL.Schema, config.PostgreSQL.Table)
@@ -208,6 +208,10 @@ func New(config Config) (*BulkProcessor, error) {
 		recordQueueV2:     make(chan *Record, 10000),
 		workerWg:          sync.WaitGroup{},
 		activeWorkers:     0,
+		routingTableCache: make(map[string]struct {
+			lastCheckTime   time.Time
+			hasRoutingTable bool
+		}),
 	}, nil
 }
 
@@ -256,6 +260,11 @@ func (p *BulkProcessor) Start() error {
 	}
 
 	p.isStarted = true
+
+	if p.config.PostgreSQL.Table == "" {
+		Log("BulkProcessor Start: PostgreSQL table is empty, skip start background threads")
+		return nil
+	}
 
 	if p.hasRoutingTable {
 		p.importerWg.Add(1)
@@ -390,6 +399,11 @@ func (p *BulkProcessor) checkErrorCount(err error, errorRecordsCount *int, recor
 
 // Insert inserts data into the processor
 func (p *BulkProcessor) Insert(data interface{}) error {
+
+	if p.config.PostgreSQL.Table == "" {
+		return ErrPostgreSQLTableRequired
+	}
+
 	p.mutex.RLock()
 	if p.isShutdown {
 		p.mutex.RUnlock()
@@ -651,7 +665,7 @@ func (p *BulkProcessor) Flush() error {
 		if atomic.LoadInt32(&p.recordsNum) == 0 {
 			break
 		}
-		Log("Flush wait for recordsNum to be 0, current recordsNum: %d", atomic.LoadInt32(&p.recordsNum))
+		Debug("Flush wait for recordsNum to be 0, current recordsNum: %d", atomic.LoadInt32(&p.recordsNum))
 		time.Sleep(time.Duration(1) * time.Second)
 	}
 
@@ -1201,6 +1215,10 @@ func (p *BulkProcessor) ListenThread() {
 
 // InsertV2 insert data with dual buffer
 func (p *BulkProcessor) InsertV2(fileID, routingID string, records interface{}, offset ...int64) error {
+	if p.config.PostgreSQL.Table == "" {
+		return ErrPostgreSQLTableRequired
+	}
+
 	if !p.config.EnableDualBuffer {
 		return errors.New("dual buffer is not enabled")
 	}
@@ -1316,6 +1334,10 @@ func (p *BulkProcessor) InsertV2(fileID, routingID string, records interface{}, 
 }
 
 func (p *BulkProcessor) DeleteSyncV2(fileID, routingID string) error {
+	if p.config.PostgreSQL.Table == "" {
+		return ErrPostgreSQLTableRequired
+	}
+
 	p.mutex.RLock()
 	if p.isShutdown {
 		p.mutex.RUnlock()
@@ -1336,6 +1358,11 @@ func (p *BulkProcessor) DeleteSyncV2(fileID, routingID string) error {
 }
 
 func (p *BulkProcessor) DeleteV2(fileID, routingID string, offset ...int64) error {
+
+	if p.config.PostgreSQL.Table == "" {
+		return ErrPostgreSQLTableRequired
+	}
+
 	if !p.config.EnableDualBuffer {
 		return errors.New("dual buffer is not enabled")
 	}
@@ -1815,6 +1842,38 @@ func processSQLParams(input string, args []interface{}) string {
 	return processed
 }
 
+func (p *BulkProcessor) CheckTableHasRoutingTable(tableName string) (bool, error) {
+	var hasRoutingTable bool
+	needCheck := true
+	tableName = strings.ToLower(tableName)
+
+	// check cache first, if cache is not expired, return the cached result
+	if ret, exists := p.routingTableCache[tableName]; exists {
+		needCheck = time.Since(ret.lastCheckTime) > 5*time.Minute
+		hasRoutingTable = ret.hasRoutingTable
+	}
+
+	if needCheck {
+		var err error
+		routingTableName := fmt.Sprintf("%s%s", tableName, routingTableSuffix)
+		log.Printf("CheckTableHasRoutingTable: %s, routingTableName: %s", tableName, routingTableName)
+		hasRoutingTable, err = p.pgClient.HasRoutingTable(p.ctx, routingTableName)
+		if err != nil {
+			return false, errors.Wrap(err, "failed to check if routing table exists")
+		}
+
+		p.routingTableCache[tableName] = struct {
+			lastCheckTime   time.Time
+			hasRoutingTable bool
+		}{
+			lastCheckTime:   time.Now(),
+			hasRoutingTable: hasRoutingTable,
+		}
+	}
+
+	return hasRoutingTable, nil
+}
+
 // SearchJsonRowsV2 return pgx.Rows object, let caller control the iteration
 // caller need to call rows.Next() and rows.Scan()
 func (p *BulkProcessor) SearchJsonRowsV2(options *SearchOptions, args ...interface{}) (pgx.Rows, error) {
@@ -1824,6 +1883,12 @@ func (p *BulkProcessor) SearchJsonRowsV2(options *SearchOptions, args ...interfa
 		return nil, ErrProcessorClosed
 	}
 	p.mutex.RUnlock()
+
+	if options.Table == "" {
+		return nil, ErrPostgreSQLTableRequired
+	} else {
+		options.Table = strings.ToLower(options.Table)
+	}
 
 	// process column names
 	processedColumns := make([]string, len(options.Columns))
@@ -1838,10 +1903,15 @@ func (p *BulkProcessor) SearchJsonRowsV2(options *SearchOptions, args ...interfa
 	processedGroupBy := processSQLParams(options.GroupBy, args)
 	processedHaving := processSQLParams(options.Having, args)
 
+	hasRoutingTable, err := p.CheckTableHasRoutingTable(options.Table)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to check if routing table exists")
+	}
+
 	// prepare params
 	params := []interface{}{
 		p.config.PostgreSQL.Schema,
-		p.config.PostgreSQL.Table,
+		options.Table,
 		pq.Array(processedColumns),
 		processedCondition,
 		options.OrderBy,
@@ -1849,7 +1919,7 @@ func (p *BulkProcessor) SearchJsonRowsV2(options *SearchOptions, args ...interfa
 		processedHaving,
 		options.Limit,
 		options.Offset,
-		p.config.NeedSelectAuxTable,
+		hasRoutingTable,
 	}
 
 	// log.Printf("baseSQL: select * from get_columns_with_condition('%v', '%v', '%v', '%v', '%v', '%v', '%v', '%v', '%v', %t)", params...)
@@ -1974,6 +2044,12 @@ func (p *BulkProcessor) SearchJsonRowsWithTimeoutV2(timeoutMs int, options *Sear
 	}
 	p.mutex.RUnlock()
 
+	if options.Table == "" {
+		return nil, ErrPostgreSQLTableRequired
+	} else {
+		options.Table = strings.ToLower(options.Table)
+	}
+
 	// process column names
 	processedColumns := make([]string, len(options.Columns))
 	for i, col := range options.Columns {
@@ -1987,10 +2063,15 @@ func (p *BulkProcessor) SearchJsonRowsWithTimeoutV2(timeoutMs int, options *Sear
 	processedGroupBy := processSQLParams(options.GroupBy, args)
 	processedHaving := processSQLParams(options.Having, args)
 
+	hasRoutingTable, err := p.CheckTableHasRoutingTable(options.Table)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to check if routing table exists")
+	}
+
 	// prepare params
 	params := []interface{}{
 		p.config.PostgreSQL.Schema,
-		p.config.PostgreSQL.Table,
+		options.Table,
 		pq.Array(processedColumns),
 		processedCondition,
 		options.OrderBy,
@@ -1998,7 +2079,7 @@ func (p *BulkProcessor) SearchJsonRowsWithTimeoutV2(timeoutMs int, options *Sear
 		processedHaving,
 		options.Limit,
 		options.Offset,
-		p.config.NeedSelectAuxTable,
+		hasRoutingTable,
 	}
 
 	// log.Printf("baseSQL: select * from get_columns_with_condition('%v', '%v', '%v', '%v', '%v', '%v', '%v', '%v', '%v', %t)", params...)
