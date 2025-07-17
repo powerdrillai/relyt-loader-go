@@ -1,12 +1,14 @@
 package bulkprocessor
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os/exec"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -520,7 +522,9 @@ func TestNewSearchFunc(t *testing.T) {
 		OrderBy:   "id ASC",
 		Limit:     16,
 	}
-	rows, err := processor.SearchJsonRowsWithTimeoutV2(10000, searchOptions)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	rows, err := processor.SearchJsonRowsWithContextV2(ctx, searchOptions)
 	if err != nil {
 		if pgErr, ok := err.(*pgconn.PgError); ok {
 			log.Printf("TestNewSearchFunc test 7 PostgreSQL error: %s", pgErr.Message)
@@ -529,6 +533,7 @@ func TestNewSearchFunc(t *testing.T) {
 		}
 		return
 	}
+	defer rows.Close()
 
 	for rows.Next() {
 		var jsonData []byte
@@ -576,12 +581,15 @@ func TestNewSearchFunc(t *testing.T) {
 	searchOptions = &SearchOptions{
 		Table:     "content_personal_vector_semantic_insight_vector_bge_m3_dense",
 		Columns:   []string{"count(*)"},
-		Condition: "group_id IN (1, 11) AND routing_id IN ('1', '11')",
+		Condition: "group_id IN (1, 11) AND routing_id IN ($1)",
 	}
-	_, err = processor.SearchJsonRowsWithTimeoutV2(10000, searchOptions)
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel2()
 
+	rows, err = processor.SearchJsonRowsWithContextV2(ctx2, searchOptions, []string{"1", "11"})
 	if err == nil {
-		t.Errorf("TestNewSearchFunc test 8 error: %v", err)
+		defer rows.Close()
+		t.Errorf("TestNewSearchFunc test 8 expected error, but got nil")
 		return
 	}
 	log.Printf("TestNewSearchFunc test 8 error: %v", err)
@@ -592,26 +600,33 @@ func TestNewSearchFunc(t *testing.T) {
 		Columns:   []string{"*"},
 		Condition: "group_id IN (1, 11) AND routing_id IN ('1', '11')",
 	}
-	_, err = processor.SearchJsonRowsWithTimeoutV2(10000, searchOptions)
-	if err != nil {
-		log.Printf("TestNewSearchFunc test 9 error: %v", err)
+	ctx3, cancel3 := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel3()
+	rows, err = processor.SearchJsonRowsWithContextV2(ctx3, searchOptions)
+	if err == nil {
+		defer rows.Close()
+		t.Errorf("TestNewSearchFunc test 9 expected error, but got nil")
 	}
+	log.Printf("TestNewSearchFunc test 9 error: %v", err)
 
 	// test 10: select id, group_id, mtime, count(*) over() as count, vector <-> '[0.76,0.49, 0.67]' as score from test_table where group_id in (1, 11) and routing_id in ('1', '11') order by score ASC, mtime DESC limit 2;
 	searchOptions = &SearchOptions{
 		Table:     "content_personal_vector_semantic_insight_vector_bge_m3_dense",
 		Columns:   []string{"id", "group_id", "mtime", "COUNT(*) OVER() as count", "vector <-> '[0.76,0.49, 0.67]' as score"},
-		Condition: "group_id IN (1, 11) AND routing_id IN ('1', '11')",
+		Condition: "group_id IN ($1) AND routing_id IN ($2)",
 		OrderBy:   "score ASC, mtime DESC",
 		Limit:     2,
 	}
-	rows, err = processor.SearchJsonRowsWithTimeoutV2(10000, searchOptions)
+	ctx4, cancel4 := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel4()
+	rows, err = processor.SearchJsonRowsWithContextV2(ctx4, searchOptions, []int64{1, 11}, []string{"1", "11"})
 	if err != nil {
 		if pgErr, ok := err.(*pgconn.PgError); ok {
 			log.Printf("TestNewSearchFunc test 10 PostgreSQL error: %s, %s", pgErr.Message, pgErr.Detail)
 		} else {
 			log.Printf("TestNewSearchFunc test 10 error: %v", err)
 		}
+		t.Errorf("TestNewSearchFunc test 10 error: %v", err)
 		return
 	}
 
@@ -652,25 +667,31 @@ func TestNewSearchFunc(t *testing.T) {
 		} else {
 			log.Printf("TestNewSearchFunc test 10 error: %v", err)
 		}
+		t.Errorf("TestNewSearchFunc test 10 error: %v", err)
+		return
 	}
 
 	// test 11: select id, group_id, count(*) over() count, mtime, vector <-> '[0.76,0.49, 0.67]' score from test_table where group_id in (1, 11) and routing_id in ('1', '11') order by score ASC, mtime DESC limit 2;
 	searchOptions = &SearchOptions{
 		Table:     "content_personal_vector_semantic_insight_vector_bge_m3_dense",
 		Columns:   []string{"id", "group_id", "COUNT(*) OVER() Count", "mtime", "vector <-> '[0.76,0.49, 0.67]' score"},
-		Condition: "group_id IN (1, 11) AND routing_id IN ('1', '11')",
+		Condition: "group_id IN ($1) AND routing_id IN ($2)",
 		OrderBy:   "score ASC, mtime DESC",
 		Limit:     2,
 	}
-	rows, err = processor.SearchJsonRowsWithTimeoutV2(10000, searchOptions)
+	ctx5, cancel5 := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel5()
+	rows, err = processor.SearchJsonRowsWithContextV2(ctx5, searchOptions, []interface{}{1, 11}, []string{"1", "11"})
 	if err != nil {
 		if pgErr, ok := err.(*pgconn.PgError); ok {
 			log.Printf("TestNewSearchFunc test 11 PostgreSQL error: %s, %s", pgErr.Message, pgErr.Detail)
 		} else {
 			log.Printf("TestNewSearchFunc test 11 error: %v", err)
 		}
+		t.Errorf("TestNewSearchFunc test 11 error: %v", err)
 		return
 	}
+	defer rows.Close()
 
 	for rows.Next() {
 		var jsonData []byte
@@ -689,6 +710,8 @@ func TestNewSearchFunc(t *testing.T) {
 		} else {
 			log.Printf("TestNewSearchFunc test 11 error: %v", err)
 		}
+		t.Errorf("TestNewSearchFunc test 11 error: %v", err)
+		return
 	}
 }
 
