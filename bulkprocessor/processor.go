@@ -575,7 +575,7 @@ func (p *BulkProcessor) InsertThread() error {
 				pgTable := fmt.Sprintf("%s.%s", p.config.PostgreSQL.Schema, targetTable)
 
 				if err := p.pgClient.InsertDeltaCheckpoint(ctx, p.processId, pgTable, currentFile.S3Key); err != nil {
-					fmt.Fprintf(os.Stderr, "Failed to insert delta checkpoint with new file: %v\n", err)
+					Debug("Failed to insert delta checkpoint with new file: %s, %v", currentFile.S3Key, err)
 				}
 			}
 			//log.Printf("InsertThread Current file state: %v, num records: %d", currentFile.State, currentFile.NumRecords)
@@ -1513,7 +1513,7 @@ func (p *BulkProcessor) InsertThreadV2() {
 				pgTable := fmt.Sprintf("%s.%s", p.config.PostgreSQL.Schema, targetTable)
 
 				if err := p.pgClient.InsertDeltaCheckpoint(ctx, p.processId, pgTable, currentBuffer.LocalFilePath); err != nil {
-					fmt.Fprintf(os.Stderr, "Failed to insert delta checkpoint with new file: %s, %v\n", currentBuffer.LocalFilePath, err)
+					Debug("Failed to insert delta checkpoint with new file: %s, %v", currentBuffer.LocalFilePath, err)
 				}
 			}
 
@@ -1618,8 +1618,8 @@ func (p *BulkProcessor) processBufferTask(task *BufferTask, workerID int, feedba
 	for i := 0; i < maxLoopNum; i++ {
 		if err := p.processBufferTaskWithTransaction(task); err != nil {
 
-			Warning("Server is busy, will retry to process buffer task %s after %d seconds",
-				task.TaskId, p.config.ImportErrorSleepTime)
+			Warning("Server is busy, will retry to process buffer task %s after %d seconds, error: %v",
+				task.TaskId, p.config.ImportErrorSleepTime, err)
 
 			// Update checkpoint with all error file
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1833,6 +1833,55 @@ func processSQLParams(input string, args []interface{}) string {
 				}
 			}
 			valueStr = strings.Join(values, ",")
+		case []string:
+			// process string array
+			values := make([]string, len(v))
+			for j, item := range v {
+				values[j] = fmt.Sprintf("'%s'", strings.ReplaceAll(item, "'", "''"))
+			}
+			valueStr = strings.Join(values, ",")
+		case []int64:
+			// process int64 array
+			values := make([]string, len(v))
+			for j, item := range v {
+				values[j] = fmt.Sprintf("%d", item)
+			}
+			valueStr = strings.Join(values, ",")
+		case []int32:
+			// process int32 array
+			values := make([]string, len(v))
+			for j, item := range v {
+				values[j] = fmt.Sprintf("%d", item)
+			}
+			valueStr = strings.Join(values, ",")
+		case []int:
+			// process int array
+			values := make([]string, len(v))
+			for j, item := range v {
+				values[j] = fmt.Sprintf("%d", item)
+			}
+			valueStr = strings.Join(values, ",")
+		case []float64:
+			// process float64 array
+			values := make([]string, len(v))
+			for j, item := range v {
+				values[j] = fmt.Sprintf("%f", item)
+			}
+			valueStr = strings.Join(values, ",")
+		case []float32:
+			// process float32 array
+			values := make([]string, len(v))
+			for j, item := range v {
+				values[j] = fmt.Sprintf("%f", item)
+			}
+			valueStr = strings.Join(values, ",")
+		case []bool:
+			// process bool array
+			values := make([]string, len(v))
+			for j, item := range v {
+				values[j] = fmt.Sprintf("%t", item)
+			}
+			valueStr = strings.Join(values, ",")
 		default:
 			valueStr = fmt.Sprintf("%v", v)
 		}
@@ -2034,9 +2083,10 @@ func (p *BulkProcessor) SearchJsonV2(options *SearchOptions, args ...interface{}
 	return jsonResults, nil
 }
 
-// SearchJsonRowsWithTimeoutV2 return pgx.Rows object with timeout to control the query time,
+// SearchJsonRowsWithContextV2 return pgx.Rows object with context to control the query time,
 // let caller control the iteration caller need to call rows.Next() and rows.Scan()
-func (p *BulkProcessor) SearchJsonRowsWithTimeoutV2(timeoutMs int, options *SearchOptions, args ...interface{}) (pgx.Rows, error) {
+// The caller is responsible for managing the context lifecycle
+func (p *BulkProcessor) SearchJsonRowsWithContextV2(ctx context.Context, options *SearchOptions, args ...interface{}) (pgx.Rows, error) {
 	p.mutex.RLock()
 	if p.isShutdown {
 		p.mutex.RUnlock()
@@ -2083,18 +2133,6 @@ func (p *BulkProcessor) SearchJsonRowsWithTimeoutV2(timeoutMs int, options *Sear
 	}
 
 	// log.Printf("baseSQL: select * from get_columns_with_condition('%v', '%v', '%v', '%v', '%v', '%v', '%v', '%v', '%v', %t)", params...)
-	var ctx context.Context
-	var cancel context.CancelFunc
-
-	if timeoutMs <= 0 {
-		ctx = p.ctx
-		cancel = func() {}
-	} else {
-		ctx, cancel = context.WithTimeout(p.ctx, time.Duration(timeoutMs)*time.Millisecond)
-	}
-
-	defer cancel()
-
 	start := time.Now()
 
 	rows, finalSQL, err := p.pgClient.GetColumnsWithCondition(ctx, params...)

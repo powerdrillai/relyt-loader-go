@@ -34,21 +34,14 @@
 
 # 用于生成测试数据插入content_personal_vector_semantic_insight_vector_bge_m3_dense中:
 # 1. 随机生成(routing_id, fileid)的组合，每一万条数据重新生成一次(routing_id, fileid)，每条数据的id都唯一（按照生成的数据顺序，从0开始，依次递增）
-# 2. 数据总量为1亿条，每个csv文件包含100万条基础数据, 在基础数据基础上，额外生成10%主键重复的数据
-# 3. vector为3维的向量
+# 2. 数据总量为1亿条，每个txt文件包含100万条基础数据, 在基础数据基础上，额外生成10%主键重复的数据
+# 3. vector为1024维的向量
 # 4. 除了(routing_id, fileid, id)，为了效率其余字段可固定
-
-# -- 查找具有多个version的routing_id和fileid组合
-# SELECT routing_id, fileid, COUNT(DISTINCT version) as version_count,
-# count(*) FROM content_personal_vector_semantic_insight_vector_bge_m3_dense
-# GROUP BY routing_id, fileid
-# HAVING COUNT(DISTINCT version) > 0
-# ORDER BY version_count DESC;
+# 5. 使用|分割符，生成txt文件
 
 import random
 import string
 import time
-import csv
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
@@ -80,11 +73,12 @@ def generate_routing_fileid_pair(current_id):
     fileid = random.randint(1000000000, 9999999999)
     return routing_id, fileid
 
-def generate_csv_file(file_index, base_records_per_file, start_id, output_dir, duplicate_ratio=0):
+def generate_txt_file(file_index, base_records_per_file, start_id, output_dir, duplicate_ratio=0):
     """
-    生成单个CSV文件（包含基础数据和10%重复数据）
+    生成单个TXT文件（包含基础数据和10%重复数据）
     每一万条数据重新生成一次(routing_id, fileid)组合
     重复数据随机插入到基础数据中，最后对数据进行打乱
+    使用|分割符
     
     Args:
         file_index: 文件索引
@@ -117,13 +111,12 @@ def generate_csv_file(file_index, base_records_per_file, start_id, output_dir, d
     FIXED_EXT_GROUP = "text"
     # 生成固定的1024维向量
     FIXED_VECTOR = [0.1] * 1024  # 生成1024个0.1的固定向量
+    VECTOR_STR = "[" + ",".join(map(str, FIXED_VECTOR)) + "]"
     
-    filename = os.path.join(output_dir, f"wps_batch_data_{file_index}.csv")
+    filename = os.path.join(output_dir, f"wps_batch_data_{file_index}.txt")
     
     # 使用大缓冲区以提高写入性能
-    with open(filename, 'w', newline='', encoding='utf-8', buffering=32*1024*1024) as csvfile:
-        csv_writer = csv.writer(csvfile)
-        
+    with open(filename, 'w', encoding='utf-8', buffering=32*1024*1024) as txtfile:
         # 预分配数据列表
         data_batch = []
         rand = get_thread_random()
@@ -153,29 +146,30 @@ def generate_csv_file(file_index, base_records_per_file, start_id, output_dir, d
             # 前RECORDS_PER_COMBINATION/2条记录用version 0，后RECORDS_PER_COMBINATION/2条记录用version 1
             current_version = (i % RECORDS_PER_COMBINATION) // (RECORDS_PER_COMBINATION // 2)
             
+            # 使用|分割符构建记录
             record = [
                 str(current_id),            # id (唯一递增)
                 current_routing_id,         # routing_id (每RECORDS_PER_COMBINATION条更新一次)
-                current_id,                 # chunk_id (与id相同)
+                str(current_id),            # chunk_id (与id相同)
                 FIXED_CHUNK_TYPE,           # chunk_type (固定)
-                FIXED_USER_ID,              # user_id (固定)
-                FIXED_CREATOR,              # creator (固定)
-                FIXED_SHARER,               # sharer (固定)
-                current_fileid,             # fileid (每RECORDS_PER_COMBINATION条更新一次)
-                FIXED_GROUP_ID,             # group_id (固定)
-                FIXED_CTIME,                # ctime (固定)
-                FIXED_MTIME,                # mtime (固定)
-                FIXED_Y,                    # y (固定)
-                FIXED_YM,                   # ym (固定)
-                FIXED_YMD,                  # ymd (固定)
+                str(FIXED_USER_ID),         # user_id (固定)
+                str(FIXED_CREATOR),         # creator (固定)
+                str(FIXED_SHARER),          # sharer (固定)
+                str(current_fileid),        # fileid (每RECORDS_PER_COMBINATION条更新一次)
+                str(FIXED_GROUP_ID),        # group_id (固定)
+                str(FIXED_CTIME),           # ctime (固定)
+                str(FIXED_MTIME),           # mtime (固定)
+                str(FIXED_Y),               # y (固定)
+                str(FIXED_YM),              # ym (固定)
+                str(FIXED_YMD),             # ymd (固定)
                 FIXED_EXT,                  # ext (固定)
-                FIXED_FSIZE,                # fsize (固定)
-                FIXED_PARENT_ID,            # parent_id (固定)
+                str(FIXED_FSIZE),           # fsize (固定)
+                str(FIXED_PARENT_ID),       # parent_id (固定)
                 FIXED_FTYPE,                # ftype (固定)
-                current_version,            # version (每RECORDS_PER_COMBINATION条更新一次)
-                FIXED_INDEX_UPDATE_TIME,    # index_update_time (固定)
+                str(current_version),       # version (每RECORDS_PER_COMBINATION条更新一次)
+                str(FIXED_INDEX_UPDATE_TIME), # index_update_time (固定)
                 FIXED_EXT_GROUP,            # ext_group (固定)
-                FIXED_VECTOR                # vector (固定)
+                VECTOR_STR                  # vector (固定)
             ]
             data_batch.append(record)
             
@@ -192,26 +186,26 @@ def generate_csv_file(file_index, base_records_per_file, start_id, output_dir, d
             duplicate_record = [
                 base_id,                    # id (与基础数据重复)
                 base_routing_id,            # routing_id (与基础数据重复)
-                int(base_id),               # chunk_id (与基础数据重复)
+                base_id,                    # chunk_id (与基础数据重复)
                 FIXED_CHUNK_TYPE,           # chunk_type (固定)
-                FIXED_USER_ID,              # user_id (固定)
-                FIXED_CREATOR,              # creator (固定)
-                FIXED_SHARER,               # sharer (固定)
-                base_fileid,                # fileid (与基础数据重复)
-                FIXED_GROUP_ID,             # group_id (固定)
-                FIXED_CTIME,                # ctime (固定)
-                FIXED_MTIME,                # mtime (固定)
-                FIXED_Y,                    # y (固定)
-                FIXED_YM,                   # ym (固定)
-                FIXED_YMD,                  # ymd (固定)
+                str(FIXED_USER_ID),         # user_id (固定)
+                str(FIXED_CREATOR),         # creator (固定)
+                str(FIXED_SHARER),          # sharer (固定)
+                str(base_fileid),           # fileid (与基础数据重复)
+                str(FIXED_GROUP_ID),        # group_id (固定)
+                str(FIXED_CTIME),           # ctime (固定)
+                str(FIXED_MTIME),           # mtime (固定)
+                str(FIXED_Y),               # y (固定)
+                str(FIXED_YM),              # ym (固定)
+                str(FIXED_YMD),             # ymd (固定)
                 FIXED_EXT,                  # ext (固定)
-                FIXED_FSIZE,                # fsize (固定)
-                FIXED_PARENT_ID,            # parent_id (固定)
+                str(FIXED_FSIZE),           # fsize (固定)
+                str(FIXED_PARENT_ID),       # parent_id (固定)
                 FIXED_FTYPE,                # ftype (固定)
-                base_version,               # version (与基础数据重复)
-                FIXED_INDEX_UPDATE_TIME,    # index_update_time (固定)
+                str(base_version),          # version (与基础数据重复)
+                str(FIXED_INDEX_UPDATE_TIME), # index_update_time (固定)
                 FIXED_EXT_GROUP,            # ext_group (固定)
-                FIXED_VECTOR                # vector (固定)
+                VECTOR_STR                  # vector (固定)
             ]
             data_batch.append(duplicate_record)
         
@@ -219,10 +213,12 @@ def generate_csv_file(file_index, base_records_per_file, start_id, output_dir, d
         print(f"[文件-{file_index}] 打乱数据顺序...")
         rand.shuffle(data_batch)
         
-        # 一次性写入所有数据
+        # 一次性写入所有数据，使用|分割符
         print(f"[文件-{file_index}] 开始写入 {total_records:,} 条记录到磁盘...")
-        csv_writer.writerows(data_batch)
-        csvfile.flush()
+        for record in data_batch:
+            line = "|".join(record)
+            txtfile.write(line + "\n")
+        txtfile.flush()
     
     end_time = time.time()
     elapsed_time = end_time - start_time
@@ -234,21 +230,22 @@ def generate_csv_file(file_index, base_records_per_file, start_id, output_dir, d
 
 def main():
     """
-    主函数：生成1亿条测试数据
+    主函数：生成测试数据
     
     数据生成策略：
-    - 总基础数据量：100,000,000条记录
-    - 每个文件基础数据：1,000,000条记录
-    - 每个文件重复数据：100,000条记录（10%）
-    - 每个文件总计：1,100,000条记录
-    - 文件数量：100个CSV文件 (100,000,000 ÷ 1,000,000 = 100)
+    - 总基础数据量：800,000条记录
+    - 每个文件基础数据：80,000条记录
+    - 每个文件重复数据：8,000条记录（10%）
+    - 每个文件总计：88,000条记录
+    - 文件数量：10个TXT文件
     - ID生成：全局唯一，从0开始递增
-    - routing_id和fileid：每1万条数据重新生成一次组合
+    - routing_id和fileid：每8,000条数据重新生成一次组合
     - 其他字段：固定值以提高生成效率
+    - 分割符：|
     
     输出：
-    - 100个CSV文件：wps_batch_data_0.csv ~ wps_batch_data_99.csv
-    - 每个文件包含110万条记录（100万基础 + 10万重复）
+    - 10个TXT文件：wps_batch_data_0.txt ~ wps_batch_data_9.txt
+    - 每个文件包含88,000条记录（80,000基础 + 8,000重复）
     """
     # 配置参数
     total_base_records = 800000
@@ -259,8 +256,8 @@ def main():
     total_files = (total_base_records + base_records_per_file - 1) // base_records_per_file  # 向上取整
     
     # 计算(routing_id, fileid)组合数量
-    # 每1万条数据生成一次组合，总共需要的组合数
-    records_per_combination = 10_000
+    # 每8,000条数据生成一次组合，总共需要的组合数
+    records_per_combination = 8_000
     total_combinations = (total_base_records + records_per_combination - 1) // records_per_combination
     
     # 多线程配置
@@ -268,13 +265,13 @@ def main():
     max_workers = 4  # 使用4个线程并行生成文件
     
     # 创建输出目录
-    output_dir = "generated_data"
+    output_dir = "generated_data_v2"
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
     
     try:
         print("=" * 80)
-        print("WPS批量测试数据生成器")
+        print("WPS批量测试数据生成器 V2 (TXT格式，|分割符)")
         print("=" * 80)
         print(f"总基础数据量: {total_base_records:,} 条记录")
         print(f"重复数据比例: {duplicate_ratio:.0%}")
@@ -285,6 +282,7 @@ def main():
         print(f"每文件总记录数: {int(base_records_per_file * (1 + duplicate_ratio)):,} 条")
         print(f"(routing_id, fileid)组合生成策略: 每 {records_per_combination:,} 条记录生成一次")
         print(f"预计总组合数: {total_combinations:,} 个")
+        print(f"文件格式: TXT文件，使用|分割符")
         print(f"执行模式: {'多线程' if use_multithreading else '单线程'}")
         if use_multithreading:
             print(f"线程数: {max_workers}")
@@ -307,7 +305,7 @@ def main():
                     current_base_records = min(base_records_per_file, total_base_records - start_id)
                     
                     future = executor.submit(
-                        generate_csv_file,
+                        generate_txt_file,
                         file_index,
                         current_base_records,
                         start_id,
@@ -348,7 +346,7 @@ def main():
                 # 计算当前文件的基础记录数（最后一个文件可能不满）
                 current_base_records = min(base_records_per_file, total_base_records - start_id)
                 
-                file_idx, record_count, elapsed_time, filename = generate_csv_file(
+                file_idx, record_count, elapsed_time, filename = generate_txt_file(
                     file_index,
                     current_base_records,
                     start_id,
@@ -393,7 +391,7 @@ def main():
             for file_idx, record_count, elapsed_time, filename in completed_files:
                 print(f"  {os.path.basename(filename)}: {record_count:,} 条记录, {elapsed_time:.2f}秒")
         else:
-            print(f"生成了 {len(completed_files)} 个文件，文件名格式: wps_batch_data_0.csv ~ wps_batch_data_{len(completed_files)-1}.csv")
+            print(f"生成了 {len(completed_files)} 个文件，文件名格式: wps_batch_data_0.txt ~ wps_batch_data_{len(completed_files)-1}.txt")
         
     except Exception as e:
         print(f"错误: {e}")

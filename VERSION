@@ -1,3 +1,9 @@
+2025-07-21 v1.0.17
+main change:
+1. modify searchV2 interface, add SearchJsonRowsWithContextV2 and remove SearchJsonRowsWithTimeoutV2
+2. support []string, []int etc. as the input of searchV2 interface
+3. optimizer search UDF
+
 2025-07-14 v1.0.16
 main change:
 1. add log_level config to control the log level, default is LOG (option: DEBUG, LOG, WARNING, ERROR)

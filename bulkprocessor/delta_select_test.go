@@ -355,8 +355,8 @@ func TestSearchBasic(t *testing.T) {
 	// 将结果转换为字符串进行比较
 	row0Str = fmt.Sprintf("%v", result.Rows[0])
 	row1Str = fmt.Sprintf("%v", result.Rows[1])
-	expectedRow0Str = "[10 140  4.050000190734863]"
-	expectedRow1Str = "[9 140 <nil> 4.621503829956055]"
+	expectedRow0Str = "[10 140  4.05]"
+	expectedRow1Str = "[9 140 <nil> 4.621504]"
 
 	if row0Str != expectedRow0Str {
 		t.Errorf("result.Rows[0]: %v:%v, expected: %s", result.Columns, result.Rows[0], expectedRow0Str)
@@ -783,9 +783,9 @@ func TestSearchAdditional(t *testing.T) {
 	if len(result.Rows) != 3 {
 		t.Errorf("expected 3 rows, but got %d", len(result.Rows))
 	}
-	expectedResult0 := "[10 140 4.050000190734863]"
-	expectedResult1 := "[9 140 4.621503829956055]"
-	expectedResult2 := "[8 130 5.250292778015137]"
+	expectedResult0 := "[10 140 4.05]"
+	expectedResult1 := "[9 140 4.621504]"
+	expectedResult2 := "[8 130 5.250293]"
 	if fmt.Sprintf("%v", result.Rows[0]) != expectedResult0 {
 		t.Errorf("expected result: %v, but got %v", expectedResult0, result.Rows[0])
 	}
@@ -1019,9 +1019,9 @@ func TestSearchMultipleTables(t *testing.T) {
 		t.Errorf("expected 3 rows, but got %d", len(result.Rows))
 	}
 	log.Printf("Test 2 result size: %d, result: %v", len(result.Rows), result)
-	expectedResult0 = "[4 110 8.369647979736328]"
-	expectedResult1 = "[3 110 9.300244331359863]"
-	expectedResult2 = "[2 100 10.290419578552246]"
+	expectedResult0 = "[4 110 8.369648]"
+	expectedResult1 = "[3 110 9.300244]"
+	expectedResult2 = "[2 100 10.29042]"
 	if fmt.Sprintf("%v", result.Rows[0]) != expectedResult0 {
 		t.Errorf("expected result: %v, but got %v", expectedResult0, result.Rows[0])
 	}
