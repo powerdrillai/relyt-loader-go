@@ -175,7 +175,6 @@ def build_query(schema_name, target_table_name, column_names, condition, order_b
     final_select = build_final_select()
     
     if have_aux_table:
-        # 带辅助表的查询：使用 UNION ALL
         aux_table = f"{target_table_name}_relyt_massive_group"
         query = f"""
             WITH combined_data AS (
@@ -183,15 +182,18 @@ def build_query(schema_name, target_table_name, column_names, condition, order_b
                 UNION ALL
                 (SELECT {inner_select} FROM {schema_name}.{aux_table} {where_clause} {vector_order_clause} LIMIT 500)
             )
-            SELECT {final_select} FROM combined_data {order_clause} {limit_clause} {offset_clause}
+            SELECT row_to_json(t) FROM (
+                SELECT {final_select} FROM combined_data {order_clause} {limit_clause} {offset_clause}
+            ) t
         """
     else:
-        # 不带辅助表的查询：单表查询
         query = f"""
             WITH main_table AS (
                 SELECT {inner_select} FROM {schema_name}.{target_table_name} {where_clause} {group_clause} {having_clause} {vector_order_clause} LIMIT 500
             )
-            SELECT {final_select} FROM main_table {order_clause} {limit_clause} {offset_clause}
+            SELECT row_to_json(t) FROM (
+                SELECT {final_select} FROM main_table {order_clause} {limit_clause} {offset_clause}
+            ) t
         """
     
     return query
@@ -232,153 +234,6 @@ except Exception as e:
 
 $$ LANGUAGE plpython3u;
 
--- 不带辅助表的函数（使用plpython3u）
-CREATE OR REPLACE FUNCTION relyt_sys.get_columns_with_condition_without_aux(
-    schema_name TEXT,
-    target_table_name TEXT,
-    column_names TEXT[],
-    condition TEXT DEFAULT NULL,
-    order_by TEXT DEFAULT NULL,
-    group_by TEXT DEFAULT NULL,
-    having_con TEXT DEFAULT NULL,
-    limit_count INTEGER DEFAULT NULL,
-    offset_count INTEGER DEFAULT NULL
-) RETURNS SETOF JSON AS $$
-import re
-import plpy
-import json
-
-try:
-    import time
-    
-    # 记录prepare开始时间
-    start_get_sql_time = time.time()
-    
-    # 使用公共函数进行验证和查询构建
-    plan = plpy.prepare("""
-        SELECT relyt_sys._check_and_build_query(
-            $1, $2, $3::text[], $4, $5, $6, $7, $8, $9, $10
-        ) as result
-    """, ["text", "text", "text[]", "text", "text", "text", "text", "int", "int", "bool"])
-    
-    result_json = plpy.execute(plan, [
-        schema_name, 
-        target_table_name, 
-        column_names, 
-        condition if condition else None, 
-        order_by if order_by else None, 
-        group_by if group_by else None, 
-        having_con if having_con else None, 
-        limit_count if limit_count else None, 
-        offset_count if offset_count else None, 
-        False
-    ])[0]['result']
-    
-    # 计算execute执行时间
-    get_sql_time = time.time() - start_get_sql_time
-    
-    result_data = json.loads(result_json)
-    query = result_data['query']
-
-    # 记录execute开始时间
-    start_execute_time = time.time()
-
-    # 执行查询
-    main_result = plpy.execute(query)
-
-    # 计算execute执行时间
-    execute_time = time.time() - start_execute_time
-    plpy.log(f'get_columns_with_condition_without_aux_exec query: {query}, get sql time: {get_sql_time*1000:.3f} ms, execute time: {execute_time*1000:.3f} ms')
-    
-    # 处理结果
-    for row in main_result:
-        row_dict = dict(row)
-        
-        # 返回 JSON 格式
-        yield json.dumps(row_dict, ensure_ascii=False)
-    
-except Exception as e:
-    plpy.error(f"function execution error: {str(e)}")
-
-$$ LANGUAGE plpython3u;
-
-CREATE OR REPLACE FUNCTION relyt_sys.get_columns_with_condition_with_aux(
-    schema_name TEXT,
-    target_table_name TEXT,
-    column_names TEXT[],
-    condition TEXT DEFAULT NULL,
-    order_by TEXT DEFAULT NULL,
-    group_by TEXT DEFAULT NULL,
-    having_con TEXT DEFAULT NULL,
-    limit_count INTEGER DEFAULT NULL,
-    offset_count INTEGER DEFAULT NULL
-) RETURNS SETOF JSON AS $$
-import re
-import plpy
-import json
-
-try:
-    import time
-
-    # 记录prepare开始时间
-    prepare_start_time = time.time()
-
-    # 使用公共函数进行验证和查询构建
-
-    plan = plpy.prepare("""
-        SELECT relyt_sys._check_and_build_query(
-            $1, $2, $3::text[], $4, $5, $6, $7, $8, $9, $10
-        ) as result
-    """, ["text", "text", "text[]", "text", "text", "text", "text", "int", "int", "bool"])
-    
-    # 计算prepare执行时间
-    prepare_time = time.time() - prepare_start_time
-    
-    # 记录execute开始时间
-    start_get_sql_time = time.time()
-    
-    result_json = plpy.execute(plan, [
-        schema_name, 
-        target_table_name, 
-        column_names, 
-        condition if condition else None, 
-        order_by if order_by else None, 
-        group_by if group_by else None, 
-        having_con if having_con else None, 
-        limit_count if limit_count else None, 
-        offset_count if offset_count else None, 
-        True
-    ])[0]['result']
-
-    # 计算execute执行时间
-    get_sql_time = time.time() - start_get_sql_time
-
-    result_data = json.loads(result_json)
-    query = result_data['query']
-    
-    # 记录execute开始时间
-    start_execute_time = time.time()
-
-    # 执行查询
-    main_result = plpy.execute(query)
-
-    # 计算execute执行时间
-    execute_time = time.time() - start_execute_time
-
-    plpy.log(f'get_columns_with_condition_with_aux_exec: {query}, prepare get sql time: {prepare_time*1000:.3f} ms, get sql time: {get_sql_time*1000:.3f} ms, execute time: {execute_time*1000:.3f} ms')
-    
-    # 处理结果
-    for row in main_result:
-        row_dict = dict(row)
-        
-        # 返回 JSON 格式
-        yield json.dumps(row_dict, ensure_ascii=False)
-    
-except Exception as e:
-    plpy.error(f"function execution error: {str(e)}")
-
-$$ LANGUAGE plpython3u;
-
 -- main function, decide which function to call based on have_aux_table parameter
 CREATE OR REPLACE FUNCTION relyt_sys.get_columns_with_condition(
     schema_name TEXT,
@@ -392,26 +247,50 @@ CREATE OR REPLACE FUNCTION relyt_sys.get_columns_with_condition(
     offset_count INTEGER DEFAULT NULL,
     have_aux_table BOOLEAN DEFAULT TRUE
 ) RETURNS SETOF JSON AS $$
+DECLARE
+    query_sql TEXT;
+    result_json TEXT;
+    rec JSON;
+    start_get_sql_time TIMESTAMP;
+    get_sql_time TIMESTAMP;
+    start_exec_time TIMESTAMP;
 BEGIN
     -- 检查group_by和having_con参数
     IF (group_by IS NOT NULL AND group_by != '') OR (having_con IS NOT NULL AND having_con != '') THEN
         RAISE EXCEPTION 'group by and having parameters are not supported now';
     END IF;
 
-    IF have_aux_table THEN
-        RETURN QUERY SELECT * FROM relyt_sys.get_columns_with_condition_with_aux(
-            schema_name, target_table_name, column_names, condition, order_by,
-            group_by, having_con, limit_count, offset_count
-        );
-    ELSE
-        RETURN QUERY SELECT * FROM relyt_sys.get_columns_with_condition_without_aux(
-            schema_name, target_table_name, column_names, condition, order_by,
-            group_by, having_con, limit_count, offset_count
-        );
-    END IF;
+    start_get_sql_time := clock_timestamp();
+
+    -- 使用_check_and_build_query函数生成查询
+    SELECT relyt_sys._check_and_build_query(
+        schema_name, 
+        target_table_name, 
+        column_names, 
+        condition, 
+        order_by, 
+        group_by, 
+        having_con, 
+        limit_count, 
+        offset_count, 
+        have_aux_table
+    ) INTO result_json;
+    
+    -- 从JSON结果中提取query字段
+    query_sql := (result_json::json->>'query');
+
+    get_sql_time := clock_timestamp();
+    start_exec_time := clock_timestamp();
+
+    -- 直接执行SQL并返回JSON结果
+    FOR rec IN EXECUTE query_sql
+    LOOP
+        RETURN NEXT rec;
+    END LOOP;
+
+    RAISE LOG 'get_columns_with_condition_exec: result_sql: %, get_sql_time: % ms, exec time: % ms', query_sql, EXTRACT(EPOCH FROM (get_sql_time - start_get_sql_time)) * 1000, EXTRACT(EPOCH FROM (clock_timestamp() - start_exec_time)) * 1000;
 END;
 $$ LANGUAGE plpgsql;
-
 
 CREATE OR REPLACE FUNCTION relyt_sys.get_columns_sql_with_condition(
     schema_name TEXT,
@@ -425,43 +304,32 @@ CREATE OR REPLACE FUNCTION relyt_sys.get_columns_sql_with_condition(
     offset_count INTEGER DEFAULT NULL,
     have_aux_table BOOLEAN DEFAULT TRUE
 ) RETURNS TEXT AS $$
-import time
-import plpy
-import json
+DECLARE
+    query_sql TEXT;
+    result_json TEXT;
+BEGIN
+    -- 检查group_by和having_con参数
+    IF (group_by IS NOT NULL AND group_by != '') OR (having_con IS NOT NULL AND having_con != '') THEN
+        RAISE EXCEPTION 'group by and having parameters are not supported now';
+    END IF;
 
-try:
-    
-    # 检查group_by和having_con参数
-    if (group_by is not None and group_by != '') or (having_con is not None and having_con != ''):
-        plpy.error('group by and having parameters are not supported now')
-
-    # 使用公共函数进行验证和查询构建
-    plan = plpy.prepare("""
-        SELECT relyt_sys._check_and_build_query(
-            $1, $2, $3::text[], $4, $5, $6, $7, $8, $9, $10
-        ) as result
-    """, ["text", "text", "text[]", "text", "text", "text", "text", "int", "int", "bool"])
-    
-    result_json = plpy.execute(plan, [
+    -- 使用_check_and_build_query函数生成查询
+    SELECT relyt_sys._check_and_build_query(
         schema_name, 
         target_table_name, 
         column_names, 
-        condition if condition else None, 
-        order_by if order_by else None, 
-        group_by if group_by else None, 
-        having_con if having_con else None, 
-        limit_count if limit_count else None, 
-        offset_count if offset_count else None, 
+        condition, 
+        order_by, 
+        group_by, 
+        having_con, 
+        limit_count, 
+        offset_count, 
         have_aux_table
-    ])[0]['result']
+    ) INTO result_json;
     
-    # 从JSON结果中提取query字段
-    result_data = json.loads(result_json)
-    query_sql = result_data['query']
+    -- 从JSON结果中提取query字段
+    query_sql := (result_json::json->>'query');
     
-    return query_sql
-    
-except Exception as e:
-    plpy.error(f"function execution error: {str(e)}")
-
-$$ LANGUAGE plpython3u;
+    RETURN query_sql;
+END;
+$$ LANGUAGE plpgsql;
