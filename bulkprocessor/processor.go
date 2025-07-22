@@ -1732,6 +1732,8 @@ func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask) error
 				Error("task %s failed to rollback transaction: %v", task.TaskId, rollbackErr)
 			}
 		}
+		conn := conn.Hijack()
+		conn.Close(ctx)
 	}()
 
 	// 1. delete records first
