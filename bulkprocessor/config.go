@@ -61,6 +61,7 @@ type Config struct {
 	TuplesPrePartition   int    // tuples pre partition, default: 5000
 	LocalFilePrefix      string // local file prefix, default: "/tmp"
 	MaxConcurrentWorkers int    // max concurrent workers, default: 1
+	DeleteBeforeInsert   bool   // delete before insert, default: true
 	AsyncDelete          bool   // async delete, default: true
 
 	// LogLevel sets the logging level (LOG, WARNING, ERROR)

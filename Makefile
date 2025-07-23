@@ -22,8 +22,9 @@ testv2:
 	go test -v -count=1 ./bulkprocessor -run TestBufferDeleteSync
 	go test -v -count=1 ./bulkprocessor -run TestBufferInsertWithDuplicate
 	go test -v -count=1 ./bulkprocessor -run TestBufferInsertWithCopyOnConflict
-	go test -v -count=1 ./bulkprocessor -run TestAsyncDelete
+	go test -v -count=1 ./bulkprocessor -run TestDeleteBeforeInsert
 	go test -v -count=1 ./bulkprocessor -run TestErrorCaseEmptyTableName
+	go test -v -count=1 ./bulkprocessor -run TestRealDelete
 
 testselect:
 	go test -v -count=1 ./bulkprocessor -run TestSearchBasic

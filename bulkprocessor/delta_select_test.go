@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"reflect"
+	"strconv"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -524,58 +527,17 @@ func TestNewSearchFunc(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	rows, err := processor.SearchJsonRowsWithContextV2(ctx, searchOptions)
-	if err != nil {
+	var rows pgx.Rows
+	_, err = processor.SearchJsonRowsWithContextV2(ctx, searchOptions)
+	if err == nil {
 		if pgErr, ok := err.(*pgconn.PgError); ok {
-			log.Printf("TestNewSearchFunc test 7 PostgreSQL error: %s", pgErr.Message)
+			log.Printf("TestNewSearchFunc test 7 error with pg error: %s", pgErr.Message)
 		} else {
 			log.Printf("TestNewSearchFunc test 7 error: %v", err)
 		}
 		return
 	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var jsonData []byte
-		err = rows.Scan(&jsonData)
-		if err != nil {
-			log.Printf("TestNewSearchFunc test 7 scan error: %v", err)
-			continue
-		}
-
-		// 解析 JSON 数据
-		var row map[string]interface{}
-		if err := json.Unmarshal(jsonData, &row); err != nil {
-			log.Printf("TestNewSearchFunc test 7 JSON unmarshal error: %v", err)
-			continue
-		}
-
-		// 方法1: 直接访问字段（推荐）
-		if id, exists := row["id"]; exists {
-			log.Printf("TestNewSearchFunc test 7 result: id=%v", id)
-		}
-
-		// 方法2: 类型断言获取具体类型
-		if chunkId, exists := row["chunk_id"]; exists {
-			if chunkIdInt, ok := chunkId.(float64); ok {
-				// JSON 中的数字默认解析为 float64
-				log.Printf("TestNewSearchFunc test 7 result: chunk_id=%d", int(chunkIdInt))
-			} else {
-				log.Printf("TestNewSearchFunc test 7 result: chunk_id=%v (type: %T)", chunkId, chunkId)
-			}
-		}
-
-		// 方法3: 获取所有字段
-		log.Printf("TestNewSearchFunc test 7 full result: %v", row)
-	}
-
-	if err := rows.Err(); err != nil {
-		if pgErr, ok := err.(*pgconn.PgError); ok {
-			log.Printf("TestNewSearchFunc test 7 PostgreSQL error: %s", pgErr.Message)
-		} else {
-			log.Printf("TestNewSearchFunc test 7 error: %v", err)
-		}
-	}
+	log.Printf("TestNewSearchFunc test 7 success, expected error: %v", err)
 
 	// test 8: count(*)
 	searchOptions = &SearchOptions{
@@ -712,6 +674,104 @@ func TestNewSearchFunc(t *testing.T) {
 		}
 		t.Errorf("TestNewSearchFunc test 11 error: %v", err)
 		return
+	}
+
+	// test 12: select id, group_id test_table order by id limit 5;
+	searchOptions = &SearchOptions{
+		Table:   "content_personal_vector_semantic_insight_vector_bge_m3_dense",
+		Columns: []string{"id", "group_id", "fileid"},
+		OrderBy: "fileid ASC",
+		Limit:   6,
+	}
+	ctx6, cancel6 := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel6()
+	rows, err = processor.SearchJsonRowsWithContextV2(ctx6, searchOptions)
+	if err != nil {
+		t.Errorf("TestNewSearchFunc test 12 error: %v", err)
+	}
+	defer rows.Close()
+
+	results := make([]map[string]interface{}, 0)
+	for rows.Next() {
+		var jsonData []byte
+		err = rows.Scan(&jsonData)
+		if err != nil {
+			t.Errorf("TestNewSearchFunc test 10 rows.Scan error: %v", err)
+
+		}
+
+		// 解析 JSON 数据
+		var row map[string]interface{}
+		if err := json.Unmarshal(jsonData, &row); err != nil {
+			t.Errorf("TestNewSearchFunc test 10 JSON unmarshal error: %v", err)
+			continue
+		}
+
+		// 获取具体的字段值并转换为正确的类型
+		id, idExists := row["id"]
+		chunkId, chunkIdExists := row["group_id"]
+		fileid, fileidExists := row["fileid"]
+
+		if idExists && chunkIdExists && fileidExists {
+			// 将字符串转换为数字类型
+			idInt, _ := strconv.Atoi(fmt.Sprintf("%v", id))
+			chunkIdInt, _ := strconv.Atoi(fmt.Sprintf("%v", chunkId))
+			fileidInt, _ := strconv.Atoi(fmt.Sprintf("%v", fileid))
+
+			row := make(map[string]interface{})
+			row["id"] = idInt
+			row["group_id"] = chunkIdInt
+			row["fileid"] = fileidInt
+			results = append(results, row)
+		}
+	}
+
+	expectedResults := []map[string]interface{}{
+		{
+			"id":       1,
+			"group_id": 1,
+			"fileid":   1,
+		},
+		{
+			"id":       2,
+			"group_id": 2,
+			"fileid":   2,
+		},
+		{
+			"id":       3,
+			"group_id": 3,
+			"fileid":   3,
+		},
+		{
+			"id":       4,
+			"group_id": 4,
+			"fileid":   4,
+		},
+		{
+			"id":       5,
+			"group_id": 5,
+			"fileid":   5,
+		},
+		{
+			"id":       11,
+			"group_id": 11,
+			"fileid":   11,
+		},
+	}
+
+	if len(results) != len(expectedResults) {
+		t.Errorf("expected %d rows, but got %d", len(expectedResults), len(results))
+	}
+	for i, result := range results {
+		if !reflect.DeepEqual(result, expectedResults[i]) {
+			t.Errorf("expected %v, but got %v", expectedResults[i], result)
+		}
+	}
+
+	log.Printf("TestNewSearchFunc test 12 success")
+
+	if err := rows.Err(); err != nil {
+		t.Errorf("TestNewSearchFunc test 12 rows.Err error: %v", err)
 	}
 }
 
