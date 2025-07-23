@@ -329,7 +329,7 @@ func (pk *PrimaryKey) toString() string {
 	return strings.Join(pk.PKValues, "-")
 }
 
-func (b *Buffer) DeduplicateRecords(havePK, haveVersion bool, asyncDelete bool) ([]RecordIndex, map[RecordIndex]string) {
+func (b *Buffer) DeduplicateRecords(havePK, haveVersion bool, deleteBeforeInsert bool) ([]RecordIndex, map[RecordIndex]string) {
 	b.BufferMutex.Lock()
 	defer b.BufferMutex.Unlock()
 
@@ -385,9 +385,13 @@ func (b *Buffer) DeduplicateRecords(havePK, haveVersion bool, asyncDelete bool) 
 							keepMap[i] = false
 						}
 					} else {
-						versionMap[key] = record.Version
-						primarySet[pk.toString()] = struct{}{}
-						keepMap[i] = true
+						if _, exists := primarySet[pk.toString()]; exists {
+							keepMap[i] = false
+						} else {
+							versionMap[key] = record.Version
+							primarySet[pk.toString()] = struct{}{}
+							keepMap[i] = true
+						}
 					}
 				} else if havePK && !haveVersion {
 					pk := PrimaryKey{
@@ -436,7 +440,7 @@ func (b *Buffer) DeduplicateRecords(havePK, haveVersion bool, asyncDelete bool) 
 		deletedIndices = append(deletedIndices, key)
 	}
 
-	if asyncDelete && haveVersion {
+	if deleteBeforeInsert && haveVersion {
 		return deletedIndices, versionMap
 	}
 

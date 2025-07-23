@@ -228,9 +228,10 @@ func (c *PostgreSQLClient) GetLoadConfigFromDB(ctx context.Context, config *Conf
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'import_strategy' THEN CONFIG_VALUE END)::INT, 2) as import_strategy,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'max_concurrent_workers' THEN CONFIG_VALUE END)::INT, 1) as max_concurrent_workers,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'insert_into_batch_size' THEN CONFIG_VALUE END)::INT, 100) as insert_into_batch_size,
-		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'async_delete' THEN CONFIG_VALUE END)::BOOLEAN, true) as async_delete,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'delete_before_insert' THEN CONFIG_VALUE END)::BOOLEAN, true) as delete_before_insert,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'update_on_conflict' THEN CONFIG_VALUE END)::BOOLEAN, true) as update_on_conflict,
-		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'file_write_timeout' THEN CONFIG_VALUE END)::INT, 3) as file_write_timeout
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'file_write_timeout' THEN CONFIG_VALUE END)::INT, 3) as file_write_timeout,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'async_delete' THEN CONFIG_VALUE END)::BOOLEAN, false) as async_delete
 	FROM relyt_sys.SDK_LOADER_CONFIG
 	`
 
@@ -253,9 +254,10 @@ func (c *PostgreSQLClient) GetLoadConfigFromDB(ctx context.Context, config *Conf
 		&config.ImportStrategy,
 		&config.MaxConcurrentWorkers,
 		&config.InsertIntoBatchSize,
-		&config.AsyncDelete,
+		&config.DeleteBeforeInsert,
 		&config.UpdateOnConflict,
 		&config.FileWriteTimeout,
+		&config.AsyncDelete,
 	)
 
 	if err != nil {
@@ -275,15 +277,15 @@ func (c *PostgreSQLClient) UpdateLoadConfig(ctx context.Context, config *Config)
 		SELECT
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'import_timeout' THEN CONFIG_VALUE END)::INT, 1800) as import_timeout,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'import_error_sleep_time' THEN CONFIG_VALUE END)::INT, 10) as import_error_sleep_time,
-		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'enable_dual_buffer' THEN CONFIG_VALUE END)::BOOLEAN, true) as enable_dual_buffer,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'buffer_max_records' THEN CONFIG_VALUE END)::INT, 5000) as buffer_max_records,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'tuples_pre_partition' THEN CONFIG_VALUE END)::INT, -1) as tuples_pre_partition,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'import_strategy' THEN CONFIG_VALUE END)::INT, 0) as import_strategy,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'max_concurrent_workers' THEN CONFIG_VALUE END)::INT, 1) as max_concurrent_workers,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'insert_into_batch_size' THEN CONFIG_VALUE END)::INT, 100) as insert_into_batch_size,
-		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'async_delete' THEN CONFIG_VALUE END)::BOOLEAN, true) as async_delete,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'delete_before_insert' THEN CONFIG_VALUE END)::BOOLEAN, true) as delete_before_insert,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'update_on_conflict' THEN CONFIG_VALUE END)::BOOLEAN, true) as update_on_conflict,
-		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'file_write_timeout' THEN CONFIG_VALUE END)::INT, 3) as file_write_timeout
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'file_write_timeout' THEN CONFIG_VALUE END)::INT, 3) as file_write_timeout,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'async_delete' THEN CONFIG_VALUE END)::BOOLEAN, false) as async_delete
 	FROM relyt_sys.SDK_LOADER_CONFIG
 	`
 
@@ -291,15 +293,15 @@ func (c *PostgreSQLClient) UpdateLoadConfig(ctx context.Context, config *Config)
 	err := row.Scan(
 		&config.ImportTimeout,
 		&config.ImportErrorSleepTime,
-		&config.EnableDualBuffer,
 		&config.BufferMaxRecords,
 		&config.TuplesPrePartition,
 		&config.ImportStrategy,
 		&config.MaxConcurrentWorkers,
 		&config.InsertIntoBatchSize,
-		&config.AsyncDelete,
+		&config.DeleteBeforeInsert,
 		&config.UpdateOnConflict,
 		&config.FileWriteTimeout,
+		&config.AsyncDelete,
 	)
 
 	if err != nil {
@@ -824,21 +826,6 @@ func (c *PostgreSQLClient) DeleteTablesWithCondition(ctx context.Context, schema
 }
 
 func (c *PostgreSQLClient) GetColumnsWithCondition(ctx context.Context, args ...interface{}) (pgx.Rows, string, error) {
-	// build query
-	baseSQL := `
-		SELECT * FROM relyt_sys.get_columns_with_condition(
-			$1,  -- schema_name
-			$2,  -- target_table_name
-			$3,  -- column_names
-			$4,  -- condition
-			$5,  -- order_by
-			$6,  -- group_by
-			$7,  -- having
-			$8,  -- limit_count
-			$9,  -- offset_count
-			$10 -- have_aux_table
-		)`
-
 	getSQLStatement := `
 		SELECT * FROM relyt_sys.get_columns_sql_with_condition(
 			$1,  -- schema_name
@@ -861,7 +848,7 @@ func (c *PostgreSQLClient) GetColumnsWithCondition(ctx context.Context, args ...
 		return nil, "", errors.Wrap(err, "failed to get final sql")
 	}
 
-	rows, err := c.pool.Query(ctx, baseSQL, args...)
+	rows, err := c.pool.Query(ctx, finalSQL)
 	if err != nil {
 		return nil, finalSQL, errors.Wrap(err, "failed to get columns with condition")
 	}
@@ -1090,7 +1077,7 @@ func (c *PostgreSQLClient) DeleteOutdatedFiles(ctx context.Context, tx pgx.Tx, t
 	// 执行批量删除
 	_, err := tx.Exec(ctx, sqlStatement, args...)
 	if err != nil {
-		return fmt.Errorf("failed to delete outdated files in batch: %w", err)
+		return err
 	}
 
 	return nil

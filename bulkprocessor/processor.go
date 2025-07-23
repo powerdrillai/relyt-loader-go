@@ -1345,13 +1345,20 @@ func (p *BulkProcessor) DeleteSyncV2(fileID, routingID string) error {
 	}
 	p.mutex.RUnlock()
 
+	// In order to solve DeleteSyncV2() failure in server (upgrade etc.),
+	// an asynchronous deletion method is added here.The business side needs to ensure:
+	// 1. No need to execute DeleteSyncV2() before insert, batch operation will automatically execute deletion.
+	// 	Refer to processBufferTaskWithTransaction and guc:DeleteBeforeInsert, otherwise insert first and then delete may cause data loss
+	// 2. DeleteSyncV2 will only be called when data is actually deleted. If synchronous deletion fails,
+	// 	it will be converted to asynchronous, and the deletion will be successful after the database is restored.
+	if p.config.AsyncDelete {
+		return p.DeleteV2(fileID, routingID)
+	}
+
 	_, err := p.pgClient.DeleteTablesWithCondition(p.ctx, p.config.PostgreSQL.Schema, p.config.PostgreSQL.Table, fileID, routingID, p.hasRoutingTable)
 	if err != nil {
-		if p.config.AsyncDelete {
-			Debug("Failed to delete file %s with routingID %s sync: %v, will retry in async mode", fileID, routingID, err)
-			return nil
-		}
-		return fmt.Errorf("failed to delete tables with condition: %w", err)
+		Debug("Failed to delete file %s with routingID %s sync: %v, will retry in async mode", fileID, routingID, err)
+		return p.DeleteV2(fileID, routingID)
 	}
 
 	return nil
@@ -1410,7 +1417,7 @@ func (p *BulkProcessor) SaveBufferToFileAndGenerateTask(currentBuffer *Buffer, t
 		currentBuffer.ID, currentBuffer.GetRecordCount())
 
 	// deduplicate records
-	deletedRecords, versionMap := currentBuffer.DeduplicateRecords(len(p.pkColumns) > 0, p.versionColIndex >= 0, p.config.AsyncDelete)
+	deletedRecords, versionMap := currentBuffer.DeduplicateRecords(len(p.pkColumns) > 0, p.versionColIndex >= 0, p.config.DeleteBeforeInsert)
 
 	columnNames := GetColumnNames(p.fields)
 
@@ -1571,6 +1578,8 @@ func (p *BulkProcessor) ImporterThreadV2() {
 			return
 		case task := <-p.bufferTaskQueue:
 
+			Log("Begin to import task: %s, records: %d", task.TaskId, task.RecordCount)
+
 			feedbackKeysArray := p.getFeedbackValues()
 
 			if p.config.MaxConcurrentWorkers > 1 {
@@ -1693,14 +1702,15 @@ func (p *BulkProcessor) processBufferTask(task *BufferTask, workerID int, feedba
 // processBufferTaskWithTransaction process buffer task with transaction, include delete and import
 func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask) error {
 
-	asyncDelete := p.config.AsyncDelete
+	deleteBeforeInsert := p.config.DeleteBeforeInsert
 
 	if task.RecordCount <= 0 && len(task.DeletedRecords) == 0 {
 		Debug("task %s has no records, skip processing", task.TaskId)
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	// 300 seconds is the max timeout for the transaction
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
 	defer cancel()
 
 	conn, err := p.pgClient.pool.Acquire(ctx)
@@ -1716,7 +1726,7 @@ func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask) error
 	}
 
 	updateOnConflict := p.config.UpdateOnConflict
-	if asyncDelete && len(task.FileVersionMap) > 0 {
+	if deleteBeforeInsert && len(task.FileVersionMap) > 0 {
 		updateOnConflict = false
 	}
 
@@ -1731,6 +1741,10 @@ func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask) error
 			if rollbackErr := tx.Rollback(ctx); rollbackErr != nil {
 				Error("task %s failed to rollback transaction: %v", task.TaskId, rollbackErr)
 			}
+			// detach the connection from the pool and close it manually,
+			// fix the issue where a segment restart would cause the link to fail to be released
+			conn := conn.Hijack()
+			conn.Close(ctx)
 		}
 		conn := conn.Hijack()
 		conn.Close(ctx)
@@ -1762,7 +1776,7 @@ func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask) error
 	}
 
 	// 2. delete outdated files
-	if len(task.FileVersionMap) > 0 && asyncDelete {
+	if len(task.FileVersionMap) > 0 && deleteBeforeInsert {
 		if err := p.pgClient.DeleteOutdatedFiles(ctx, tx, targetTable, task.FileVersionMap); err != nil {
 			return fmt.Errorf("failed to delete outdated files: %w", err)
 		}

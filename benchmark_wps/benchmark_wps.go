@@ -348,7 +348,7 @@ func main() {
 			filePath := fmt.Sprintf("%s/%s%d.csv", dataDir, filePrefix, version)
 			log.Printf("Processing version %d: %s", version, filePath)
 
-			err := insertDataForThreadV4(processor, filePath, 0)
+			err := insertDataForThread(processor, filePath, 0)
 			if err != nil {
 				log.Fatalf("Failed to insert data for version %d: %v", version, err)
 			}

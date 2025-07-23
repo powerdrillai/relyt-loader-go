@@ -36,7 +36,7 @@ type TestDataWithCopyOnConflict struct {
 	Vector    string `relyt:"vector"`
 }
 
-type TestDataWithAsyncDelete struct {
+type TestDataWithDeleteBeforeInsert struct {
 	ID        int    `relyt:"id"`
 	FileID    int    `relyt:"fileid"`
 	RoutingID string `relyt:"routing_id"`
@@ -340,7 +340,7 @@ func GetCountFromTestDataTableWithCopyOnConflict(db *sql.DB, auxtable bool) (int
 	return count, nil
 }
 
-func CreateTestAsyncDeleteWithOutAux(db *sql.DB) error {
+func CreateTestDeleteBeforeInsertWithOutAux(db *sql.DB) error {
 	// This function is a placeholder for creating the test table in PostgreSQL.
 	// You can implement the logic to create the necessary table structure here.
 	// For example, you might use a SQL command like:
@@ -364,7 +364,7 @@ func CreateTestAsyncDeleteWithOutAux(db *sql.DB) error {
 	return nil
 }
 
-func DropTestAsyncDeleteWithOutAux(db *sql.DB) error {
+func DropTestDeleteBeforeInsertWithOutAux(db *sql.DB) error {
 	// This function is a placeholder for creating the test table in PostgreSQL.
 	// You can implement the logic to create the necessary table structure here.
 	// For example, you might use a SQL command like:
@@ -381,7 +381,7 @@ func DropTestAsyncDeleteWithOutAux(db *sql.DB) error {
 	return nil
 }
 
-func GetCountFromTestDataTableWithAsyncDelete(db *sql.DB) (int, error) {
+func GetCountFromTestDataTableWithDeleteBeforeInsert(db *sql.DB) (int, error) {
 	// This function retrieves the count of records in all test tables.
 	log.Println("Counting records in test tables...")
 	table := "test_routing_data_async_delete"
@@ -1968,7 +1968,7 @@ func TestBufferInsertWithCopyOnConflict(t *testing.T) {
 	log.Printf("results: %v", results)
 }
 
-func TestAsyncDelete(t *testing.T) {
+func TestDeleteBeforeInsert(t *testing.T) {
 	dbConfig := InitDatabaseConfig("127.0.0.1", 7000, "postgres", "", "postgres")
 	db, err := SetupDataBase(dbConfig)
 	if err != nil {
@@ -1976,13 +1976,13 @@ func TestAsyncDelete(t *testing.T) {
 	}
 	defer db.Close()
 
-	err = DropTestAsyncDeleteWithOutAux(db)
+	err = DropTestDeleteBeforeInsertWithOutAux(db)
 	if err != nil {
 		log.Fatalf("failed to truncate test table: %v", err)
 		return
 	}
 
-	err = CreateTestAsyncDeleteWithOutAux(db)
+	err = CreateTestDeleteBeforeInsertWithOutAux(db)
 	if err != nil {
 		log.Fatalf("failed to create test table: %v", err)
 		return
@@ -1993,7 +1993,7 @@ func TestAsyncDelete(t *testing.T) {
 
 	filePath := "../examples/data/test_insert_v2_async_delete.csv"
 
-	var tests []TestDataWithAsyncDelete
+	var tests []TestDataWithDeleteBeforeInsert
 
 	csvFile, err := os.Open(filePath)
 	if err != nil {
@@ -2036,7 +2036,7 @@ func TestAsyncDelete(t *testing.T) {
 		if err != nil {
 			t.Errorf("failed to parse version: %v", err)
 		}
-		tests = append(tests, TestDataWithAsyncDelete{
+		tests = append(tests, TestDataWithDeleteBeforeInsert{
 			ID:        id,
 			FileID:    fileID,
 			RoutingID: routingID,
@@ -2080,7 +2080,7 @@ func TestAsyncDelete(t *testing.T) {
 	time.Sleep(time.Duration(5) * time.Second)
 	processor.Flush()
 
-	mainCount, err := GetCountFromTestDataTableWithAsyncDelete(db)
+	mainCount, err := GetCountFromTestDataTableWithDeleteBeforeInsert(db)
 	if err != nil {
 		t.Errorf("failed to get count from test table: %v", err)
 	}
@@ -2113,18 +2113,6 @@ func TestAsyncDelete(t *testing.T) {
 	}
 
 	log.Printf("actual results: %v", actualResults)
-
-	// Check the count of records in the test table
-	mainCount, err = GetCountFromTestDataTableWithoutAux(db)
-	if err != nil {
-		t.Errorf("failed to get count from test table: %v", err)
-	}
-
-	log.Printf("main table count: %d", mainCount)
-
-	if mainCount != 5 {
-		t.Errorf("expected main table count to be 5, got %d", mainCount)
-	}
 }
 
 // test case 1: table name is empty
@@ -2237,4 +2225,163 @@ func TestErrorCaseEmptyTableName(t *testing.T) {
 
 	time.Sleep(time.Duration(10) * time.Second)
 	processor.Shutdown()
+}
+
+func TestRealDelete(t *testing.T) {
+	dbConfig := InitDatabaseConfig("127.0.0.1", 7000, "postgres", "", "postgres")
+	db, err := SetupDataBase(dbConfig)
+	if err != nil {
+		log.Fatalf("failed to setup database: %v", err)
+	}
+	defer db.Close()
+
+	err = DropTestDeleteBeforeInsertWithOutAux(db)
+	if err != nil {
+		log.Fatalf("failed to truncate test table: %v", err)
+		return
+	}
+
+	err = CreateTestDeleteBeforeInsertWithOutAux(db)
+	if err != nil {
+		log.Fatalf("failed to create test table: %v", err)
+		return
+	}
+
+	processor := NewProcessorV2(dbConfig, 3, 0, "test_routing_data_async_delete")
+	defer processor.Shutdown()
+
+	filePath := "../examples/data/test_insert_v2_async_delete.csv"
+
+	var tests []TestDataWithDeleteBeforeInsert
+
+	csvFile, err := os.Open(filePath)
+	if err != nil {
+		log.Fatalf("failed to open csv file: %v", err)
+	}
+	defer csvFile.Close()
+
+	csvReader := csv.NewReader(csvFile)
+	csvReader.FieldsPerRecord = -1
+	csvReader.Comma = '\t'
+	csvReader.ReuseRecord = true
+
+	i := 0
+
+	for {
+		record, err := csvReader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Errorf("failed to read csv file: %v", err)
+		}
+		id, err := strconv.Atoi(record[0])
+		if err != nil {
+			t.Errorf("failed to parse id: %v", err)
+		}
+		fileID, err := strconv.Atoi(record[1])
+		if err != nil {
+			t.Errorf("failed to parse file_id: %v", err)
+		}
+		routingID := record[2]
+		if len(record) < 6 {
+			t.Errorf("record does not contain enough fields: %v", record)
+		}
+		ext := record[3]
+		vector := record[4]
+		version, err := strconv.Atoi(record[5])
+		if err != nil {
+			t.Errorf("failed to parse version: %v", err)
+		}
+		tests = append(tests, TestDataWithDeleteBeforeInsert{
+			ID:        id,
+			FileID:    fileID,
+			RoutingID: routingID,
+			Ext:       ext,
+			Vector:    vector,
+			Version:   version,
+		})
+		i++
+
+		err = processor.InsertV2(fmt.Sprintf("%d", fileID), routingID, tests)
+		if err != nil {
+			t.Errorf("failed to insert data: %v", err)
+		}
+
+		tests = nil // clear the list, prepare for the next batch
+	}
+
+	time.Sleep(time.Duration(5) * time.Second)
+	processor.Flush()
+
+	mainCount, err := GetCountFromTestDataTableWithDeleteBeforeInsert(db)
+	if err != nil {
+		t.Errorf("failed to get count from test table: %v", err)
+	}
+	if mainCount != 6 {
+		t.Errorf("expected main table count to be %d, got %d", 6, mainCount)
+	}
+
+	// select count(*) from test_routing_data where fileid = 120 and routing_id = 120
+	searchOptions := &SearchOptions{
+		Table:     "test_routing_data_async_delete",
+		Columns:   []string{"routing_id", "version"},
+		Condition: "fileid IN (100, 110, 120)",
+		OrderBy:   "routing_id ASC",
+	}
+
+	results, err := processor.SearchV2(searchOptions)
+	if err != nil {
+		t.Errorf("failed to search data: %v", err)
+	}
+
+	expectedResults := "[100 2][110 1][110 1][110 1][110 1][120 10]"
+	var actualResults string
+
+	for _, result := range results.Rows {
+		actualResults += fmt.Sprintf("%v", result)
+	}
+
+	if expectedResults != actualResults {
+		t.Errorf("expected results: %v, got: %v", expectedResults, actualResults)
+	}
+
+	log.Printf("actual results: %v", actualResults)
+
+	log.Printf("shutting down the pg-server...")
+	cmd := exec.Command("/bin/sh", "-c", "source /workspace/phoenix/neon/pg_install/v12/greenplum_path.sh; source /workspace/phoenix/gpAux/gpdemo/gpdemo-env.sh;gpstop -ia;")
+	err = cmd.Run()
+	if err != nil {
+		t.Errorf("failed to kill pg-server: %v", err)
+	}
+	log.Printf("finish shut down the pg-server...")
+
+	err = processor.DeleteSyncV2("120", "120")
+	if err != nil {
+		t.Errorf("failed to delete data: %v", err)
+	}
+
+	err = processor.DeleteSyncV2("100", "100")
+	if err != nil {
+		t.Errorf("failed to delete data: %v", err)
+	}
+
+	log.Printf("starting the pg-server...")
+	cmd = exec.Command("/bin/sh", "-c", "source /workspace/phoenix/neon/pg_install/v12/greenplum_path.sh; source /workspace/phoenix/gpAux/gpdemo/gpdemo-env.sh;gpstart -a;")
+	err = cmd.Run()
+	if err != nil {
+		t.Errorf("failed to start pg-server: %v", err)
+	}
+	log.Printf("finish starting the pg-server...")
+
+	time.Sleep(time.Duration(5) * time.Second)
+	processor.Flush()
+
+	mainCount, err = GetCountFromTestDataTableWithDeleteBeforeInsert(db)
+	if err != nil {
+		t.Errorf("failed to get count from test table: %v", err)
+	}
+	if mainCount != 4 {
+		t.Errorf("expected main table count to be 4, got %d", mainCount)
+	}
 }
