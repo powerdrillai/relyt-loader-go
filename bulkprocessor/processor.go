@@ -1746,8 +1746,6 @@ func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask) error
 			conn := conn.Hijack()
 			conn.Close(ctx)
 		}
-		conn := conn.Hijack()
-		conn.Close(ctx)
 	}()
 
 	// 1. delete records first
