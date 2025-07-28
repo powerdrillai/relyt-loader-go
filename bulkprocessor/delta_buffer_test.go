@@ -536,6 +536,10 @@ func TestBufferInsertBasic(t *testing.T) {
 	processor.Shutdown()
 }
 
+// set the following config to test
+// 1. buffer_max_records to 10
+// 2. tuples_pre_partition to 10
+// 3. import_strategy to 3
 func TestBufferInsertWithSomeErrors(t *testing.T) {
 	// Initialize database connection
 	dbConfig := InitDatabaseConfig("127.0.0.1", 7000, "postgres", "", "postgres")
@@ -643,8 +647,8 @@ func TestBufferInsertWithSomeErrors(t *testing.T) {
 		t.Errorf("failed to get count from test table: %v", err)
 	} else {
 		log.Printf("Counted %d records in test table.", count)
-		if count != 10 {
-			t.Errorf("expected %d records, but got %d", 10, count)
+		if count != 20 {
+			t.Errorf("expected %d records, but got %d", 20, count)
 		}
 	}
 }

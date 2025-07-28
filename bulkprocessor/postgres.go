@@ -208,6 +208,7 @@ func (c *PostgreSQLClient) UpdateCheckpointStatus(ctx context.Context, processId
 // GetLoadConfigFromDB retrieves loader configuration from the database
 func (c *PostgreSQLClient) GetLoadConfigFromDB(ctx context.Context, config *Config) (*S3Config, error) {
 	var s3Config S3Config
+	var rawSkipServerErrorInfos string
 
 	// Query the SDK_LOADER_CONFIG table
 	sqlStatement := `
@@ -231,7 +232,9 @@ func (c *PostgreSQLClient) GetLoadConfigFromDB(ctx context.Context, config *Conf
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'delete_before_insert' THEN CONFIG_VALUE END)::BOOLEAN, true) as delete_before_insert,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'update_on_conflict' THEN CONFIG_VALUE END)::BOOLEAN, true) as update_on_conflict,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'file_write_timeout' THEN CONFIG_VALUE END)::INT, 3) as file_write_timeout,
-		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'async_delete' THEN CONFIG_VALUE END)::BOOLEAN, false) as async_delete
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'async_delete' THEN CONFIG_VALUE END)::BOOLEAN, false) as async_delete,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'skip_server_error_infos' THEN CONFIG_VALUE END)::TEXT, 'Bad literal|Dimensions|duplicate key value|invalid byte sequence') as skip_server_error_infos,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'task_timeout' THEN CONFIG_VALUE END)::INT, 120) as task_timeout
 	FROM relyt_sys.SDK_LOADER_CONFIG
 	`
 
@@ -258,7 +261,11 @@ func (c *PostgreSQLClient) GetLoadConfigFromDB(ctx context.Context, config *Conf
 		&config.UpdateOnConflict,
 		&config.FileWriteTimeout,
 		&config.AsyncDelete,
+		&rawSkipServerErrorInfos,
+		&config.TaskTimeout,
 	)
+
+	config.SkipServerErrorInfos = strings.Split(rawSkipServerErrorInfos, "|")
 
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to retrieve S3 configuration from database")
@@ -273,6 +280,7 @@ func (c *PostgreSQLClient) GetLoadConfigFromDB(ctx context.Context, config *Conf
 }
 
 func (c *PostgreSQLClient) UpdateLoadConfig(ctx context.Context, config *Config) error {
+	var rawSkipServerErrorInfos string
 	sqlStatement := `
 		SELECT
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'import_timeout' THEN CONFIG_VALUE END)::INT, 1800) as import_timeout,
@@ -285,7 +293,9 @@ func (c *PostgreSQLClient) UpdateLoadConfig(ctx context.Context, config *Config)
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'delete_before_insert' THEN CONFIG_VALUE END)::BOOLEAN, true) as delete_before_insert,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'update_on_conflict' THEN CONFIG_VALUE END)::BOOLEAN, true) as update_on_conflict,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'file_write_timeout' THEN CONFIG_VALUE END)::INT, 3) as file_write_timeout,
-		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'async_delete' THEN CONFIG_VALUE END)::BOOLEAN, false) as async_delete
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'async_delete' THEN CONFIG_VALUE END)::BOOLEAN, false) as async_delete,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'skip_server_error_infos' THEN CONFIG_VALUE END)::TEXT, 'Bad literal|Dimensions|duplicate key value|invalid byte sequence') as skip_server_error_infos,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'task_timeout' THEN CONFIG_VALUE END)::INT, 120) as task_timeout
 	FROM relyt_sys.SDK_LOADER_CONFIG
 	`
 
@@ -302,6 +312,8 @@ func (c *PostgreSQLClient) UpdateLoadConfig(ctx context.Context, config *Config)
 		&config.UpdateOnConflict,
 		&config.FileWriteTimeout,
 		&config.AsyncDelete,
+		&rawSkipServerErrorInfos,
+		&config.TaskTimeout,
 	)
 
 	if err != nil {
@@ -312,6 +324,8 @@ func (c *PostgreSQLClient) UpdateLoadConfig(ctx context.Context, config *Config)
 		log.Printf("TuplesPrePartition is less than 0, set to 5000")
 		config.TuplesPrePartition = 5000
 	}
+
+	config.SkipServerErrorInfos = strings.Split(rawSkipServerErrorInfos, "|")
 
 	return nil
 }
@@ -1043,6 +1057,165 @@ func (c *PostgreSQLClient) CopyFromS3OnConflict(ctx context.Context, tx pgx.Tx, 
 	_, err := tx.Exec(ctx, copySQL)
 	if err != nil {
 		return fmt.Errorf("failed to execute COPY FROM S3: %w", err)
+	}
+
+	return nil
+}
+
+func (c *PostgreSQLClient) InsertIntoFromExternalTable(ctx context.Context, tx pgx.Tx, s3URL, batchDir, targetTable string, columnNames []string, updateOnConflict bool, s3Config S3Config) error {
+	// Generate a unique table name for the external table
+	externalTableName := fmt.Sprintf("ext_%s_%s",
+		strings.ReplaceAll(c.config.Table, ".", "_"),
+		batchDir)
+
+	// Drop external table first using transaction, because we have a retry mechanism in the import process
+	dropSQL := fmt.Sprintf(`DROP FOREIGN TABLE IF EXISTS %s.%s`, c.config.Schema, externalTableName)
+	_, err := tx.Exec(ctx, dropSQL)
+	if err != nil {
+		return errors.Wrap(err, "failed to drop existing external table")
+	}
+
+	// Create external table using transaction with column names (types will be taken from target table)
+	// Get the table schema to ensure column types match
+	tableSchema, err := c.GetTableSchema(ctx)
+	if err != nil {
+		return errors.Wrap(err, "failed to get table schema for creating external table")
+	}
+
+	// Create a map of column names to their definitions
+	columnMap := make(map[string]string)
+	for _, col := range tableSchema {
+		columnMap[col.Name] = fmt.Sprintf("%s %s", col.Name, col.ColumnType)
+	}
+
+	// Build column definitions based on the provided column names
+	// but use the types from the actual table schema
+	columnDefs := make([]string, 0, len(columnNames))
+	for _, name := range columnNames {
+		if def, exists := columnMap[name]; exists {
+			columnDefs = append(columnDefs, def)
+		} else {
+			return fmt.Errorf("column '%s' does not exist in target table", name)
+		}
+	}
+
+	// Create external table using transaction
+	createSQL := fmt.Sprintf(`CREATE EXTERNAL TABLE %s.%s (
+		%s
+	)
+	LOCATION('%s 
+          accessid=%s
+          secret=%s 
+          region=%s 
+          version=2
+		  clean_invalid_encoding=on')
+	FORMAT 'CSV'
+	(delimiter ',' null 'null')
+	`, c.config.Schema, externalTableName, strings.Join(columnDefs, ",\n"), s3URL, s3Config.AccessKey, s3Config.SecretKey, s3Config.Region)
+
+	_, err = tx.Exec(ctx, createSQL)
+	if err != nil {
+		return errors.Wrap(err, "failed to create external table")
+	}
+
+	// Import data from external table to target table using transaction
+	// Get primary key columns to handle conflicts
+	pkColumns, err := c.GetTablePrimaryKeys(ctx)
+	if err != nil {
+		// Try to drop external table even if import failed using transaction
+		if _, dropErr := tx.Exec(ctx, dropSQL); dropErr != nil {
+			log.Printf("Failed to drop external table after import error: %v", dropErr)
+		}
+		return errors.Wrap(err, "failed to get primary key columns")
+	}
+
+	// Import data from external table to target table
+	columnsList := strings.Join(columnNames, ", ")
+
+	var sqlStatement string
+	if len(pkColumns) > 0 {
+		// Build the ON CONFLICT clause
+		conflictColumns := strings.Join(pkColumns, ", ")
+
+		// For the SELECT statement, we need to handle duplicate keys in the external table
+		// Use DISTINCT ON to get only one row per primary key combination
+		distinctOnClause := fmt.Sprintf("DISTINCT ON (%s)", conflictColumns)
+
+		// Build the WHERE clause to ensure all columns are not null
+		wherePartsForSelect := make([]string, 0, len(pkColumns))
+		for _, pk := range pkColumns {
+			wherePartsForSelect = append(wherePartsForSelect, fmt.Sprintf("%s IS NOT NULL", pk))
+		}
+		whereClauseForSelect := ""
+		if len(wherePartsForSelect) > 0 {
+			whereClauseForSelect = "WHERE " + strings.Join(wherePartsForSelect, " AND ")
+		}
+
+		if updateOnConflict {
+			// Build the update set clause (set each column to excluded.column)
+			updateSetParts := make([]string, 0, len(columnNames))
+			for _, col := range columnNames {
+				// Skip primary key columns in the update part
+				isPK := false
+				for _, pk := range pkColumns {
+					if pk == col {
+						isPK = true
+						break
+					}
+				}
+				if !isPK {
+					updateSetParts = append(updateSetParts, fmt.Sprintf("%s = excluded.%s", col, col))
+				}
+			}
+
+			// If there are non-PK columns to update
+			if len(updateSetParts) > 0 {
+				updateSet := strings.Join(updateSetParts, ", ")
+				sqlStatement = fmt.Sprintf(`INSERT INTO %s.%s (%s)
+				SELECT %s %s FROM %s.%s %s
+				ON CONFLICT (%s) DO UPDATE SET %s`,
+					c.config.Schema, targetTable, columnsList,
+					distinctOnClause, columnsList, c.config.Schema, externalTableName, whereClauseForSelect,
+					conflictColumns, updateSet)
+			} else {
+				// All columns are primary keys, do nothing on conflict
+				sqlStatement = fmt.Sprintf(`INSERT INTO %s.%s (%s)
+				SELECT %s %s FROM %s.%s %s
+				ON CONFLICT (%s) DO NOTHING`,
+					c.config.Schema, targetTable, columnsList,
+					distinctOnClause, columnsList, c.config.Schema, externalTableName, whereClauseForSelect,
+					conflictColumns)
+			}
+		} else {
+			// Do nothing on conflict (as per configuration)
+			sqlStatement = fmt.Sprintf(`INSERT INTO %s.%s (%s)
+			SELECT %s %s FROM %s.%s %s
+			ON CONFLICT (%s) DO NOTHING`,
+				c.config.Schema, targetTable, columnsList,
+				distinctOnClause, columnsList, c.config.Schema, externalTableName, whereClauseForSelect,
+				conflictColumns)
+		}
+	} else {
+		// No primary key, use standard INSERT
+		sqlStatement = fmt.Sprintf(`INSERT INTO %s.%s (%s)
+		SELECT %s FROM %s.%s`,
+			c.config.Schema, targetTable, columnsList,
+			columnsList, c.config.Schema, externalTableName)
+	}
+
+	_, err = tx.Exec(ctx, sqlStatement)
+	if err != nil {
+		// Try to drop external table even if import failed using transaction
+		if _, dropErr := tx.Exec(ctx, dropSQL); dropErr != nil {
+			log.Printf("Failed to drop external table after import error: %v", dropErr)
+		}
+		return errors.Wrap(err, "failed to execute import from external table")
+	}
+
+	// Drop external table after successful import using transaction
+	_, err = tx.Exec(ctx, dropSQL)
+	if err != nil {
+		return errors.Wrap(err, "failed to drop external table after import")
 	}
 
 	return nil

@@ -1578,7 +1578,7 @@ func (p *BulkProcessor) ImporterThreadV2() {
 			return
 		case task := <-p.bufferTaskQueue:
 
-			Log("Begin to import task: %s, records: %d", task.TaskId, task.RecordCount)
+			Debug("Begin to import task: %s, records: %d", task.TaskId, task.RecordCount)
 
 			feedbackKeysArray := p.getFeedbackValues()
 
@@ -1625,7 +1625,7 @@ func (p *BulkProcessor) processBufferTask(task *BufferTask, workerID int, feedba
 	err := errors.New("Buffer Task timeout")
 
 	for i := 0; i < maxLoopNum; i++ {
-		if err := p.processBufferTaskWithTransaction(task); err != nil {
+		if err := p.processBufferTaskWithTransaction(task, p.config.TaskTimeout); err != nil {
 
 			Warning("Server is busy, will retry to process buffer task %s after %d seconds, error: %v",
 				task.TaskId, p.config.ImportErrorSleepTime, err)
@@ -1639,9 +1639,15 @@ func (p *BulkProcessor) processBufferTask(task *BufferTask, workerID int, feedba
 
 			// all the errors without parsing error are not expected, we will retry, parsing error just call
 			// the callback and continue to next batch
-			if !strings.Contains(err.Error(), "Bad literal") &&
-				!strings.Contains(err.Error(), "Dimensions") &&
-				!strings.Contains(err.Error(), "duplicate key value") {
+			shouldRetry := true
+			for _, skipError := range p.config.SkipServerErrorInfos {
+				if strings.Contains(err.Error(), skipError) {
+					shouldRetry = false
+					break
+				}
+			}
+
+			if shouldRetry {
 				time.Sleep(time.Duration(p.config.ImportErrorSleepTime) * time.Second)
 				continue
 			}
@@ -1700,7 +1706,7 @@ func (p *BulkProcessor) processBufferTask(task *BufferTask, workerID int, feedba
 }
 
 // processBufferTaskWithTransaction process buffer task with transaction, include delete and import
-func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask) error {
+func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask, timeout int) error {
 
 	deleteBeforeInsert := p.config.DeleteBeforeInsert
 
@@ -1710,7 +1716,7 @@ func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask) error
 	}
 
 	// 300 seconds is the max timeout for the transaction
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
 	defer cancel()
 
 	conn, err := p.pgClient.pool.Acquire(ctx)
@@ -1799,12 +1805,18 @@ func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask) error
 
 			if err := p.pgClient.CopyFromS3OnConflict(ctx, tx, p.s3Client.GetS3URL(task.S3File), targetTable, GetColumnNames(p.fields), updateOnConflict, *s3Config); err != nil {
 				log.Printf("COPY FROM S3 failed for task %s: %v, falling back to INSERT ON CONFLICT", task.TaskId, err)
+				task.ImportStrategy = InsertOnConflict
+				return fmt.Errorf("COPY FROM S3 failed: %w", err)
+			}
+		} else if task.ImportStrategy == InsertFromExtTable {
+			s3Config, err := p.pgClient.GetLoadConfigFromDB(ctx, &p.config)
+			if err != nil {
+				return fmt.Errorf("failed to get S3 configuration: %w", err)
+			}
 
-				if err := p.pgClient.InsertIntoOnConflictFromLocal(ctx, tx, GetLocalFileFullPath(task.LocalFile), targetTable,
-					GetColumnNames(p.fields), updateOnConflict, p.config.InsertIntoBatchSize); err != nil {
-					return fmt.Errorf("fallback INSERT ON CONFLICT also failed: %w", err)
-				}
-				log.Printf("Successfully used fallback INSERT ON CONFLICT for task %s", task.TaskId)
+			if err := p.pgClient.InsertIntoFromExternalTable(ctx, tx, p.s3Client.GetS3URL(task.S3File), task.TaskId, targetTable, GetColumnNames(p.fields), updateOnConflict, *s3Config); err != nil {
+				task.ImportStrategy = InsertOnConflict
+				return fmt.Errorf("INSERT INTO FROM EXTERNAL TABLE failed: %w", err)
 			}
 		}
 	}
