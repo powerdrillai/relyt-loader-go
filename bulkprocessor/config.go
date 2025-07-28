@@ -33,9 +33,10 @@ type PostgreSQLConfig struct {
 }
 
 const (
-	InsertOnConflict = 0
-	CopyFromLocal    = 1
-	CopyFromS3       = 2
+	InsertOnConflict   = 0
+	CopyFromLocal      = 1
+	CopyFromS3         = 2
+	InsertFromExtTable = 3
 )
 
 // Config represents the configuration for the bulk processor
@@ -50,19 +51,21 @@ type Config struct {
 	FeedbackColumn       string           // Column name for error messages (default: "") when import failed
 	ImportErrorCallback  ImportErrorHandler
 	CallbackResource     interface{}
-	FileWriteTimeout     int    // a new file opened for a limited time to write, default: 10 seconds
-	BGWorkerInterval     int    // GC interval in seconds, default: 60 seconds
-	ImportTimeout        int    // S3 import timeout in seconds
-	ImportErrorSleepTime int    // S3 import error sleep time in seconds
-	EnableDualBuffer     bool   // enable dual buffer, default: true
-	BufferMaxRecords     int    // buffer max records, default: 1000
-	ImportStrategy       int    // use insert on conflict, default: true
-	InsertIntoBatchSize  int    // insert into batch size, default: 100
-	TuplesPrePartition   int    // tuples pre partition, default: 5000
-	LocalFilePrefix      string // local file prefix, default: "/tmp"
-	MaxConcurrentWorkers int    // max concurrent workers, default: 1
-	DeleteBeforeInsert   bool   // delete before insert, default: true
-	AsyncDelete          bool   // async delete, default: true
+	FileWriteTimeout     int      // a new file opened for a limited time to write, default: 10 seconds
+	BGWorkerInterval     int      // GC interval in seconds, default: 60 seconds
+	ImportTimeout        int      // S3 import timeout in seconds
+	ImportErrorSleepTime int      // S3 import error sleep time in seconds
+	EnableDualBuffer     bool     // enable dual buffer, default: true
+	BufferMaxRecords     int      // buffer max records, default: 1000
+	ImportStrategy       int      // use insert on conflict, default: true
+	InsertIntoBatchSize  int      // insert into batch size, default: 100
+	TuplesPrePartition   int      // tuples pre partition, default: 5000
+	LocalFilePrefix      string   // local file prefix, default: "/tmp"
+	MaxConcurrentWorkers int      // max concurrent workers, default: 1
+	DeleteBeforeInsert   bool     // delete before insert, default: true
+	AsyncDelete          bool     // async delete, default: true
+	SkipServerErrorInfos []string // skip server error infos, default: [Bad literal, Dimensions, duplicate key value, invalid byte sequence]
+	TaskTimeout          int      // task timeout in seconds, default: 120s
 
 	// LogLevel sets the logging level (LOG, WARNING, ERROR)
 	LogLevel LogLevel
@@ -145,6 +148,20 @@ func (c *Config) Validate() error {
 
 	if c.LogLevel < DEBUG || c.LogLevel > ERROR {
 		c.LogLevel = LOG // Default to LOG level
+	}
+
+	// Set default skip server error infos if not provided
+	if len(c.SkipServerErrorInfos) == 0 {
+		c.SkipServerErrorInfos = []string{
+			"Bad literal",
+			"Dimensions",
+			"duplicate key value",
+			"invalid byte sequence",
+		}
+	}
+
+	if c.TaskTimeout <= 0 {
+		c.TaskTimeout = 120
 	}
 
 	return nil
