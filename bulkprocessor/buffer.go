@@ -40,6 +40,7 @@ type Record struct {
 	Tag       RecordTag
 	FileID    string
 	RoutingID string
+	GroupID   string
 	PKValues  []string
 	Version   string
 	Values    []string
@@ -321,6 +322,11 @@ type RecordIndex struct {
 	routingID string
 }
 
+type GroupIndex struct {
+	groupID   string
+	routingID string
+}
+
 type PrimaryKey struct {
 	PKValues []string
 }
@@ -329,16 +335,17 @@ func (pk *PrimaryKey) toString() string {
 	return strings.Join(pk.PKValues, "-")
 }
 
-func (b *Buffer) DeduplicateRecords(havePK, haveVersion bool, deleteBeforeInsert bool) ([]RecordIndex, map[RecordIndex]string) {
+func (b *Buffer) DeduplicateRecords(havePK, haveVersion bool, deleteBeforeInsert bool) ([]RecordIndex, []GroupIndex, map[RecordIndex]string) {
 	b.BufferMutex.Lock()
 	defer b.BufferMutex.Unlock()
 
 	if len(b.Records) == 0 {
-		return []RecordIndex{}, make(map[RecordIndex]string)
+		return []RecordIndex{}, []GroupIndex{}, make(map[RecordIndex]string)
 	}
 
 	// records the delete records
 	deleteMap := make(map[RecordIndex]bool)
+	deleteGroupMap := make(map[GroupIndex]bool)
 	//hash<routingID-fileID, version>
 	versionMap := make(map[RecordIndex]string)
 	primarySet := make(map[string]struct{})
@@ -353,7 +360,14 @@ func (b *Buffer) DeduplicateRecords(havePK, haveVersion bool, deleteBeforeInsert
 			routingID: record.RoutingID,
 		}
 		if record.Tag == OperationDelete {
-			deleteMap[key] = true
+			if record.GroupID != "" {
+				deleteGroupMap[GroupIndex{
+					groupID:   record.GroupID,
+					routingID: record.RoutingID,
+				}] = true
+			} else {
+				deleteMap[key] = true
+			}
 			keepMap[i] = false
 		} else if record.Tag == OperationInsert {
 			// if the insert record has the same fileID and routingID as the delete record, mark it as delete
@@ -436,15 +450,19 @@ func (b *Buffer) DeduplicateRecords(havePK, haveVersion bool, deleteBeforeInsert
 	b.Records = newRecords
 	// collect all the deleted records
 	var deletedIndices []RecordIndex
+	var deletedGroupIndices []GroupIndex
 	for key := range deleteMap {
 		deletedIndices = append(deletedIndices, key)
 	}
-
-	if deleteBeforeInsert && haveVersion {
-		return deletedIndices, versionMap
+	for key := range deleteGroupMap {
+		deletedGroupIndices = append(deletedGroupIndices, key)
 	}
 
-	return deletedIndices, nil
+	if deleteBeforeInsert && haveVersion {
+		return deletedIndices, deletedGroupIndices, versionMap
+	}
+
+	return deletedIndices, deletedGroupIndices, nil
 }
 
 func CleanupLocalFile(filePath string) error {
@@ -561,29 +579,31 @@ func (b *Buffer) BufferWriteToFile(headers []string, s3Client *S3Client, tuplesP
 
 // BufferTask represents the buffer task
 type BufferTask struct {
-	TaskId         string // same as buffer id
-	LocalFile      string // same as buffer local file path
-	S3File         string // same as buffer s3 file path
-	RecordCount    int
-	CreatedAt      time.Time
-	DeletedRecords []RecordIndex
-	FileVersionMap map[RecordIndex]string
-	MaxOffset      int64 // Maximum offset in this buffer task
-	ImportStrategy int   // Import strategy
+	TaskId              string // same as buffer id
+	LocalFile           string // same as buffer local file path
+	S3File              string // same as buffer s3 file path
+	RecordCount         int
+	CreatedAt           time.Time
+	DeletedRecords      []RecordIndex
+	DeletedGroupRecords []GroupIndex
+	FileVersionMap      map[RecordIndex]string
+	MaxOffset           int64 // Maximum offset in this buffer task
+	ImportStrategy      int   // Import strategy
 }
 
 // NewBufferTask create a new buffer task
-func NewBufferTask(buffer *Buffer, deletedRecords []RecordIndex, fileVersionMap map[RecordIndex]string, importStrategy int) *BufferTask {
+func NewBufferTask(buffer *Buffer, deletedRecords []RecordIndex, deletedGroupRecords []GroupIndex, fileVersionMap map[RecordIndex]string, importStrategy int) *BufferTask {
 	bufferTask := BufferTask{
-		TaskId:         buffer.ID,
-		LocalFile:      buffer.LocalFilePath,
-		S3File:         buffer.S3FilePath,
-		DeletedRecords: deletedRecords,
-		FileVersionMap: fileVersionMap,
-		RecordCount:    buffer.GetRecordCount(),
-		CreatedAt:      time.Now(),
-		MaxOffset:      buffer.GetMaxOffset(),
-		ImportStrategy: importStrategy,
+		TaskId:              buffer.ID,
+		LocalFile:           buffer.LocalFilePath,
+		S3File:              buffer.S3FilePath,
+		DeletedRecords:      deletedRecords,
+		DeletedGroupRecords: deletedGroupRecords,
+		FileVersionMap:      fileVersionMap,
+		RecordCount:         buffer.GetRecordCount(),
+		CreatedAt:           time.Now(),
+		MaxOffset:           buffer.GetMaxOffset(),
+		ImportStrategy:      importStrategy,
 	}
 	buffer.Records = nil
 	buffer.MaxVersionMap = nil

@@ -25,6 +25,7 @@ testv2:
 	go test -v -count=1 ./bulkprocessor -run TestDeleteBeforeInsert
 	go test -v -count=1 ./bulkprocessor -run TestErrorCaseEmptyTableName
 	go test -v -count=1 ./bulkprocessor -run TestRealDelete
+	go test -v -count=1 ./bulkprocessor -run TestDeleteGroupV2
 
 testselect:
 	go test -v -count=1 ./bulkprocessor -run TestSearchBasic

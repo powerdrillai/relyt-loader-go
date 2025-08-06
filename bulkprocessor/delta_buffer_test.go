@@ -45,6 +45,16 @@ type TestDataWithDeleteBeforeInsert struct {
 	Version   int    `relyt:"version"`
 }
 
+type TestDataWithDeleteGroupID struct {
+	ID        int    `relyt:"id"`
+	FileID    int    `relyt:"fileid"`
+	RoutingID string `relyt:"routing_id"`
+	GroupID   string `relyt:"group_id"`
+	Ext       string `relyt:"ext"`
+	Vector    string `relyt:"vector"`
+	Version   int    `relyt:"version"`
+}
+
 func NewProcessorV2(dbconfig DatabaseConfig, fileTimeout int, bufferSize int, tablename ...string) *BulkProcessor {
 	// open a error.log
 	logFile, err := os.OpenFile("/tmp/error.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
@@ -75,6 +85,7 @@ func NewProcessorV2(dbconfig DatabaseConfig, fileTimeout int, bufferSize int, ta
 		CallbackResource:    resources,
 		FileWriteTimeout:    fileTimeout, // set file write timeout
 		BGWorkerInterval:    10,          // set GC interval
+		LogLevel:            DEBUG,
 	}
 
 	if len(tablename) > 0 {
@@ -385,6 +396,56 @@ func GetCountFromTestDataTableWithDeleteBeforeInsert(db *sql.DB) (int, error) {
 	// This function retrieves the count of records in all test tables.
 	log.Println("Counting records in test tables...")
 	table := "test_routing_data_async_delete"
+	query := fmt.Sprintf(`SELECT COUNT(*) FROM %s`, table)
+
+	var count int
+	err := db.QueryRow(query).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count records: %w", err)
+	}
+	return count, nil
+}
+
+func CreateTestDeleteGroupV2WithOutAux(db *sql.DB) error {
+	query := `
+	CREATE TABLE IF NOT EXISTS test_routing_data_async_delete_group (
+		id bigint NOT NULL PRIMARY KEY,
+		fileid bigint NOT NULL,
+		routing_id bigint NOT NULL,
+		group_id text NOT NULL,
+		ext text NOT NULL,
+		vector vecf16(3) NOT NULL,
+		version bigint NOT NULL
+	) using heap;
+	`
+	_, err := db.Exec(query)
+	if err != nil {
+		return fmt.Errorf("failed to create test table: %w", err)
+	}
+	log.Println("Test table created successfully.")
+	return nil
+}
+
+func DropTestDeleteGroupV2WithOutAux(db *sql.DB) error {
+	// This function is a placeholder for creating the test table in PostgreSQL.
+	// You can implement the logic to create the necessary table structure here.
+	// For example, you might use a SQL command like:
+	// CREATE TABLE test_data (id SERIAL PRIMARY KEY, ext TEXT, vector TEXT);
+	log.Println("Dropping test table with auxin PostgreSQL...")
+	query := `
+	DROP TABLE IF EXISTS test_routing_data_async_delete_group;
+	`
+	_, err := db.Exec(query)
+	if err != nil {
+		return fmt.Errorf("failed to create test table: %w", err)
+	}
+	log.Println("Test table dropped successfully.")
+	return nil
+}
+
+func GetCountFromTestDataTableWithDeleteGroupV2(db *sql.DB) (int, error) {
+	log.Println("Counting records in test tables with delete group...")
+	table := "test_routing_data_async_delete_group"
 	query := fmt.Sprintf(`SELECT COUNT(*) FROM %s`, table)
 
 	var count int
@@ -2387,5 +2448,154 @@ func TestRealDelete(t *testing.T) {
 	}
 	if mainCount != 4 {
 		t.Errorf("expected main table count to be 4, got %d", mainCount)
+	}
+}
+
+// test case 2: test DeleteGroupV2
+func TestDeleteGroupV2(t *testing.T) {
+	dbConfig := InitDatabaseConfig("127.0.0.1", 7000, "postgres", "", "postgres")
+	db, err := SetupDataBase(dbConfig)
+	if err != nil {
+		log.Fatalf("failed to setup database: %v", err)
+	}
+	defer db.Close()
+
+	err = DropTestDeleteGroupV2WithOutAux(db)
+	if err != nil {
+		log.Fatalf("failed to drop test table: %v", err)
+		return
+	}
+
+	err = CreateTestDeleteGroupV2WithOutAux(db)
+	if err != nil {
+		log.Fatalf("failed to create test table: %v", err)
+		return
+	}
+
+	processor := NewProcessorV2(dbConfig, 3, 0, "test_routing_data_async_delete_group")
+	defer processor.Shutdown()
+
+	filePath := "../examples/data/test_delete_group_v2.csv"
+
+	var tests []TestDataWithDeleteGroupID
+
+	csvFile, err := os.Open(filePath)
+	if err != nil {
+		log.Fatalf("failed to open csv file: %v", err)
+	}
+	defer csvFile.Close()
+
+	csvReader := csv.NewReader(csvFile)
+	csvReader.FieldsPerRecord = -1
+	csvReader.Comma = '\t'
+	csvReader.ReuseRecord = true
+
+	i := 0
+
+	for {
+		record, err := csvReader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Errorf("failed to read csv file: %v", err)
+		}
+		id, err := strconv.Atoi(record[0])
+		if err != nil {
+			t.Errorf("failed to parse id: %v", err)
+		}
+		fileID, err := strconv.Atoi(record[1])
+		if err != nil {
+			t.Errorf("failed to parse file_id: %v", err)
+		}
+		groupID := record[2]
+		if err != nil {
+			t.Errorf("failed to parse group_id: %v", err)
+		}
+		routingID := record[3]
+		if len(record) < 6 {
+			t.Errorf("record does not contain enough fields: %v", record)
+		}
+		ext := record[4]
+		vector := record[5]
+		version, err := strconv.Atoi(record[6])
+		if err != nil {
+			t.Errorf("failed to parse version: %v", err)
+		}
+		tests = append(tests, TestDataWithDeleteGroupID{
+			ID:        id,
+			FileID:    fileID,
+			RoutingID: routingID,
+			GroupID:   groupID,
+			Ext:       ext,
+			Vector:    vector,
+			Version:   version,
+		})
+
+		if i == 45 {
+			log.Printf("shutting down the pg-server...")
+			cmd := exec.Command("/bin/sh", "-c", "source /workspace/phoenix/neon/pg_install/v12/greenplum_path.sh; source /workspace/phoenix/gpAux/gpdemo/gpdemo-env.sh;gpstop -ia;")
+			err = cmd.Run()
+			if err != nil {
+				t.Errorf("failed to kill pg-server: %v", err)
+			}
+			log.Printf("finish shut down the pg-server...")
+
+			// async delete
+			err = processor.DeleteGroupV2("110", "110")
+			if err != nil {
+				t.Errorf("failed to delete data: %v", err)
+			}
+
+			// async delete
+			err = processor.DeleteGroupV2("120", "120")
+			if err != nil {
+				t.Errorf("failed to delete data: %v", err)
+			}
+
+			// async delete
+			err = processor.DeleteGroupV2("130", "130")
+			if err != nil {
+				t.Errorf("failed to delete data: %v", err)
+			}
+
+			log.Printf("starting the pg-server...")
+			cmd = exec.Command("/bin/sh", "-c", "source /workspace/phoenix/neon/pg_install/v12/greenplum_path.sh; source /workspace/phoenix/gpAux/gpdemo/gpdemo-env.sh;gpstart -a;")
+			err = cmd.Run()
+			if err != nil {
+				t.Errorf("failed to start pg-server: %v", err)
+			}
+			log.Printf("finish starting the pg-server...")
+		}
+
+		err = processor.InsertV2(fmt.Sprintf("%d", fileID), routingID, tests)
+		if err != nil {
+			t.Errorf("failed to insert data: %v", err)
+		}
+
+		i++
+		tests = nil // clear the list, prepare for the next batch
+	}
+
+	time.Sleep(time.Duration(5) * time.Second)
+	processor.Flush()
+
+	mainCount, err := GetCountFromTestDataTableWithDeleteGroupV2(db)
+	if err != nil {
+		t.Errorf("failed to get count from test table: %v", err)
+	}
+	if mainCount != 20 {
+		t.Errorf("expected main table count to be %d, got %d", 20, mainCount)
+	}
+
+	// sync delete
+	processor.DeleteGroupV2("100", "100")
+
+	mainCount, err = GetCountFromTestDataTableWithDeleteGroupV2(db)
+	if err != nil {
+		t.Errorf("failed to get count from test table: %v", err)
+	}
+	if mainCount != 5 {
+		t.Errorf("expected main table count to be %d, got %d", 5, mainCount)
 	}
 }
