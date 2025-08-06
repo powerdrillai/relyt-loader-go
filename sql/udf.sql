@@ -30,6 +30,38 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION relyt_sys.delete_tables_with_group(
+    IN schema_name TEXT,
+    IN main_table TEXT,
+    IN p_group_id TEXT,
+    IN routing_id TEXT,
+    IN have_aux_table BOOLEAN DEFAULT TRUE,
+    OUT deleted_count BIGINT
+) RETURNS BIGINT AS $$
+DECLARE
+    main_count BIGINT := 0;
+    aux_count BIGINT := 0;
+    aux_table TEXT;
+BEGIN
+    aux_table := main_table || '_relyt_massive_group';
+    
+    -- delete main table
+    EXECUTE format('DELETE FROM %I.%I WHERE routing_id = %L AND group_id = %L', 
+                  schema_name, main_table, routing_id, p_group_id);
+    GET DIAGNOSTICS main_count = ROW_COUNT;
+    
+    -- delete aux table
+    IF have_aux_table THEN
+        EXECUTE format('DELETE FROM %I.%I WHERE routing_id = %L AND group_id = %L', 
+                      schema_name, aux_table, routing_id, p_group_id);
+        GET DIAGNOSTICS aux_count = ROW_COUNT;
+    END IF;
+    
+    -- return deleted total records
+    deleted_count := main_count + aux_count;
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION relyt_sys._check_and_build_query(
     schema_name TEXT,
     target_table_name TEXT,

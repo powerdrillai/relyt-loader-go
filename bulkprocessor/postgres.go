@@ -839,6 +839,25 @@ func (c *PostgreSQLClient) DeleteTablesWithCondition(ctx context.Context, schema
 	return result, nil
 }
 
+func (c *PostgreSQLClient) DeleteTablesWithGroup(ctx context.Context, schema, table, groupID, routingID string, haveAuxTable bool) (int, error) {
+	sqlStatement := `
+	SELECT relyt_sys.delete_tables_with_group(
+		$1,  -- schema_name
+		$2,  -- main_table
+		$3,  -- group_id
+		$4,  -- routing_id
+		$5  -- have_aux_table
+	)`
+
+	var result int
+	err := c.pool.QueryRow(ctx, sqlStatement, schema, table, groupID, routingID, haveAuxTable).Scan(&result)
+	if err != nil {
+		return 0, errors.Wrap(err, "failed to delete tables with group")
+	}
+
+	return result, nil
+}
+
 func (c *PostgreSQLClient) GetColumnsWithCondition(ctx context.Context, args ...interface{}) (pgx.Rows, string, error) {
 	getSQLStatement := `
 		SELECT * FROM relyt_sys.get_columns_sql_with_condition(

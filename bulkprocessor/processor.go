@@ -1364,6 +1364,79 @@ func (p *BulkProcessor) DeleteSyncV2(fileID, routingID string) error {
 	return nil
 }
 
+func (p *BulkProcessor) DeleteGroupV2(groupID, routingID string) error {
+
+	if p.config.PostgreSQL.Table == "" {
+		return ErrPostgreSQLTableRequired
+	}
+
+	p.mutex.RLock()
+	if p.isShutdown {
+		p.mutex.RUnlock()
+		return ErrProcessorClosed
+	}
+	p.mutex.RUnlock()
+
+	if p.config.AsyncDelete {
+		return p.DeleteAsyncGroupV2(groupID, routingID)
+	}
+
+	_, err := p.pgClient.DeleteTablesWithGroup(p.ctx, p.config.PostgreSQL.Schema, p.config.PostgreSQL.Table, groupID, routingID, p.hasRoutingTable)
+	if err != nil {
+		Debug("Failed to delete group %s with routingID %s sync: %v, will retry in async mode", groupID, routingID, err)
+		return p.DeleteAsyncGroupV2(groupID, routingID)
+	}
+
+	return nil
+}
+
+func (p *BulkProcessor) DeleteAsyncGroupV2(groupID, routingID string, offset ...int64) error {
+	if p.config.PostgreSQL.Table == "" {
+		return ErrPostgreSQLTableRequired
+	}
+
+	if !p.config.EnableDualBuffer {
+		return errors.New("dual buffer is not enabled")
+	}
+
+	p.mutex.RLock()
+	if p.isShutdown {
+		p.mutex.RUnlock()
+		return ErrProcessorClosed
+	}
+	p.mutex.RUnlock()
+
+	// start processor if not started
+	if !p.isStarted {
+		if err := p.Start(); err != nil {
+			return err
+		}
+	}
+
+	// Get offset value, default to 0 if not provided
+	var recordOffset int64 = 0
+	if len(offset) > 1 {
+		return errors.New("offset must be a single value")
+	} else if len(offset) == 1 {
+		recordOffset = offset[0]
+	}
+
+	// create delete record and write to queue
+	record := &Record{
+		Tag:       OperationDelete,
+		RoutingID: routingID,
+		GroupID:   groupID,
+		Values:    nil,
+		Offset:    recordOffset,
+	}
+
+	p.recordQueueV2 <- record
+
+	atomic.AddInt32(&p.recordsNum, 1)
+
+	return nil
+}
+
 func (p *BulkProcessor) DeleteV2(fileID, routingID string, offset ...int64) error {
 
 	if p.config.PostgreSQL.Table == "" {
@@ -1417,7 +1490,7 @@ func (p *BulkProcessor) SaveBufferToFileAndGenerateTask(currentBuffer *Buffer, t
 		currentBuffer.ID, currentBuffer.GetRecordCount())
 
 	// deduplicate records
-	deletedRecords, versionMap := currentBuffer.DeduplicateRecords(len(p.pkColumns) > 0, p.versionColIndex >= 0, p.config.DeleteBeforeInsert)
+	deletedRecords, deletedGroupRecords, versionMap := currentBuffer.DeduplicateRecords(len(p.pkColumns) > 0, p.versionColIndex >= 0, p.config.DeleteBeforeInsert)
 
 	columnNames := GetColumnNames(p.fields)
 
@@ -1436,7 +1509,7 @@ func (p *BulkProcessor) SaveBufferToFileAndGenerateTask(currentBuffer *Buffer, t
 	}
 
 	// create task and send to task queue
-	task := NewBufferTask(currentBuffer, deletedRecords, versionMap, taskImportStrategy)
+	task := NewBufferTask(currentBuffer, deletedRecords, deletedGroupRecords, versionMap, taskImportStrategy)
 	p.bufferTaskQueue <- task
 	p.lastFlushTime = time.Now()
 
@@ -1710,7 +1783,7 @@ func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask, timeo
 
 	deleteBeforeInsert := p.config.DeleteBeforeInsert
 
-	if task.RecordCount <= 0 && len(task.DeletedRecords) == 0 {
+	if task.RecordCount <= 0 && len(task.DeletedRecords) == 0 && len(task.DeletedGroupRecords) == 0 {
 		Debug("task %s has no records, skip processing", task.TaskId)
 		return nil
 	}
@@ -1818,6 +1891,28 @@ func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask, timeo
 				task.ImportStrategy = InsertOnConflict
 				return fmt.Errorf("INSERT INTO FROM EXTERNAL TABLE failed: %w", err)
 			}
+		}
+	}
+
+	// 4. delete group records
+	for _, deletedGroupRecord := range task.DeletedGroupRecords {
+		deleteSQL := `SELECT relyt_sys.delete_tables_with_group(
+							$1,  -- schema_name
+							$2,  -- main_table
+							$3,  -- group_id
+							$4,  -- routing_id
+							$5   -- have_aux_table
+						)`
+
+		_, err := tx.Exec(ctx, deleteSQL,
+			p.config.PostgreSQL.Schema,
+			p.config.PostgreSQL.Table,
+			deletedGroupRecord.groupID,
+			deletedGroupRecord.routingID,
+			p.hasRoutingTable,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to execute delete SQL for %s:%s: %w", deletedGroupRecord.groupID, deletedGroupRecord.routingID, err)
 		}
 	}
 
