@@ -2475,7 +2475,7 @@ func TestRealDelete(t *testing.T) {
 	}
 }
 
-// test case 2: test DeleteGroupV2
+// test case 2: test DeleteByGroupV2
 func TestDeleteGroupV2(t *testing.T) {
 	dbConfig := InitDatabaseConfig("127.0.0.1", 7000, "postgres", "", "postgres")
 	db, err := SetupDataBase(dbConfig)
@@ -2566,19 +2566,19 @@ func TestDeleteGroupV2(t *testing.T) {
 			log.Printf("finish shut down the pg-server...")
 
 			// async delete
-			err = processor.DeleteGroupV2("110", "110")
+			err = processor.DeleteByGroupV2("110", "110")
 			if err != nil {
 				t.Errorf("failed to delete data: %v", err)
 			}
 
 			// async delete
-			err = processor.DeleteGroupV2("120", "120")
+			err = processor.DeleteByGroupV2("120", "120")
 			if err != nil {
 				t.Errorf("failed to delete data: %v", err)
 			}
 
 			// async delete
-			err = processor.DeleteGroupV2("130", "130")
+			err = processor.DeleteByGroupV2("130", "130")
 			if err != nil {
 				t.Errorf("failed to delete data: %v", err)
 			}
@@ -2621,8 +2621,8 @@ func TestDeleteGroupV2(t *testing.T) {
 	}
 
 	// sync delete
-	processor.DeleteGroupV2("100", "100")
-	processor.DeleteGroupV2("140", "140")
+	processor.DeleteByGroupV2("100", "100")
+	processor.DeleteByGroupV2("140", "140")
 
 	mainCount, err = GetCountFromTestDataTableWithDeleteGroupV2(db, false)
 	if err != nil {

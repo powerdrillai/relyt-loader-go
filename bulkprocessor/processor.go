@@ -1364,7 +1364,7 @@ func (p *BulkProcessor) DeleteSyncV2(fileID, routingID string) error {
 	return nil
 }
 
-func (p *BulkProcessor) DeleteGroupV2(groupID, routingID string) error {
+func (p *BulkProcessor) DeleteByGroupV2(groupID, routingID string) error {
 
 	if p.config.PostgreSQL.Table == "" {
 		return ErrPostgreSQLTableRequired
