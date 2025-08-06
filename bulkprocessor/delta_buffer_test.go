@@ -406,7 +406,7 @@ func GetCountFromTestDataTableWithDeleteBeforeInsert(db *sql.DB) (int, error) {
 	return count, nil
 }
 
-func CreateTestDeleteGroupV2WithOutAux(db *sql.DB) error {
+func CreateTestDeleteGroupV2WithAux(db *sql.DB) error {
 	query := `
 	CREATE TABLE IF NOT EXISTS test_routing_data_async_delete_group (
 		id bigint NOT NULL PRIMARY KEY,
@@ -417,6 +417,25 @@ func CreateTestDeleteGroupV2WithOutAux(db *sql.DB) error {
 		vector vecf16(3) NOT NULL,
 		version bigint NOT NULL
 	) using heap;
+
+	CREATE TABLE IF NOT EXISTS test_routing_data_async_delete_group_relyt_massive_group (
+		id bigint NOT NULL PRIMARY KEY,
+		fileid bigint NOT NULL,
+		routing_id bigint NOT NULL,
+		group_id text NOT NULL,
+		ext text NOT NULL,
+		vector vecf16(3) NOT NULL,
+		version bigint NOT NULL
+	) using heap;
+
+	CREATE TABLE IF NOT EXISTS relyt_sys.test_routing_data_async_delete_group_relyt_routing (
+		routing_id text PRIMARY KEY,
+		store_table_name text NOT NULL
+	) using heap DISTRIBUTED NONE;
+
+	INSERT INTO relyt_sys.test_routing_data_async_delete_group_relyt_routing VALUES (100, 'test_routing_data_async_delete_group_relyt_routing');
+	INSERT INTO relyt_sys.test_routing_data_async_delete_group_relyt_routing VALUES (110, 'test_routing_data_async_delete_group_relyt_routing');
+	INSERT INTO relyt_sys.test_routing_data_async_delete_group_relyt_routing VALUES (120, 'test_routing_data_async_delete_group_relyt_routing');
 	`
 	_, err := db.Exec(query)
 	if err != nil {
@@ -426,7 +445,7 @@ func CreateTestDeleteGroupV2WithOutAux(db *sql.DB) error {
 	return nil
 }
 
-func DropTestDeleteGroupV2WithOutAux(db *sql.DB) error {
+func DropTestDeleteGroupV2WithAux(db *sql.DB) error {
 	// This function is a placeholder for creating the test table in PostgreSQL.
 	// You can implement the logic to create the necessary table structure here.
 	// For example, you might use a SQL command like:
@@ -434,6 +453,8 @@ func DropTestDeleteGroupV2WithOutAux(db *sql.DB) error {
 	log.Println("Dropping test table with auxin PostgreSQL...")
 	query := `
 	DROP TABLE IF EXISTS test_routing_data_async_delete_group;
+	DROP TABLE IF EXISTS test_routing_data_async_delete_group_relyt_massive_group;
+	DROP TABLE IF EXISTS relyt_sys.test_routing_data_async_delete_group_relyt_routing;
 	`
 	_, err := db.Exec(query)
 	if err != nil {
@@ -443,9 +464,12 @@ func DropTestDeleteGroupV2WithOutAux(db *sql.DB) error {
 	return nil
 }
 
-func GetCountFromTestDataTableWithDeleteGroupV2(db *sql.DB) (int, error) {
+func GetCountFromTestDataTableWithDeleteGroupV2(db *sql.DB, auxtable bool) (int, error) {
 	log.Println("Counting records in test tables with delete group...")
 	table := "test_routing_data_async_delete_group"
+	if auxtable {
+		table = "test_routing_data_async_delete_group_relyt_massive_group"
+	}
 	query := fmt.Sprintf(`SELECT COUNT(*) FROM %s`, table)
 
 	var count int
@@ -2460,13 +2484,13 @@ func TestDeleteGroupV2(t *testing.T) {
 	}
 	defer db.Close()
 
-	err = DropTestDeleteGroupV2WithOutAux(db)
+	err = DropTestDeleteGroupV2WithAux(db)
 	if err != nil {
 		log.Fatalf("failed to drop test table: %v", err)
 		return
 	}
 
-	err = CreateTestDeleteGroupV2WithOutAux(db)
+	err = CreateTestDeleteGroupV2WithAux(db)
 	if err != nil {
 		log.Fatalf("failed to create test table: %v", err)
 		return
@@ -2580,22 +2604,39 @@ func TestDeleteGroupV2(t *testing.T) {
 	time.Sleep(time.Duration(5) * time.Second)
 	processor.Flush()
 
-	mainCount, err := GetCountFromTestDataTableWithDeleteGroupV2(db)
+	mainCount, err := GetCountFromTestDataTableWithDeleteGroupV2(db, false)
 	if err != nil {
 		t.Errorf("failed to get count from test table: %v", err)
 	}
-	if mainCount != 20 {
+	if mainCount != 5 {
+		t.Errorf("expected main table count to be %d, got %d", 20, mainCount)
+	}
+
+	mainCount, err = GetCountFromTestDataTableWithDeleteGroupV2(db, true)
+	if err != nil {
+		t.Errorf("failed to get count from test table: %v", err)
+	}
+	if mainCount != 15 {
 		t.Errorf("expected main table count to be %d, got %d", 20, mainCount)
 	}
 
 	// sync delete
 	processor.DeleteGroupV2("100", "100")
+	processor.DeleteGroupV2("140", "140")
 
-	mainCount, err = GetCountFromTestDataTableWithDeleteGroupV2(db)
+	mainCount, err = GetCountFromTestDataTableWithDeleteGroupV2(db, false)
 	if err != nil {
 		t.Errorf("failed to get count from test table: %v", err)
 	}
-	if mainCount != 5 {
+	if mainCount != 0 {
+		t.Errorf("expected main table count to be %d, got %d", 5, mainCount)
+	}
+
+	mainCount, err = GetCountFromTestDataTableWithDeleteGroupV2(db, true)
+	if err != nil {
+		t.Errorf("failed to get count from test table: %v", err)
+	}
+	if mainCount != 0 {
 		t.Errorf("expected main table count to be %d, got %d", 5, mainCount)
 	}
 }
