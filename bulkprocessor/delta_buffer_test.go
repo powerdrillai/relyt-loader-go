@@ -411,8 +411,8 @@ func CreateTestDeleteGroupV2WithAux(db *sql.DB) error {
 	CREATE TABLE IF NOT EXISTS test_routing_data_async_delete_group (
 		id bigint NOT NULL PRIMARY KEY,
 		fileid bigint NOT NULL,
-		routing_id bigint NOT NULL,
-		group_id text NOT NULL,
+		routing_id text NOT NULL,
+		group_id bigint NOT NULL,
 		ext text NOT NULL,
 		vector vecf16(3) NOT NULL,
 		version bigint NOT NULL
@@ -421,8 +421,8 @@ func CreateTestDeleteGroupV2WithAux(db *sql.DB) error {
 	CREATE TABLE IF NOT EXISTS test_routing_data_async_delete_group_relyt_massive_group (
 		id bigint NOT NULL PRIMARY KEY,
 		fileid bigint NOT NULL,
-		routing_id bigint NOT NULL,
-		group_id text NOT NULL,
+		routing_id text NOT NULL,
+		group_id bigint NOT NULL,
 		ext text NOT NULL,
 		vector vecf16(3) NOT NULL,
 		version bigint NOT NULL

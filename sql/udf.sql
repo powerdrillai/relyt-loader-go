@@ -320,7 +320,7 @@ BEGIN
         RETURN NEXT rec;
     END LOOP;
 
-    RAISE LOG 'get_columns_with_condition_exec: result_sql: %, get_sql_time: % ms, exec time: % ms', query_sql, EXTRACT(EPOCH FROM (get_sql_time - start_get_sql_time)) * 1000, EXTRACT(EPOCH FROM (clock_timestamp() - start_exec_time)) * 1000;
+    RAISE LOG 'get_columns_with_condition_exec: get_sql_time: % ms, exec time: % ms', EXTRACT(EPOCH FROM (get_sql_time - start_get_sql_time)) * 1000, EXTRACT(EPOCH FROM (clock_timestamp() - start_exec_time)) * 1000;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -339,11 +339,14 @@ CREATE OR REPLACE FUNCTION relyt_sys.get_columns_sql_with_condition(
 DECLARE
     query_sql TEXT;
     result_json TEXT;
+    start_time TIMESTAMP;
 BEGIN
     -- 检查group_by和having_con参数
     IF (group_by IS NOT NULL AND group_by != '') OR (having_con IS NOT NULL AND having_con != '') THEN
         RAISE EXCEPTION 'group by and having parameters are not supported now';
     END IF;
+
+    start_time := clock_timestamp();
 
     -- 使用_check_and_build_query函数生成查询
     SELECT relyt_sys._check_and_build_query(
@@ -361,6 +364,8 @@ BEGIN
     
     -- 从JSON结果中提取query字段
     query_sql := (result_json::json->>'query');
+
+    RAISE LOG 'get_columns_sql_with_condition_exec: query_sql: %, exec time: % ms', query_sql, EXTRACT(EPOCH FROM (clock_timestamp() - start_time)) * 1000;
     
     RETURN query_sql;
 END;
