@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -79,6 +80,7 @@ type BulkProcessor struct {
 		lastCheckTime   time.Time
 		hasRoutingTable bool
 	}
+	routingTableCacheMutex sync.RWMutex
 }
 
 // SearchResult
@@ -212,6 +214,7 @@ func New(config Config) (*BulkProcessor, error) {
 			lastCheckTime   time.Time
 			hasRoutingTable bool
 		}),
+		routingTableCacheMutex: sync.RWMutex{},
 	}, nil
 }
 
@@ -1721,7 +1724,12 @@ func (p *BulkProcessor) processBufferTask(task *BufferTask, workerID int, feedba
 			}
 
 			if shouldRetry {
-				time.Sleep(time.Duration(p.config.ImportErrorSleepTime) * time.Second)
+				randomOffset := rand.Intn(9) - 4 // 生成 -4 到 4 的随机数
+				sleepTime := p.config.ImportErrorSleepTime + randomOffset
+				if sleepTime < 0 {
+					sleepTime = 1
+				}
+				time.Sleep(time.Duration(sleepTime) * time.Second)
 				continue
 			}
 
@@ -2018,20 +2026,23 @@ func (p *BulkProcessor) CheckTableHasRoutingTable(tableName string) (bool, error
 	tableName = strings.ToLower(tableName)
 
 	// check cache first, if cache is not expired, return the cached result
+	p.routingTableCacheMutex.RLock()
 	if ret, exists := p.routingTableCache[tableName]; exists {
 		needCheck = time.Since(ret.lastCheckTime) > 5*time.Minute
 		hasRoutingTable = ret.hasRoutingTable
 	}
+	p.routingTableCacheMutex.RUnlock()
 
 	if needCheck {
 		var err error
 		routingTableName := fmt.Sprintf("%s%s", tableName, routingTableSuffix)
-		log.Printf("CheckTableHasRoutingTable: %s, routingTableName: %s", tableName, routingTableName)
+		Log("CheckTableHasRoutingTable: %s, routingTableName: %s", tableName, routingTableName)
 		hasRoutingTable, err = p.pgClient.HasRoutingTable(p.ctx, routingTableName)
 		if err != nil {
 			return false, errors.Wrap(err, "failed to check if routing table exists")
 		}
 
+		p.routingTableCacheMutex.Lock()
 		p.routingTableCache[tableName] = struct {
 			lastCheckTime   time.Time
 			hasRoutingTable bool
@@ -2039,6 +2050,7 @@ func (p *BulkProcessor) CheckTableHasRoutingTable(tableName string) (bool, error
 			lastCheckTime:   time.Now(),
 			hasRoutingTable: hasRoutingTable,
 		}
+		p.routingTableCacheMutex.Unlock()
 	}
 
 	return hasRoutingTable, nil
