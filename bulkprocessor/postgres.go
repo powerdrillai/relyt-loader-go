@@ -1274,3 +1274,39 @@ func (c *PostgreSQLClient) DeleteOutdatedFiles(ctx context.Context, tx pgx.Tx, t
 
 	return nil
 }
+
+func (c *PostgreSQLClient) UpdateByQueryV2(ctx context.Context, schemaName, tableName, condition string,
+	updateFields map[string]interface{}, haveAuxTable bool) (int64, string, error) {
+
+	// 将updateFields转换为JSONB
+	updateFieldsJSON, err := json.Marshal(updateFields)
+	if err != nil {
+		return 0, "", errors.Wrap(err, "failed to marshal update fields")
+	}
+
+	getSQLStatement := `
+		SELECT relyt_sys.generate_update_by_query_sql(
+			$1,  -- schema_name
+			$2,  -- target_table_name
+			$3,  -- update_condition
+			$4,  -- update_fields
+			$5   -- have_aux_table
+		)`
+
+	sqlRow := c.pool.QueryRow(ctx, getSQLStatement,
+		schemaName, tableName, condition, updateFieldsJSON, haveAuxTable)
+	var finalSQL string
+	err = sqlRow.Scan(&finalSQL)
+	if err != nil {
+		return 0, "", errors.Wrap(err, "failed to generate update SQL")
+	}
+
+	var updatedCount int64
+	result, err := c.pool.Exec(ctx, finalSQL)
+	if err != nil {
+		return 0, finalSQL, errors.Wrap(err, "failed to execute update SQL")
+	}
+	updatedCount = result.RowsAffected()
+
+	return updatedCount, finalSQL, nil
+}

@@ -370,3 +370,65 @@ BEGIN
     RETURN query_sql;
 END;
 $$ LANGUAGE plpgsql;
+
+
+CREATE OR REPLACE FUNCTION relyt_sys.generate_update_by_query_sql(
+    IN schema_name TEXT,
+    IN target_table_name TEXT,
+    IN update_condition TEXT,
+    IN update_fields JSONB,
+    IN have_aux_table BOOLEAN DEFAULT TRUE,
+    OUT generated_sql TEXT
+) RETURNS TEXT AS $$
+DECLARE
+    aux_table TEXT;
+    update_set_parts TEXT[] := '{}';
+    update_set_clause TEXT;
+    main_sql TEXT;
+    aux_sql TEXT;
+    field_name TEXT;
+    field_value TEXT;
+BEGIN
+    -- 构建更新字段的SET子句
+    FOR field_name, field_value IN SELECT key, value FROM jsonb_each_text(update_fields)
+    LOOP
+        -- 检查值是否为函数调用或数组语法
+        IF field_value LIKE '(%)' OR field_value LIKE 'ARRAY[%]' OR field_value LIKE '[%]' THEN
+            -- 函数调用或数组语法，简单字符串替换(不安全)
+            update_set_parts := array_append(update_set_parts, format('%I = %s', field_name, field_value));
+        ELSE
+            -- 普通字符串值，字面量引用（安全）
+            update_set_parts := array_append(update_set_parts, format('%I = %L', field_name, field_value));
+        END IF;
+    END LOOP;
+    
+    IF array_length(update_set_parts, 1) = 0 THEN
+        RAISE EXCEPTION 'No valid update fields specified';
+    END IF;
+
+    aux_table := target_table_name || '_relyt_massive_group';
+    
+    update_set_clause := array_to_string(update_set_parts, ', ');
+
+    IF update_condition IS NULL OR trim(update_condition) = '' THEN
+        main_sql := format('UPDATE %I.%I SET %s', 
+                          schema_name, target_table_name, update_set_clause);
+        aux_sql := format('UPDATE %I.%I SET %s', 
+                          schema_name, aux_table, update_set_clause);
+    ELSE
+        main_sql := format('UPDATE %I.%I SET %s WHERE %s', 
+                          schema_name, target_table_name, update_set_clause, update_condition);
+        aux_sql := format('UPDATE %I.%I SET %s WHERE %s', 
+                          schema_name, aux_table, update_set_clause, update_condition);
+    END IF;
+
+    if have_aux_table then
+        generated_sql := main_sql || '; ' || aux_sql;
+    else
+        generated_sql := main_sql;
+    end if;
+
+    RAISE LOG 'generate_update_by_query_sql: generated_sql: %', generated_sql;
+
+END;
+$$ LANGUAGE plpgsql;

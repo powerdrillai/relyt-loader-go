@@ -1,3 +1,7 @@
+2025-09-05 v1.1.2
+main change:
+1. support UpdateByQueryWithContextV2
+
 2025-08-12 v1.1.1
 main change:
 1. bug fix for CheckTableHasRoutingTable()
