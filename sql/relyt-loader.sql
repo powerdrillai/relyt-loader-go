@@ -71,6 +71,15 @@ CREATE TABLE IF NOT EXISTS relyt_sys.relyt_loader_delta_checkpoint (
 ) using heap;
 GRANT SELECT,INSERT ON relyt_sys.relyt_loader_delta_checkpoint TO public;
 
+-- buffer_max_records and insert_into_batch_size per table
+CREATE TABLE IF NOT EXISTS relyt_sys.relyt_loader_table_config (
+    table_name TEXT PRIMARY KEY,
+    buffer_max_records INT,
+    insert_into_batch_size INT,
+	tuples_pre_partition INT
+) using heap;
+GRANT SELECT,INSERT ON relyt_sys.relyt_loader_table_config TO public;
+
 -- create a table to store the routing table
 --
 -- CREATE TABLE IF NOT EXISTS relyt_sys.XXXX_relyt_routing (

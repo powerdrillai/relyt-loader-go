@@ -2,6 +2,7 @@ package bulkprocessor
 
 import (
 	"context"
+	"database/sql"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
@@ -206,6 +207,13 @@ func (c *PostgreSQLClient) UpdateCheckpointStatus(ctx context.Context, processId
 }
 
 // GetLoadConfigFromDB retrieves loader configuration from the database
+// TableConfig represents table-specific configuration
+type TableConfig struct {
+	BufferMaxRecords    *int `json:"buffer_max_records"`
+	InsertIntoBatchSize *int `json:"insert_into_batch_size"`
+	TuplesPrePartition  *int `json:"tuples_pre_partition"`
+}
+
 func (c *PostgreSQLClient) GetLoadConfigFromDB(ctx context.Context, config *Config) (*S3Config, error) {
 	var s3Config S3Config
 	var rawSkipServerErrorInfos string
@@ -271,6 +279,22 @@ func (c *PostgreSQLClient) GetLoadConfigFromDB(ctx context.Context, config *Conf
 		return nil, errors.Wrap(err, "failed to retrieve S3 configuration from database")
 	}
 
+	if config.PostgreSQL.Table != "" {
+		tableConfig, err := c.GetTableConfig(ctx, config.PostgreSQL.Table)
+		if err == nil {
+			if tableConfig.BufferMaxRecords != nil {
+				config.BufferMaxRecords = *tableConfig.BufferMaxRecords
+			}
+			if tableConfig.InsertIntoBatchSize != nil {
+				config.InsertIntoBatchSize = *tableConfig.InsertIntoBatchSize
+			}
+			if tableConfig.TuplesPrePartition != nil {
+				config.TuplesPrePartition = *tableConfig.TuplesPrePartition
+			}
+		}
+	}
+
+	// 在表级别配置覆盖后验证 TuplesPrePartition
 	if config.TuplesPrePartition < 0 && config.ImportStrategy == CopyFromS3 {
 		log.Printf("TuplesPrePartition is less than 0, set to 5000")
 		config.TuplesPrePartition = 5000
@@ -279,8 +303,53 @@ func (c *PostgreSQLClient) GetLoadConfigFromDB(ctx context.Context, config *Conf
 	return &s3Config, nil
 }
 
+// GetTableConfig retrieves table-specific configuration from relyt_loader_table_config
+func (c *PostgreSQLClient) GetTableConfig(ctx context.Context, tableName string) (*TableConfig, error) {
+	tableConfig := &TableConfig{}
+
+	sqlStatement := `
+		SELECT 
+			buffer_max_records,
+			insert_into_batch_size,
+			tuples_pre_partition
+		FROM relyt_sys.relyt_loader_table_config
+		WHERE table_name = $1
+	`
+
+	row := c.pool.QueryRow(ctx, sqlStatement, tableName)
+
+	var bufferMaxRecords, insertIntoBatchSize, tuplesPrePartition sql.NullInt32
+
+	err := row.Scan(&bufferMaxRecords, &insertIntoBatchSize, &tuplesPrePartition)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return tableConfig, nil
+		}
+		return nil, errors.Wrap(err, "failed to get table-specific configuration")
+	}
+
+	if bufferMaxRecords.Valid {
+		val := int(bufferMaxRecords.Int32)
+		tableConfig.BufferMaxRecords = &val
+	}
+
+	if insertIntoBatchSize.Valid {
+		val := int(insertIntoBatchSize.Int32)
+		tableConfig.InsertIntoBatchSize = &val
+	}
+
+	if tuplesPrePartition.Valid {
+		val := int(tuplesPrePartition.Int32)
+		tableConfig.TuplesPrePartition = &val
+	}
+
+	return tableConfig, nil
+}
+
 func (c *PostgreSQLClient) UpdateLoadConfig(ctx context.Context, config *Config) error {
 	var rawSkipServerErrorInfos string
+	var temConfig Config
+
 	sqlStatement := `
 		SELECT
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'import_timeout' THEN CONFIG_VALUE END)::INT, 1800) as import_timeout,
@@ -301,31 +370,61 @@ func (c *PostgreSQLClient) UpdateLoadConfig(ctx context.Context, config *Config)
 
 	row := c.pool.QueryRow(ctx, sqlStatement)
 	err := row.Scan(
-		&config.ImportTimeout,
-		&config.ImportErrorSleepTime,
-		&config.BufferMaxRecords,
-		&config.TuplesPrePartition,
-		&config.ImportStrategy,
-		&config.MaxConcurrentWorkers,
-		&config.InsertIntoBatchSize,
-		&config.DeleteBeforeInsert,
-		&config.UpdateOnConflict,
-		&config.FileWriteTimeout,
-		&config.AsyncDelete,
+		&temConfig.ImportTimeout,
+		&temConfig.ImportErrorSleepTime,
+		&temConfig.BufferMaxRecords,
+		&temConfig.TuplesPrePartition,
+		&temConfig.ImportStrategy,
+		&temConfig.MaxConcurrentWorkers,
+		&temConfig.InsertIntoBatchSize,
+		&temConfig.DeleteBeforeInsert,
+		&temConfig.UpdateOnConflict,
+		&temConfig.FileWriteTimeout,
+		&temConfig.AsyncDelete,
 		&rawSkipServerErrorInfos,
-		&config.TaskTimeout,
+		&temConfig.TaskTimeout,
 	)
 
 	if err != nil {
 		return errors.Wrap(err, "failed to update load config")
 	}
 
+	temConfig.SkipServerErrorInfos = strings.Split(rawSkipServerErrorInfos, "|")
+
+	if config.PostgreSQL.Table != "" {
+		tableConfig, err := c.GetTableConfig(ctx, config.PostgreSQL.Table)
+		if err == nil {
+			if tableConfig.BufferMaxRecords != nil {
+				temConfig.BufferMaxRecords = *tableConfig.BufferMaxRecords
+			}
+			if tableConfig.InsertIntoBatchSize != nil {
+				temConfig.InsertIntoBatchSize = *tableConfig.InsertIntoBatchSize
+			}
+			if tableConfig.TuplesPrePartition != nil {
+				temConfig.TuplesPrePartition = *tableConfig.TuplesPrePartition
+			}
+		}
+	}
+
+	config.ImportTimeout = temConfig.ImportTimeout
+	config.ImportErrorSleepTime = temConfig.ImportErrorSleepTime
+	config.BufferMaxRecords = temConfig.BufferMaxRecords
+	config.TuplesPrePartition = temConfig.TuplesPrePartition
+	config.ImportStrategy = temConfig.ImportStrategy
+	config.MaxConcurrentWorkers = temConfig.MaxConcurrentWorkers
+	config.InsertIntoBatchSize = temConfig.InsertIntoBatchSize
+	config.DeleteBeforeInsert = temConfig.DeleteBeforeInsert
+	config.UpdateOnConflict = temConfig.UpdateOnConflict
+	config.FileWriteTimeout = temConfig.FileWriteTimeout
+	config.AsyncDelete = temConfig.AsyncDelete
+	config.TaskTimeout = temConfig.TaskTimeout
+	config.SkipServerErrorInfos = temConfig.SkipServerErrorInfos
+
+	// 在表级别配置覆盖后验证 TuplesPrePartition
 	if config.TuplesPrePartition < 0 && config.ImportStrategy == CopyFromS3 {
 		log.Printf("TuplesPrePartition is less than 0, set to 5000")
 		config.TuplesPrePartition = 5000
 	}
-
-	config.SkipServerErrorInfos = strings.Split(rawSkipServerErrorInfos, "|")
 
 	return nil
 }

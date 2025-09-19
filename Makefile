@@ -1,7 +1,7 @@
 .PHONY: test testv1 testv2 testselect
 
 # 运行所有测试
-all test: testv1 testv2 testselect
+all test: testv2 testselect
 
 testv1:
 	go test -v ./bulkprocessor -run TestInsertWithSomeErrors

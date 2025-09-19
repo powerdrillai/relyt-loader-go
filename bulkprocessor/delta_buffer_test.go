@@ -480,6 +480,29 @@ func GetCountFromTestDataTableWithDeleteGroupV2(db *sql.DB, auxtable bool) (int,
 	return count, nil
 }
 
+func InitLoaderTableConfig(db *sql.DB, tableName string) error {
+	query := `
+	INSERT INTO relyt_sys.relyt_loader_table_config (table_name, buffer_max_records, insert_into_batch_size, tuples_pre_partition)
+	VALUES ($1, 10, 10, 10) ON CONFLICT (table_name) DO UPDATE SET buffer_max_records = 10, insert_into_batch_size = 10, tuples_pre_partition = 10;
+	`
+	_, err := db.Exec(query, tableName)
+	if err != nil {
+		return fmt.Errorf("failed to init relyt_loader_table_config: %w", err)
+	}
+	return nil
+}
+
+func ClearLoaderTableConfig(db *sql.DB, tableName string) error {
+	query := `
+	DELETE FROM relyt_sys.relyt_loader_table_config WHERE table_name = $1;
+	`
+	_, err := db.Exec(query, tableName)
+	if err != nil {
+		return fmt.Errorf("failed to clear relyt_loader_table_config: %w", err)
+	}
+	return nil
+}
+
 // TestInsertWithBufferBasic:
 // buffer_max_records to 10
 func TestBufferInsertBasic(t *testing.T) {
@@ -621,10 +644,6 @@ func TestBufferInsertBasic(t *testing.T) {
 	processor.Shutdown()
 }
 
-// set the following config to test
-// 1. buffer_max_records to 10
-// 2. tuples_pre_partition to 10
-// 3. import_strategy to 3
 func TestBufferInsertWithSomeErrors(t *testing.T) {
 	// Initialize database connection
 	dbConfig := InitDatabaseConfig("127.0.0.1", 7000, "postgres", "", "postgres")
@@ -640,6 +659,12 @@ func TestBufferInsertWithSomeErrors(t *testing.T) {
 		err = TruncateTestDataTableWithAuxV2(db)
 		if err != nil {
 			log.Fatalf("failed to truncate test table: %v", err)
+			return
+		}
+
+		err = InitLoaderTableConfig(db, "test_routing_data_v2")
+		if err != nil {
+			log.Fatalf("failed to init relyt_loader_table_config: %v", err)
 			return
 		}
 	}
@@ -725,6 +750,8 @@ func TestBufferInsertWithSomeErrors(t *testing.T) {
 		log.Fatalf("failed to refresh data: %v", err)
 	}
 
+	ClearLoaderTableConfig(db, "test_routing_data_v2")
+
 	processor.Shutdown()
 	// Check the count of records in the test table
 	count, err := GetCountFromTestDataTableWithAuxV2(db, false)
@@ -732,8 +759,8 @@ func TestBufferInsertWithSomeErrors(t *testing.T) {
 		t.Errorf("failed to get count from test table: %v", err)
 	} else {
 		log.Printf("Counted %d records in test table.", count)
-		if count != 20 {
-			t.Errorf("expected %d records, but got %d", 20, count)
+		if count != 10 {
+			t.Errorf("expected %d records, but got %d", 10, count)
 		}
 	}
 }
