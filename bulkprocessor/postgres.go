@@ -209,9 +209,10 @@ func (c *PostgreSQLClient) UpdateCheckpointStatus(ctx context.Context, processId
 // GetLoadConfigFromDB retrieves loader configuration from the database
 // TableConfig represents table-specific configuration
 type TableConfig struct {
-	BufferMaxRecords    *int `json:"buffer_max_records"`
-	InsertIntoBatchSize *int `json:"insert_into_batch_size"`
-	TuplesPrePartition  *int `json:"tuples_pre_partition"`
+	BufferMaxRecords    *int  `json:"buffer_max_records"`
+	InsertIntoBatchSize *int  `json:"insert_into_batch_size"`
+	TuplesPrePartition  *int  `json:"tuples_pre_partition"`
+	UpdateOnConflict    *bool `json:"update_on_conflict"`
 }
 
 func (c *PostgreSQLClient) GetLoadConfigFromDB(ctx context.Context, config *Config) (*S3Config, error) {
@@ -291,6 +292,9 @@ func (c *PostgreSQLClient) GetLoadConfigFromDB(ctx context.Context, config *Conf
 			if tableConfig.TuplesPrePartition != nil {
 				config.TuplesPrePartition = *tableConfig.TuplesPrePartition
 			}
+			if tableConfig.UpdateOnConflict != nil {
+				config.UpdateOnConflict = *tableConfig.UpdateOnConflict
+			}
 		}
 	}
 
@@ -311,7 +315,8 @@ func (c *PostgreSQLClient) GetTableConfig(ctx context.Context, tableName string)
 		SELECT 
 			buffer_max_records,
 			insert_into_batch_size,
-			tuples_pre_partition
+			tuples_pre_partition,
+			update_on_conflict
 		FROM relyt_sys.relyt_loader_table_config
 		WHERE table_name = $1
 	`
@@ -319,8 +324,9 @@ func (c *PostgreSQLClient) GetTableConfig(ctx context.Context, tableName string)
 	row := c.pool.QueryRow(ctx, sqlStatement, tableName)
 
 	var bufferMaxRecords, insertIntoBatchSize, tuplesPrePartition sql.NullInt32
+	var updateOnConflict sql.NullBool
 
-	err := row.Scan(&bufferMaxRecords, &insertIntoBatchSize, &tuplesPrePartition)
+	err := row.Scan(&bufferMaxRecords, &insertIntoBatchSize, &tuplesPrePartition, &updateOnConflict)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return tableConfig, nil
@@ -341,6 +347,11 @@ func (c *PostgreSQLClient) GetTableConfig(ctx context.Context, tableName string)
 	if tuplesPrePartition.Valid {
 		val := int(tuplesPrePartition.Int32)
 		tableConfig.TuplesPrePartition = &val
+	}
+
+	if updateOnConflict.Valid {
+		val := updateOnConflict.Bool
+		tableConfig.UpdateOnConflict = &val
 	}
 
 	return tableConfig, nil
@@ -402,6 +413,9 @@ func (c *PostgreSQLClient) UpdateLoadConfig(ctx context.Context, config *Config)
 			}
 			if tableConfig.TuplesPrePartition != nil {
 				temConfig.TuplesPrePartition = *tableConfig.TuplesPrePartition
+			}
+			if tableConfig.UpdateOnConflict != nil {
+				temConfig.UpdateOnConflict = *tableConfig.UpdateOnConflict
 			}
 		}
 	}
