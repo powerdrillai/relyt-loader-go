@@ -321,7 +321,7 @@ func (c *PostgreSQLClient) GetTableConfig(ctx context.Context, tableName string)
 		WHERE table_name = $1
 	`
 
-	row := c.pool.QueryRow(ctx, sqlStatement, tableName)
+	row := c.pool.QueryRow(ctx, sqlStatement, strings.ToLower(tableName))
 
 	var bufferMaxRecords, insertIntoBatchSize, tuplesPrePartition sql.NullInt32
 	var updateOnConflict sql.NullBool
