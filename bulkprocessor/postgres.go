@@ -213,6 +213,8 @@ type TableConfig struct {
 	InsertIntoBatchSize *int  `json:"insert_into_batch_size"`
 	TuplesPrePartition  *int  `json:"tuples_pre_partition"`
 	UpdateOnConflict    *bool `json:"update_on_conflict"`
+	FileWriteTimeout    *int  `json:"file_write_timeout"`
+	RetrySleepMaxTime   *int  `json:"retry_sleep_max_time"`
 }
 
 func (c *PostgreSQLClient) GetLoadConfigFromDB(ctx context.Context, config *Config) (*S3Config, error) {
@@ -243,7 +245,8 @@ func (c *PostgreSQLClient) GetLoadConfigFromDB(ctx context.Context, config *Conf
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'file_write_timeout' THEN CONFIG_VALUE END)::INT, 3) as file_write_timeout,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'async_delete' THEN CONFIG_VALUE END)::BOOLEAN, false) as async_delete,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'skip_server_error_infos' THEN CONFIG_VALUE END)::TEXT, 'Bad literal|Dimensions|duplicate key value|invalid byte sequence') as skip_server_error_infos,
-		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'task_timeout' THEN CONFIG_VALUE END)::INT, 120) as task_timeout
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'task_timeout' THEN CONFIG_VALUE END)::INT, 120) as task_timeout,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'retry_sleep_max_time' THEN CONFIG_VALUE END)::INT, 10) as retry_sleep_max_time
 	FROM relyt_sys.SDK_LOADER_CONFIG
 	`
 
@@ -272,6 +275,7 @@ func (c *PostgreSQLClient) GetLoadConfigFromDB(ctx context.Context, config *Conf
 		&config.AsyncDelete,
 		&rawSkipServerErrorInfos,
 		&config.TaskTimeout,
+		&config.RetrySleepMaxTime,
 	)
 
 	config.SkipServerErrorInfos = strings.Split(rawSkipServerErrorInfos, "|")
@@ -295,6 +299,12 @@ func (c *PostgreSQLClient) GetLoadConfigFromDB(ctx context.Context, config *Conf
 			if tableConfig.UpdateOnConflict != nil {
 				config.UpdateOnConflict = *tableConfig.UpdateOnConflict
 			}
+			if tableConfig.FileWriteTimeout != nil {
+				config.FileWriteTimeout = *tableConfig.FileWriteTimeout
+			}
+			if tableConfig.RetrySleepMaxTime != nil {
+				config.RetrySleepMaxTime = *tableConfig.RetrySleepMaxTime
+			}
 		}
 	}
 
@@ -316,7 +326,9 @@ func (c *PostgreSQLClient) GetTableConfig(ctx context.Context, tableName string)
 			buffer_max_records,
 			insert_into_batch_size,
 			tuples_pre_partition,
-			update_on_conflict
+			update_on_conflict,
+			file_write_timeout,
+			retry_sleep_max_time
 		FROM relyt_sys.relyt_loader_table_config
 		WHERE table_name = $1
 	`
@@ -325,8 +337,9 @@ func (c *PostgreSQLClient) GetTableConfig(ctx context.Context, tableName string)
 
 	var bufferMaxRecords, insertIntoBatchSize, tuplesPrePartition sql.NullInt32
 	var updateOnConflict sql.NullBool
+	var fileWriteTimeout, retrySleepMaxTime sql.NullInt32
 
-	err := row.Scan(&bufferMaxRecords, &insertIntoBatchSize, &tuplesPrePartition, &updateOnConflict)
+	err := row.Scan(&bufferMaxRecords, &insertIntoBatchSize, &tuplesPrePartition, &updateOnConflict, &fileWriteTimeout, &retrySleepMaxTime)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return tableConfig, nil
@@ -354,6 +367,16 @@ func (c *PostgreSQLClient) GetTableConfig(ctx context.Context, tableName string)
 		tableConfig.UpdateOnConflict = &val
 	}
 
+	if fileWriteTimeout.Valid {
+		val := int(fileWriteTimeout.Int32)
+		tableConfig.FileWriteTimeout = &val
+	}
+
+	if retrySleepMaxTime.Valid {
+		val := int(retrySleepMaxTime.Int32)
+		tableConfig.RetrySleepMaxTime = &val
+	}
+
 	return tableConfig, nil
 }
 
@@ -375,7 +398,8 @@ func (c *PostgreSQLClient) UpdateLoadConfig(ctx context.Context, config *Config)
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'file_write_timeout' THEN CONFIG_VALUE END)::INT, 3) as file_write_timeout,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'async_delete' THEN CONFIG_VALUE END)::BOOLEAN, false) as async_delete,
 		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'skip_server_error_infos' THEN CONFIG_VALUE END)::TEXT, 'Bad literal|Dimensions|duplicate key value|invalid byte sequence') as skip_server_error_infos,
-		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'task_timeout' THEN CONFIG_VALUE END)::INT, 120) as task_timeout
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'task_timeout' THEN CONFIG_VALUE END)::INT, 120) as task_timeout,
+		COALESCE(MAX(CASE WHEN CONFIG_NAME = 'retry_sleep_max_time' THEN CONFIG_VALUE END)::INT, 10) as retry_sleep_max_time
 	FROM relyt_sys.SDK_LOADER_CONFIG
 	`
 
@@ -394,6 +418,7 @@ func (c *PostgreSQLClient) UpdateLoadConfig(ctx context.Context, config *Config)
 		&temConfig.AsyncDelete,
 		&rawSkipServerErrorInfos,
 		&temConfig.TaskTimeout,
+		&temConfig.RetrySleepMaxTime,
 	)
 
 	if err != nil {
@@ -417,6 +442,12 @@ func (c *PostgreSQLClient) UpdateLoadConfig(ctx context.Context, config *Config)
 			if tableConfig.UpdateOnConflict != nil {
 				temConfig.UpdateOnConflict = *tableConfig.UpdateOnConflict
 			}
+			if tableConfig.FileWriteTimeout != nil {
+				temConfig.FileWriteTimeout = *tableConfig.FileWriteTimeout
+			}
+			if tableConfig.RetrySleepMaxTime != nil {
+				temConfig.RetrySleepMaxTime = *tableConfig.RetrySleepMaxTime
+			}
 		}
 	}
 
@@ -432,6 +463,7 @@ func (c *PostgreSQLClient) UpdateLoadConfig(ctx context.Context, config *Config)
 	config.FileWriteTimeout = temConfig.FileWriteTimeout
 	config.AsyncDelete = temConfig.AsyncDelete
 	config.TaskTimeout = temConfig.TaskTimeout
+	config.RetrySleepMaxTime = temConfig.RetrySleepMaxTime
 	config.SkipServerErrorInfos = temConfig.SkipServerErrorInfos
 
 	// 在表级别配置覆盖后验证 TuplesPrePartition

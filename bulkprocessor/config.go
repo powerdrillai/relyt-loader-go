@@ -66,6 +66,7 @@ type Config struct {
 	AsyncDelete          bool     // async delete, default: true
 	SkipServerErrorInfos []string // skip server error infos, default: [Bad literal, Dimensions, duplicate key value, invalid byte sequence]
 	TaskTimeout          int      // task timeout in seconds, default: 120s
+	RetrySleepMaxTime    int      // retry sleep max time in seconds, default: 10
 
 	// LogLevel sets the logging level (LOG, WARNING, ERROR)
 	LogLevel LogLevel
@@ -148,6 +149,10 @@ func (c *Config) Validate() error {
 
 	if c.LogLevel < DEBUG || c.LogLevel > ERROR {
 		c.LogLevel = LOG // Default to LOG level
+	}
+
+	if c.RetrySleepMaxTime <= 0 {
+		c.RetrySleepMaxTime = 10
 	}
 
 	// Set default skip server error infos if not provided

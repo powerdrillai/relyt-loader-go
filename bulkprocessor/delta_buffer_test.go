@@ -482,8 +482,16 @@ func GetCountFromTestDataTableWithDeleteGroupV2(db *sql.DB, auxtable bool) (int,
 
 func InitLoaderTableConfig(db *sql.DB, tableName string) error {
 	query := `
-	INSERT INTO relyt_sys.relyt_loader_table_config (table_name, buffer_max_records, insert_into_batch_size, tuples_pre_partition, update_on_conflict)
-	VALUES ($1, 10, 10, 10, false) ON CONFLICT (table_name) DO UPDATE SET buffer_max_records = 10, insert_into_batch_size = 10, tuples_pre_partition = 10, update_on_conflict = false;
+	INSERT INTO relyt_sys.relyt_loader_table_config
+	(table_name, buffer_max_records, insert_into_batch_size, tuples_pre_partition, update_on_conflict, file_write_timeout, retry_sleep_max_time)
+	VALUES ($1, 10, 10, 10, false, 3, 10) 
+	ON CONFLICT (table_name) 
+	DO UPDATE SET buffer_max_records = excluded.buffer_max_records,
+	insert_into_batch_size = excluded.insert_into_batch_size,
+	tuples_pre_partition = excluded.tuples_pre_partition,
+	update_on_conflict = excluded.update_on_conflict,
+	file_write_timeout = excluded.file_write_timeout,
+	retry_sleep_max_time = excluded.retry_sleep_max_time;
 	`
 	_, err := db.Exec(query, tableName)
 	if err != nil {

@@ -1736,7 +1736,8 @@ func (p *BulkProcessor) processBufferTask(task *BufferTask, workerID int, feedba
 			}
 
 			if shouldRetry {
-				randomOffset := rand.Intn(9) - 4 // 生成 -4 到 4 的随机数
+				// RetrySleepMaxTime default is 10, so the random offset is -10 to 10
+				randomOffset := rand.Intn(p.config.RetrySleepMaxTime*2) - p.config.RetrySleepMaxTime
 				sleepTime := p.config.ImportErrorSleepTime + randomOffset
 				if sleepTime < 0 {
 					sleepTime = 1
