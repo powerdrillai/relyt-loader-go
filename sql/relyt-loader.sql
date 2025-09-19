@@ -30,6 +30,7 @@ INSERT INTO relyt_sys.SDK_LOADER_CONFIG (CONFIG_NAME, CONFIG_VALUE) VALUES ('fil
 -- the server error infos will be skipped when retry to import the file, split by |
 INSERT INTO relyt_sys.SDK_LOADER_CONFIG (CONFIG_NAME, CONFIG_VALUE) VALUES ('skip_server_error_infos', 'Bad literal|Dimensions|duplicate key value|invalid byte sequence') ON CONFLICT (CONFIG_NAME) DO UPDATE SET CONFIG_VALUE = EXCLUDED.CONFIG_VALUE;
 INSERT INTO relyt_sys.SDK_LOADER_CONFIG (CONFIG_NAME, CONFIG_VALUE) VALUES ('task_timeout', '120') ON CONFLICT (CONFIG_NAME) DO UPDATE SET CONFIG_VALUE = EXCLUDED.CONFIG_VALUE;
+INSERT INTO relyt_sys.SDK_LOADER_CONFIG (CONFIG_NAME, CONFIG_VALUE) VALUES ('update_on_conflict', 'true') ON CONFLICT (CONFIG_NAME) DO UPDATE SET CONFIG_VALUE = EXCLUDED.CONFIG_VALUE;
 
 -- revoke all permission from public
 REVOKE ALL ON relyt_sys.SDK_LOADER_CONFIG FROM public;
@@ -76,7 +77,8 @@ CREATE TABLE IF NOT EXISTS relyt_sys.relyt_loader_table_config (
     table_name TEXT PRIMARY KEY,
     buffer_max_records INT,
     insert_into_batch_size INT,
-	tuples_pre_partition INT
+	tuples_pre_partition INT,
+	update_on_conflict BOOLEAN
 ) using heap;
 GRANT SELECT,INSERT ON relyt_sys.relyt_loader_table_config TO public;
 
