@@ -52,27 +52,27 @@ func SetLogLevel(level LogLevel) {
 	globalLogger.level = level
 }
 
-func Debug(format string, args ...interface{}) {
+func Debug(format string, args ...any) {
 	logMessage(DEBUG, format, args...)
 }
 
 // Log logs a message at LOG level
-func Log(format string, args ...interface{}) {
+func Log(format string, args ...any) {
 	logMessage(LOG, format, args...)
 }
 
 // Warning logs a message at WARNING level
-func Warning(format string, args ...interface{}) {
+func Warning(format string, args ...any) {
 	logMessage(WARNING, format, args...)
 }
 
 // Error logs a message at ERROR level
-func Error(format string, args ...interface{}) {
+func Error(format string, args ...any) {
 	logMessage(ERROR, format, args...)
 }
 
 // logMessage logs a message if the level is enabled
-func logMessage(level LogLevel, format string, args ...interface{}) {
+func logMessage(level LogLevel, format string, args ...any) {
 	currentLevel := globalLogger.level
 	logger := globalLogger.logger
 
@@ -85,16 +85,16 @@ func logMessage(level LogLevel, format string, args ...interface{}) {
 }
 
 // Logf is an alias for Log for consistency with standard log package
-func Logf(format string, args ...interface{}) {
+func Logf(format string, args ...any) {
 	Log(format, args...)
 }
 
 // Warningf is an alias for Warning for consistency with standard log package
-func Warningf(format string, args ...interface{}) {
+func Warningf(format string, args ...any) {
 	Warning(format, args...)
 }
 
 // Errorf is an alias for Error for consistency with standard log package
-func Errorf(format string, args ...interface{}) {
+func Errorf(format string, args ...any) {
 	Error(format, args...)
 }

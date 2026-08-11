@@ -391,9 +391,6 @@ func TestNewSearchFunc(t *testing.T) {
 		t.Fatalf("failed to setup database: %v", err)
 	}
 	defer db.Close()
-	if err != nil {
-		t.Fatalf("failed to setup database: %v", err)
-	}
 
 	err = DropTestWPSDataTaleWithAux(db)
 	if err != nil {
@@ -603,7 +600,7 @@ func TestNewSearchFunc(t *testing.T) {
 		log.Printf("TestNewSearchFunc test 10 jsonData: %v", string(jsonData))
 
 		// 解析 JSON 数据
-		var row map[string]interface{}
+		var row map[string]any
 		if err := json.Unmarshal(jsonData, &row); err != nil {
 			t.Errorf("TestNewSearchFunc test 10 JSON unmarshal error: %v", err)
 			continue
@@ -643,7 +640,7 @@ func TestNewSearchFunc(t *testing.T) {
 	}
 	ctx5, cancel5 := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel5()
-	rows, err = processor.SearchJsonRowsWithContextV2(ctx5, searchOptions, []interface{}{1, 11}, []string{"1", "11"})
+	rows, err = processor.SearchJsonRowsWithContextV2(ctx5, searchOptions, []any{1, 11}, []string{"1", "11"})
 	if err != nil {
 		if pgErr, ok := err.(*pgconn.PgError); ok {
 			log.Printf("TestNewSearchFunc test 11 PostgreSQL error: %s, %s", pgErr.Message, pgErr.Detail)
@@ -691,7 +688,7 @@ func TestNewSearchFunc(t *testing.T) {
 	}
 	defer rows.Close()
 
-	results := make([]map[string]interface{}, 0)
+	results := make([]map[string]any, 0)
 	for rows.Next() {
 		var jsonData []byte
 		err = rows.Scan(&jsonData)
@@ -701,7 +698,7 @@ func TestNewSearchFunc(t *testing.T) {
 		}
 
 		// 解析 JSON 数据
-		var row map[string]interface{}
+		var row map[string]any
 		if err := json.Unmarshal(jsonData, &row); err != nil {
 			t.Errorf("TestNewSearchFunc test 10 JSON unmarshal error: %v", err)
 			continue
@@ -718,7 +715,7 @@ func TestNewSearchFunc(t *testing.T) {
 			chunkIdInt, _ := strconv.Atoi(fmt.Sprintf("%v", chunkId))
 			fileidInt, _ := strconv.Atoi(fmt.Sprintf("%v", fileid))
 
-			row := make(map[string]interface{})
+			row := make(map[string]any)
 			row["id"] = idInt
 			row["group_id"] = chunkIdInt
 			row["fileid"] = fileidInt
@@ -726,7 +723,7 @@ func TestNewSearchFunc(t *testing.T) {
 		}
 	}
 
-	expectedResults := []map[string]interface{}{
+	expectedResults := []map[string]any{
 		{
 			"id":       1,
 			"group_id": 1,
@@ -787,7 +784,7 @@ func TestSearchAdditional(t *testing.T) {
 		OrderBy:   "id ASC",
 		Limit:     5,
 	}
-	result, err := processor.SearchV2(searchOptions, []interface{}{1, 2, 5, 6})
+	result, err := processor.SearchV2(searchOptions, []any{1, 2, 5, 6})
 	if err != nil {
 		t.Errorf("failed to search data: %v", err)
 	}
@@ -864,7 +861,7 @@ func TestSearchAdditional(t *testing.T) {
 		OrderBy:   "id ASC",
 		Limit:     10,
 	}
-	result, err = processor.SearchV2(searchOptions, []interface{}{1, 2, 3, 4, 5}, 100)
+	result, err = processor.SearchV2(searchOptions, []any{1, 2, 3, 4, 5}, 100)
 	if err != nil {
 		t.Errorf("failed to search data: %v", err)
 	}
@@ -913,7 +910,7 @@ func TestSearchAdditional(t *testing.T) {
 		Condition: "id in ($1) and routing_id in ($2)",
 		OrderBy:   "id ASC",
 	}
-	result, err = processor.SearchV2(searchOptions, []interface{}{1, 3, 5, 7}, []interface{}{100, 120})
+	result, err = processor.SearchV2(searchOptions, []any{1, 3, 5, 7}, []any{100, 120})
 	if err != nil {
 		t.Errorf("failed to search data: %v", err)
 	}
@@ -942,7 +939,7 @@ func TestSearchAdditional(t *testing.T) {
 	columns := len(result.Columns)
 
 	for _, row := range result.Rows {
-		for i := 0; i < columns; i++ {
+		for i := range columns {
 			log.Printf("Test 13 result column: %d, value: %v", i, row[i])
 		}
 	}
@@ -954,7 +951,7 @@ func TestSearchAdditional(t *testing.T) {
 		Condition: "id in ($1)",
 		OrderBy:   "id DESC",
 	}
-	jsonResults, err := processor.SearchJsonV2(searchOptions, []interface{}{1, 5, 2, 6})
+	jsonResults, err := processor.SearchJsonV2(searchOptions, []any{1, 5, 2, 6})
 	if err != nil {
 		t.Errorf("Test 14 failed: %v", err)
 	}
@@ -963,9 +960,9 @@ func TestSearchAdditional(t *testing.T) {
 	}
 
 	// 解析每个JSON记录
-	var jsonRecords []map[string]interface{}
+	var jsonRecords []map[string]any
 	for _, jsonResult := range jsonResults {
-		var record map[string]interface{}
+		var record map[string]any
 		if err := json.Unmarshal(jsonResult, &record); err != nil {
 			t.Errorf("Test 14 unmarshal failed: %v", err)
 		}
@@ -975,7 +972,7 @@ func TestSearchAdditional(t *testing.T) {
 	log.Printf("Test 14 result column: %v", jsonRecords)
 
 	// 15. select json: select id, routing_id, ext from test_routing_data where id in ($1) order by id asc
-	jsonResults, err = processor.SearchJsonV2(searchOptions, []interface{}{999, 1000})
+	jsonResults, err = processor.SearchJsonV2(searchOptions, []any{999, 1000})
 	if err != nil {
 		t.Errorf("Test 15 failed: %v", err)
 	}
@@ -985,7 +982,7 @@ func TestSearchAdditional(t *testing.T) {
 	log.Printf("Test 15 result column: %v", jsonResults)
 
 	// 16. select json: select id, routing_id, ext from test_routing_data where id in ($1) order by id asc
-	rows, err := processor.SearchJsonRowsV2(searchOptions, []interface{}{1, 2, 5, 6})
+	rows, err := processor.SearchJsonRowsV2(searchOptions, []any{1, 2, 5, 6})
 	if err != nil {
 		t.Errorf("Test 16 failed: %v", err)
 	}
@@ -997,7 +994,7 @@ func TestSearchAdditional(t *testing.T) {
 			t.Errorf("Test 16 scan failed: %v", err)
 			continue
 		}
-		var record map[string]interface{}
+		var record map[string]any
 		if err := json.Unmarshal(resultJSON, &record); err != nil {
 			t.Errorf("Test 16 unmarshal failed: %v", err)
 			continue
@@ -1010,7 +1007,7 @@ func TestSearchAdditional(t *testing.T) {
 	}
 
 	// 17. select json: select id, routing_id, ext from test_routing_data where id in ($1) order by id asc
-	rows, err = processor.SearchJsonRowsV2(searchOptions, []interface{}{999, 1000})
+	rows, err = processor.SearchJsonRowsV2(searchOptions, []any{999, 1000})
 	if err != nil {
 		t.Errorf("Test 17 failed: %v", err)
 	}
@@ -1039,7 +1036,7 @@ func TestSearchMultipleTables(t *testing.T) {
 		OrderBy:   "id ASC",
 		Limit:     5,
 	}
-	result, err := processor.SearchV2(searchOptions, []interface{}{1, 2, 5, 6})
+	result, err := processor.SearchV2(searchOptions, []any{1, 2, 5, 6})
 	if err != nil {
 		t.Errorf("failed to search data: %v", err)
 	}

@@ -46,7 +46,7 @@ type ErrorHandlerResources struct {
 	LogFile *os.File
 }
 
-func WriteErrorsToFiles(fieldname string, values []string, err error, resources interface{}) {
+func WriteErrorsToFiles(fieldname string, values []string, err error, resources any) {
 	res := resources.(*ErrorHandlerResources)
 	feedbackKeysString := fmt.Sprintf("failed %s is [%s] with error: %v.", fieldname, strings.Join(values, ","), err)
 	res.LogFile.WriteString("Error: " + feedbackKeysString + "\n")
@@ -114,6 +114,24 @@ func InitDatabaseConfig(host string, port int, username, password, database stri
 		Password: password,
 		Database: database,
 	}
+}
+
+func integrationDatabaseConfig(t *testing.T) DatabaseConfig {
+	t.Helper()
+	port, err := strconv.Atoi(os.Getenv("RELYT_LEGACY_TEST_PORT"))
+	if err != nil || port <= 0 {
+		t.Skip("legacy database integration environment is not configured")
+	}
+	config := InitDatabaseConfig(
+		os.Getenv("RELYT_LEGACY_TEST_HOST"), port,
+		os.Getenv("RELYT_LEGACY_TEST_USER"),
+		os.Getenv("RELYT_LEGACY_TEST_PASSWORD"),
+		os.Getenv("RELYT_LEGACY_TEST_DATABASE"),
+	)
+	if config.Host == "" || config.Username == "" || config.Database == "" {
+		t.Skip("legacy database integration environment is not configured")
+	}
+	return config
 }
 
 func SetupDataBase(config DatabaseConfig) (*sql.DB, error) {
@@ -249,7 +267,7 @@ func InitTestDataTableWithAux(db *sql.DB) error {
 	// insert 100 records for routing_id 100 and 110
 	id := 0
 	for _, routingID := range []int{100, 110} {
-		for i := 0; i < 100; i++ {
+		for range 100 {
 			ext := fmt.Sprintf("ext_%d", id)
 			vector := fmt.Sprintf("[%f,%f,%f]", r.Float32(), r.Float32(), r.Float32())
 
@@ -263,7 +281,7 @@ func InitTestDataTableWithAux(db *sql.DB) error {
 
 	// insert 10 records for routing_id 120, 130, 140
 	for _, routingID := range []int{120, 130, 140} {
-		for i := 0; i < 10; i++ {
+		for range 10 {
 			ext := fmt.Sprintf("ext_%d", id)
 			vector := fmt.Sprintf("[%f,%f,%f]", r.Float32(), r.Float32(), r.Float32())
 
@@ -324,7 +342,7 @@ func GetRelytCheckpointTable(db *sql.DB) (int, error) {
 // and we will write the error data to a file via the ImportErrorCallback function.
 func TestInsertWithSomeErrors(t *testing.T) {
 	// Initialize database connection
-	dbConfig := InitDatabaseConfig("127.0.0.1", 7000, "postgres", "", "postgres")
+	dbConfig := integrationDatabaseConfig(t)
 	db, err := SetupDataBase(dbConfig)
 	if err != nil {
 		log.Fatalf("failed to setup database: %v", err)
@@ -424,7 +442,7 @@ func TestInsertWithSomeErrors(t *testing.T) {
 // TestInsertWithSleep test the case we write data intermittently.
 func TestInsertWithSleep(t *testing.T) {
 	// Initialize database connection
-	dbConfig := InitDatabaseConfig("127.0.0.1", 7000, "postgres", "", "postgres")
+	dbConfig := integrationDatabaseConfig(t)
 	db, err := SetupDataBase(dbConfig)
 	if err != nil {
 		log.Fatalf("failed to setup database: %v", err)
@@ -547,7 +565,7 @@ func TestInsertWithSleep(t *testing.T) {
 // TestInsertWithPgRecovery test the case when pg is down.
 func TestInsertWithPgRecovery(t *testing.T) {
 	// Initialize database connection
-	dbConfig := InitDatabaseConfig("127.0.0.1", 7000, "postgres", "", "postgres")
+	dbConfig := integrationDatabaseConfig(t)
 	db, err := SetupDataBase(dbConfig)
 	if err != nil {
 		log.Fatalf("failed to setup database: %v", err)
@@ -691,7 +709,7 @@ func TestInsertWithPgRecovery(t *testing.T) {
 
 func TestInsertWithImportTimeout(t *testing.T) {
 	// Initialize database connection
-	dbConfig := InitDatabaseConfig("127.0.0.1", 7000, "postgres", "", "postgres")
+	dbConfig := integrationDatabaseConfig(t)
 	db, err := SetupDataBase(dbConfig)
 	if err != nil {
 		log.Fatalf("failed to setup database: %v", err)
@@ -815,7 +833,7 @@ func TestInsertWithImportTimeout(t *testing.T) {
 // 5. check in inserting, after fileTimeout, the data will be flushed by the AutoFlushThread
 func TestInsertWithMigration(t *testing.T) {
 	// Initialize database connection
-	dbConfig := InitDatabaseConfig("127.0.0.1", 7000, "postgres", "", "postgres")
+	dbConfig := integrationDatabaseConfig(t)
 	db, err := SetupDataBase(dbConfig)
 	if err != nil {
 		log.Fatalf("failed to setup database: %v", err)

@@ -174,7 +174,7 @@ func InitTestDataTableWithAuxV2(db *sql.DB) error {
 	// insert 100 records for routing_id 100 and 110
 	id := 0
 	for _, routingID := range []int{100, 110} {
-		for i := 0; i < 100; i++ {
+		for range 100 {
 			fileID := routingID
 			ext := fmt.Sprintf("ext_%d", id)
 			vector := fmt.Sprintf("[%f,%f,%f]", r.Float32(), r.Float32(), r.Float32())
@@ -190,7 +190,7 @@ func InitTestDataTableWithAuxV2(db *sql.DB) error {
 
 	// insert 10 records for routing_id 120, 130, 140
 	for _, routingID := range []int{120, 130, 140} {
-		for i := 0; i < 10; i++ {
+		for range 10 {
 			fileID := routingID
 			ext := fmt.Sprintf("ext_%d", id)
 			vector := fmt.Sprintf("[%f,%f,%f]", r.Float32(), r.Float32(), r.Float32())

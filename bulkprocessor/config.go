@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 )
 
-type ImportErrorHandler func(fieldname string, values []string, err error, resources interface{})
+type ImportErrorHandler func(fieldname string, values []string, err error, resources any)
 
 // S3Config represents the configuration for S3
 type S3Config struct {
@@ -50,7 +50,7 @@ type Config struct {
 	FlushSleepTime       int              // Sleep time in milliseconds between processing iterations (default: 10)
 	FeedbackColumn       string           // Column name for error messages (default: "") when import failed
 	ImportErrorCallback  ImportErrorHandler
-	CallbackResource     interface{}
+	CallbackResource     any
 	FileWriteTimeout     int      // a new file opened for a limited time to write, default: 10 seconds
 	BGWorkerInterval     int      // GC interval in seconds, default: 60 seconds
 	ImportTimeout        int      // S3 import timeout in seconds
