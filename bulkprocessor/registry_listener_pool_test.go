@@ -237,6 +237,26 @@ func registrylistenerPool(t *testing.T, address string) *pgxpool.Pool {
 // production registry listener path. A wire-level notification changes the
 // fixture's registry status from active to draining; successful reconciliation
 // is observed through InstanceRouter, rather than inferred from a nil error.
+func TestRegistryListenFailureBackoffIsCancellationAware(t *testing.T) {
+	start := time.Now()
+	if !waitForContext(context.Background(), 40*time.Millisecond) {
+		t.Fatal("backoff unexpectedly canceled")
+	}
+	if elapsed := time.Since(start); elapsed < 30*time.Millisecond {
+		t.Fatalf("LISTEN retry had no backoff: %v", elapsed)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start = time.Now()
+	if waitForContext(ctx, 5*time.Second) {
+		t.Fatal("canceled backoff reported success")
+	}
+	if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+		t.Fatalf("canceled LISTEN backoff took too long: %v", elapsed)
+	}
+}
+
 func TestRegistryListenerRegistryNotificationRefreshesWithSingleConnection(t *testing.T) {
 	server := registrylistenerStartPGServer(t)
 	address := server.listener.Addr().String()

@@ -95,6 +95,103 @@ func TestFlushBarrierFlushRecordWaitIsCancellationAware(t *testing.T) {
 
 // A local path whose parent is a regular file makes BufferWriteToFile fail in
 // os.MkdirAll without relying on permissions, external services, or timing.
+func TestSaveBufferUsesAtomicallyPublishedRuntimeConfig(t *testing.T) {
+	p := flushbarrierProcessor(context.Background())
+	p.fields = []FieldInfo{{JSONName: "value"}}
+	runtimeConfig := p.config
+	runtimeConfig.ImportStrategy = CopyFromLocal
+	runtimeConfig.DeleteBeforeInsert = true
+	runtimeConfig.TuplesPrePartition = 17
+	p.runtimeConfig.Store(&runtimeConfig)
+
+	buffer := &Buffer{
+		ID: "runtime-config", Records: []*Record{{Tag: OperationInsert, Values: []string{"value"}}},
+		LocalFilePath: filepath.Join(t.TempDir(), "buffer.csv"), MaxRecords: 10,
+		MaxVersionMap: make(map[RecordIndex]string), FeedbackKeys: make(map[string]bool),
+	}
+	p.bufferManager.buffers[buffer.ID] = buffer
+	if err := p.SaveBufferToFileAndGenerateTask(buffer, false); err != nil {
+		t.Fatalf("SaveBufferToFileAndGenerateTask: %v", err)
+	}
+	select {
+	case task := <-p.bufferTaskQueue:
+		if task.ImportStrategy != CopyFromLocal {
+			t.Fatalf("task import strategy = %d, want refreshed CopyFromLocal", task.ImportStrategy)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("buffer task was not queued")
+	}
+}
+
+func TestRecycleLocalDirExceptPreservesRecoverableArtifacts(t *testing.T) {
+	root := t.TempDir()
+	oldDate := time.Now().AddDate(0, 0, -3).Format("2006-01-02")
+	protectedFile := filepath.Join(root, oldDate, "table", "old-process", "pending.csv")
+	staleFile := filepath.Join(root, oldDate, "table", "other-process", "stale.csv")
+	for _, path := range []string{protectedFile, staleFile} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("data"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	manager := NewBufferManager("table", "current-process")
+	manager.RecycleLocalDirExcept(root, 2, map[string]struct{}{protectedFile: {}})
+	if _, err := os.Stat(protectedFile); err != nil {
+		t.Fatalf("recoverable artifact was deleted: %v", err)
+	}
+	if _, err := os.Stat(staleFile); !os.IsNotExist(err) {
+		t.Fatalf("untracked stale artifact still exists: %v", err)
+	}
+}
+
+func TestNewBufferTaskPreservesFeedbackKeysForEnqueueFailure(t *testing.T) {
+	buffer := &Buffer{
+		ID: "feedback", FeedbackKeys: map[string]bool{"key-1": true, "key-2": true},
+		MaxVersionMap: make(map[RecordIndex]string),
+	}
+	task := NewBufferTask(buffer, nil, nil, nil, InsertOnConflict)
+	if len(task.FeedbackKeys) != 2 {
+		t.Fatalf("task feedback keys = %v, want both keys", task.FeedbackKeys)
+	}
+	if got := buffer.GetFeedbackKeys(); len(got) != 2 {
+		t.Fatalf("buffer feedback keys after task creation = %v, want both keys for enqueue error callback", got)
+	}
+}
+
+func TestFlushBarrierDoesNotWaitForCompletionMetadata(t *testing.T) {
+	p := flushbarrierProcessor(context.Background())
+	buffer := &Buffer{ID: "checkpoint-pending", status: BufferStatusFrozen}
+	p.bufferManager.buffers[buffer.ID] = buffer
+
+	done := make(chan error, 1)
+	go func() { done <- p.Flush() }()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		if !p.flushMutex.TryLock() {
+			break
+		}
+		p.flushMutex.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("Flush did not start")
+		}
+		runtime.Gosched()
+	}
+	p.bufferManager.SetBufferStatus(buffer.ID, BufferStatusCheckpointPending)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Flush returned after committed data with pending metadata: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Flush remained blocked on completion metadata after data was durable")
+	}
+}
+
 func TestFlushBarrierFlushReturnsSaveBufferFailure(t *testing.T) {
 	p := flushbarrierProcessor(context.Background())
 

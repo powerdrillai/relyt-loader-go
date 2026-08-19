@@ -2,7 +2,9 @@ package bulkprocessor
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -30,6 +32,36 @@ func missingprimarykeyProcessor(ctx context.Context) *BulkProcessor {
 		insertV2Done:    make(chan struct{}),
 		routingHashSet:  make(map[string]struct{}),
 		bufferTaskQueue: make(chan *BufferTask, 1),
+	}
+}
+
+type missingprimarykeyV1GeneratedPKRecord struct {
+	Payload string `relyt:"payload"`
+}
+
+func TestV1InsertAllowsServerGeneratedPrimaryKey(t *testing.T) {
+	p := &BulkProcessor{
+		config: Config{PostgreSQL: PostgreSQLConfig{Table: "items"}},
+		ctx:    context.Background(), isStarted: true,
+		pkColumns: []string{"id"}, feedFieldIndex: -1,
+		recordsQueue: make(chan []string, 1),
+	}
+	if err := p.Insert([]missingprimarykeyV1GeneratedPKRecord{{Payload: "value"}}); err != nil {
+		t.Fatalf("V1 Insert rejected a DB-generated primary key: %v", err)
+	}
+	if got := len(p.recordsQueue); got != 1 {
+		t.Fatalf("V1 Insert queued %d records, want 1", got)
+	}
+}
+
+func TestV2StillValidatesPrimaryKeyAfterV1InitializesSchema(t *testing.T) {
+	p := &BulkProcessor{pkColumns: []string{"id"}, routingColIndex: -1, feedFieldIndex: -1}
+	value := reflect.ValueOf([]missingprimarykeyV1GeneratedPKRecord{{Payload: "value"}})
+	if err := p.ensureRecordSchema(value, false); err != nil {
+		t.Fatalf("V1 schema initialization failed: %v", err)
+	}
+	if err := p.ensureRecordSchema(value, true); !errors.Is(err, ErrPrimaryKeyColumnRequired) {
+		t.Fatalf("V2 lazy PK validation error = %v, want ErrPrimaryKeyColumnRequired", err)
 	}
 }
 

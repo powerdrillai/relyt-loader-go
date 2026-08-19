@@ -71,7 +71,7 @@ CREATE TABLE IF NOT EXISTS relyt_sys.relyt_loader_delta_checkpoint (
 	error_records INT DEFAULT 0,
     PRIMARY KEY (process_id, filepath)
 ) using heap;
-GRANT SELECT,INSERT ON relyt_sys.relyt_loader_delta_checkpoint TO public;
+GRANT SELECT,INSERT,UPDATE,DELETE ON relyt_sys.relyt_loader_delta_checkpoint TO public;
 
 -- buffer_max_records and insert_into_batch_size per table
 CREATE TABLE IF NOT EXISTS relyt_sys.relyt_loader_table_config (

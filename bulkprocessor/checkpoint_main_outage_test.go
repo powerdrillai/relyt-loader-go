@@ -21,6 +21,22 @@ import (
 
 // checkpointoutageRow is deliberately small: the fake healthy shard below only has
 // to acknowledge an INSERT, while the real routing and import paths still run.
+func TestDeltaCheckpointInsertIsIdempotentAfterAmbiguousCommit(t *testing.T) {
+	sql := strings.ToUpper(insertDeltaCheckpointSQL)
+	if !strings.Contains(sql, "ON CONFLICT (PROCESS_ID, FILEPATH) DO NOTHING") {
+		t.Fatalf("checkpoint retry is not idempotent: %s", insertDeltaCheckpointSQL)
+	}
+}
+
+func TestTerminalCheckpointFailureIsAtomicWithInitialInsert(t *testing.T) {
+	sql := strings.ToUpper(failDeltaCheckpointSQL)
+	if !strings.Contains(sql, "INSERT INTO") ||
+		!strings.Contains(sql, "ON CONFLICT (PROCESS_ID, FILEPATH) DO UPDATE") ||
+		!strings.Contains(sql, "STATUS = EXCLUDED.STATUS") {
+		t.Fatalf("terminal checkpoint write is not an atomic failure upsert: %s", failDeltaCheckpointSQL)
+	}
+}
+
 type checkpointoutageRow struct {
 	Value     string `relyt:"value"`
 	RoutingID string `relyt:"routing_id"`

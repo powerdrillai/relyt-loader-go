@@ -98,14 +98,29 @@ func routingIDScopedCondition(condition, routingID string) string {
 }
 
 func sqlCodeOnly(fragment string) (string, bool) {
+	isIdent := func(b byte) bool {
+		return b == '_' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9'
+	}
 	var code strings.Builder
 	for i := 0; i < len(fragment); {
 		switch fragment[i] {
 		case '\'':
+			// PostgreSQL E'...' strings treat backslash as an escape. Ordinary
+			// strings use doubled quotes (standard_conforming_strings is required
+			// by supported deployments).
+			escape := i > 0 && (fragment[i-1] == 'e' || fragment[i-1] == 'E') &&
+				(i == 1 || !isIdent(fragment[i-2]))
 			code.WriteByte(' ')
 			i++
 			closed := false
 			for i < len(fragment) {
+				if escape && fragment[i] == '\\' {
+					if i+1 >= len(fragment) {
+						return "", false
+					}
+					i += 2
+					continue
+				}
 				if fragment[i] == '\'' {
 					if i+1 < len(fragment) && fragment[i+1] == '\'' {
 						i += 2
@@ -139,6 +154,31 @@ func sqlCodeOnly(fragment string) (string, bool) {
 			if !closed {
 				return "", false
 			}
+		case '$':
+			// Dollar-quoted strings use $tag$...$tag$. Parameter references such
+			// as $1 have no second '$' in the opener and remain SQL code.
+			end := i + 1
+			validTag := end < len(fragment) && fragment[end] == '$'
+			if end < len(fragment) && (fragment[end] == '_' || fragment[end] >= 'a' && fragment[end] <= 'z' || fragment[end] >= 'A' && fragment[end] <= 'Z') {
+				end++
+				for end < len(fragment) && isIdent(fragment[end]) {
+					end++
+				}
+				validTag = end < len(fragment) && fragment[end] == '$'
+			}
+			validTag = validTag && (i == 0 || !isIdent(fragment[i-1]) && fragment[i-1] != '$')
+			if validTag {
+				delim := fragment[i : end+1]
+				closeAt := strings.Index(fragment[end+1:], delim)
+				if closeAt < 0 {
+					return "", false
+				}
+				code.WriteByte(' ')
+				i = end + 1 + closeAt + len(delim)
+				continue
+			}
+			code.WriteByte(fragment[i])
+			i++
 		case '-':
 			if i+1 < len(fragment) && fragment[i+1] == '-' {
 				return "", false
@@ -149,13 +189,22 @@ func sqlCodeOnly(fragment string) (string, bool) {
 			if i+1 < len(fragment) && fragment[i+1] == '*' {
 				code.WriteByte(' ')
 				i += 2
-				for i+1 < len(fragment) && !(fragment[i] == '*' && fragment[i+1] == '/') {
-					i++
+				depth := 1
+				for i < len(fragment) && depth > 0 {
+					switch {
+					case i+1 < len(fragment) && fragment[i] == '/' && fragment[i+1] == '*':
+						depth++
+						i += 2
+					case i+1 < len(fragment) && fragment[i] == '*' && fragment[i+1] == '/':
+						depth--
+						i += 2
+					default:
+						i++
+					}
 				}
-				if i+1 >= len(fragment) {
+				if depth != 0 {
 					return "", false
 				}
-				i += 2
 				continue
 			}
 			code.WriteByte(fragment[i])

@@ -818,19 +818,43 @@ func (c *PostgreSQLClient) GetTableSchema(ctx context.Context) ([]TableColumn, e
 	return columns, nil
 }
 
-// Insert a delta checkpoint record
-func (c *PostgreSQLClient) InsertDeltaCheckpoint(ctx context.Context, processId string, pgTable string, filePath string) error {
-	sqlStatement := `
+const insertDeltaCheckpointSQL = `
 	INSERT INTO relyt_sys.relyt_loader_delta_checkpoint
 	(process_id, pg_table, status, start_time, finish_time, filepath)
 	VALUES ($1, $2, $3, $4, $5, $6)
-	`
+	ON CONFLICT (process_id, filepath) DO NOTHING
+`
 
-	_, err := c.pool.Exec(ctx, sqlStatement, processId, pgTable, string(CheckpointStatusRunning), time.Now(), nil, filePath)
+// Insert a delta checkpoint record. The insert is idempotent because a timeout
+// can be returned after PostgreSQL has already committed the first attempt.
+func (c *PostgreSQLClient) InsertDeltaCheckpoint(ctx context.Context, processId string, pgTable string, filePath string) error {
+	_, err := c.pool.Exec(ctx, insertDeltaCheckpointSQL, processId, pgTable, string(CheckpointStatusRunning), time.Now(), nil, filePath)
 	if err != nil {
 		return errors.Wrap(err, "failed to insert delta checkpoint")
 	}
 
+	return nil
+}
+
+const failDeltaCheckpointSQL = `
+	INSERT INTO relyt_sys.relyt_loader_delta_checkpoint
+	(process_id, pg_table, status, start_time, finish_time, filepath, error_message, error_records)
+	VALUES ($1, $2, $3, $4, $4, $5, $6, $7)
+	ON CONFLICT (process_id, filepath) DO UPDATE SET
+		finish_time = EXCLUDED.finish_time,
+		status = EXCLUDED.status,
+		error_message = EXCLUDED.error_message,
+		error_records = EXCLUDED.error_records
+`
+
+// FailDeltaCheckpoint atomically creates or fails a row. This closes the race
+// with an asynchronous initial INSERT: whichever statement wins, the final
+// durable state is FAILED.
+func (c *PostgreSQLClient) FailDeltaCheckpoint(ctx context.Context, processID, pgTable, filepath, errorMessage string, errorRecords int) error {
+	_, err := c.pool.Exec(ctx, failDeltaCheckpointSQL, processID, pgTable, string(CheckpointStatusFailed), time.Now(), filepath, errorMessage, errorRecords)
+	if err != nil {
+		return errors.Wrap(err, "failed to upsert failed delta checkpoint")
+	}
 	return nil
 }
 
@@ -876,6 +900,31 @@ func (c *PostgreSQLClient) UpdateDeltaCheckpointStatus(ctx context.Context, proc
 	}
 
 	return nil
+}
+
+// GetIncompleteDeltaCheckpointFilepaths returns local artifacts that still
+// represent recoverable work, across current and previous process IDs.
+func (c *PostgreSQLClient) GetIncompleteDeltaCheckpointFilepaths(ctx context.Context) (map[string]struct{}, error) {
+	rows, err := c.pool.Query(ctx, `
+		SELECT filepath FROM relyt_sys.relyt_loader_delta_checkpoint
+		WHERE status <> $1 AND filepath IS NOT NULL AND filepath <> ''`, string(CheckpointStatusCompleted))
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to list incomplete delta checkpoints")
+	}
+	defer rows.Close()
+
+	filepaths := make(map[string]struct{})
+	for rows.Next() {
+		var filepath string
+		if err := rows.Scan(&filepath); err != nil {
+			return nil, errors.Wrap(err, "failed to scan incomplete delta checkpoint")
+		}
+		filepaths[filepath] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, errors.Wrap(err, "failed to iterate incomplete delta checkpoints")
+	}
+	return filepaths, nil
 }
 
 // Delete delta checkpoint record

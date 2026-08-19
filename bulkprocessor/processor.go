@@ -23,7 +23,8 @@ import (
 // BulkProcessor represents a bulk processor for PostgreSQL
 type BulkProcessor struct {
 	config            Config
-	processId         string // Unique ID for this processor instance
+	runtimeConfig     atomic.Pointer[Config] // immutable snapshots of DB-refreshable loader settings
+	processId         string                 // Unique ID for this processor instance
 	pgClient          *PostgreSQLClient
 	s3Client          *S3Client
 	fileManager       *FileManager
@@ -272,7 +273,7 @@ func New(config Config) (*BulkProcessor, error) {
 
 	ctx, cancel = context.WithCancel(context.Background())
 
-	return &BulkProcessor{
+	processor := &BulkProcessor{
 		config:                 config,
 		processId:              processId,
 		pgClient:               pgClient,
@@ -306,7 +307,18 @@ func New(config Config) (*BulkProcessor, error) {
 		activeWorkers:          0,
 		routingTableCache:      make(map[string]routingTableCacheEntry),
 		routingTableCacheMutex: sync.RWMutex{},
-	}, nil
+	}
+	runtimeConfig := config
+	processor.runtimeConfig.Store(&runtimeConfig)
+	return processor, nil
+}
+
+func (p *BulkProcessor) currentRuntimeConfig() Config {
+	if config := p.runtimeConfig.Load(); config != nil {
+		return *config
+	}
+	// Supports focused tests which construct BulkProcessor literals.
+	return p.config
 }
 
 // GetProcessId returns the unique processor ID
@@ -545,7 +557,7 @@ func (p *BulkProcessor) enqueueRecordV2(ctx context.Context, record *Record) err
 	}
 }
 
-func (p *BulkProcessor) ensureRecordSchema(val reflect.Value) error {
+func (p *BulkProcessor) ensureRecordSchema(val reflect.Value, requirePrimaryKey bool) error {
 	elemType := val.Type().Elem()
 	if elemType.Kind() == reflect.Pointer {
 		elemType = elemType.Elem()
@@ -559,6 +571,18 @@ func (p *BulkProcessor) ensureRecordSchema(val reflect.Value) error {
 	if p.structType != nil {
 		if p.structType != elemType {
 			return errors.Wrapf(ErrRecordTypeMismatch, "processor uses %s, supplied %s", p.structType, elemType)
+		}
+		// V1 Insert permits server-generated primary keys. If V1 initialized
+		// reflection metadata first, initialize the V2-only PK indexes lazily.
+		if requirePrimaryKey && p.pkColumnsIndex == nil {
+			pkColumnsIndex := make([]int, len(p.pkColumns))
+			for i, columnName := range p.pkColumns {
+				pkColumnsIndex[i] = getValueColumnIndex(p.fields, columnName)
+				if pkColumnsIndex[i] < 0 {
+					return errors.Wrapf(ErrPrimaryKeyColumnRequired, "primary-key column %q", columnName)
+				}
+			}
+			p.pkColumnsIndex = pkColumnsIndex
 		}
 		return nil
 	}
@@ -575,11 +599,14 @@ func (p *BulkProcessor) ensureRecordSchema(val reflect.Value) error {
 	if p.isSharded && routingColIndex < 0 {
 		return ErrRoutingColumnRequired
 	}
-	pkColumnsIndex := make([]int, len(p.pkColumns))
-	for i, columnName := range p.pkColumns {
-		pkColumnsIndex[i] = getValueColumnIndex(fields, columnName)
-		if pkColumnsIndex[i] < 0 {
-			return errors.Wrapf(ErrPrimaryKeyColumnRequired, "primary-key column %q", columnName)
+	var pkColumnsIndex []int
+	if requirePrimaryKey {
+		pkColumnsIndex = make([]int, len(p.pkColumns))
+		for i, columnName := range p.pkColumns {
+			pkColumnsIndex[i] = getValueColumnIndex(fields, columnName)
+			if pkColumnsIndex[i] < 0 {
+				return errors.Wrapf(ErrPrimaryKeyColumnRequired, "primary-key column %q", columnName)
+			}
 		}
 	}
 
@@ -663,7 +690,7 @@ func (p *BulkProcessor) Insert(data any) error {
 		return ErrEmptyInput
 	}
 
-	if err := p.ensureRecordSchema(val); err != nil {
+	if err := p.ensureRecordSchema(val, false); err != nil {
 		return err
 	}
 
@@ -1050,8 +1077,11 @@ func (p *BulkProcessor) Flush() error {
 				switch status {
 				case BufferStatusFlushError, BufferStatusImportError:
 					errorBuffers = append(errorBuffers, buffer)
-				case BufferStatusFrozen, BufferStatusFlushed, BufferStatusCheckpointPending:
+				case BufferStatusFrozen, BufferStatusFlushed:
 					flushingBuffers = append(flushingBuffers, buffer)
+				case BufferStatusCheckpointPending:
+					// The data transaction is already durable. Completion metadata is
+					// retried asynchronously and must not wedge the caller's data barrier.
 				}
 			}
 		}
@@ -1111,9 +1141,10 @@ func (p *BulkProcessor) ImporterThread() {
 			}
 
 			isAuxFile := strings.Contains(batchDir, BatchPrefixAux)
-			// Import the entire batch directory
+			// Keep one coherent configuration snapshot for this retry cycle.
+			runtimeConfig := p.currentRuntimeConfig()
 			isFailed := true
-			maxLoopNum := p.config.ImportTimeout / p.config.ImportErrorSleepTime
+			maxLoopNum := runtimeConfig.ImportTimeout / runtimeConfig.ImportErrorSleepTime
 			err := errors.New("import batch directory timeout")
 			for range maxLoopNum {
 				err = p.importBatchDirectory(batchDir, isAuxFile)
@@ -1133,7 +1164,7 @@ func (p *BulkProcessor) ImporterThread() {
 					// all the errors without parsing error are not expected, we will retry, parsing error just call
 					// the callback and continue to next batch
 					if !strings.Contains(err.Error(), "Bad literal") && !strings.Contains(err.Error(), "Dimensions") {
-						time.Sleep(time.Duration(p.config.ImportErrorSleepTime) * time.Second)
+						time.Sleep(time.Duration(runtimeConfig.ImportErrorSleepTime) * time.Second)
 						continue
 					}
 
@@ -1263,7 +1294,7 @@ func (p *BulkProcessor) AutoFlushThread() {
 		default:
 			// Not canceled
 		}
-		fileTimeoutDuration := time.Duration(p.config.FileWriteTimeout) * time.Second
+		fileTimeoutDuration := time.Duration(p.currentRuntimeConfig().FileWriteTimeout) * time.Second
 		lastFlushTime := p.getLastFlushTime()
 		if time.Since(lastFlushTime) >= fileTimeoutDuration {
 			Debug("AutoFlush thread doing flush (last flush: %v)", lastFlushTime)
@@ -1311,9 +1342,16 @@ func (p *BulkProcessor) BGWorkerThread() {
 			cancel()
 		}
 
-		// Loader configuration is immutable for a running processor. Mutating the
-		// shared Config here raced every import/flush worker; changes take effect
-		// when a new processor is constructed.
+		// Refresh into a copy, then atomically publish an immutable snapshot. This
+		// preserves runtime/table-level configuration without racing importers.
+		loadConfig := p.currentRuntimeConfig()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := p.pgClient.UpdateLoadConfig(ctx, &loadConfig); err != nil {
+			Debug("Failed to update load config: %v", err)
+		} else {
+			p.runtimeConfig.Store(&loadConfig)
+		}
+		cancel()
 
 		// 3. check if the local csv directory files
 		dirPath := p.bufferManager.GetLocalCSVDir()
@@ -1329,9 +1367,17 @@ func (p *BulkProcessor) BGWorkerThread() {
 			}
 		}
 
-		// Do not age-delete process directories here: they may contain the only
-		// recovery artifact for a shard commit whose main checkpoint is pending.
-		// Imported/error buffers are removed through status-aware recycling above.
+		// Bound stale disk use without deleting artifacts tracked as incomplete by
+		// any current or previous process. If main is unavailable, fail safe and
+		// skip this GC cycle.
+		gcCtx, gcCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		protected, err := p.pgClient.GetIncompleteDeltaCheckpointFilepaths(gcCtx)
+		gcCancel()
+		if err != nil {
+			Debug("Failed to list recoverable local files; skipping age GC: %v", err)
+		} else if deleted := p.bufferManager.RecycleLocalDirExcept(p.config.LocalFilePrefix, 2, protected); len(deleted) > 0 {
+			Log("BGWORKER: recycled %d stale local files", len(deleted))
+		}
 
 		// 5. periodic registry reconcile, safety net if notifications are lost
 		if p.isSharded {
@@ -1535,6 +1581,9 @@ func (p *BulkProcessor) RegistryListenThread() {
 		if _, err = conn.Exec(p.ctx, listenChannelName); err != nil {
 			_ = conn.Close(context.Background())
 			Debug("Error listening to instance registry changes: %v", err)
+			if !waitForContext(p.ctx, 5*time.Second) {
+				return
+			}
 			continue
 		}
 
@@ -1558,6 +1607,17 @@ func (p *BulkProcessor) RegistryListenThread() {
 			}
 			Debug("Instance registry refreshed on notification")
 		}
+	}
+}
+
+func waitForContext(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 
@@ -1611,7 +1671,7 @@ func (p *BulkProcessor) InsertV2(fileID, routingID string, records any, offset .
 		return ErrEmptyInput
 	}
 
-	if err := p.ensureRecordSchema(val); err != nil {
+	if err := p.ensureRecordSchema(val, true); err != nil {
 		return err
 	}
 
@@ -1695,7 +1755,7 @@ func (p *BulkProcessor) DeleteSyncV2(fileID, routingID string) error {
 	// 	Refer to processBufferTaskWithTransaction and guc:DeleteBeforeInsert, otherwise insert first and then delete may cause data loss
 	// 2. DeleteSyncV2 will only be called when data is actually deleted. If synchronous deletion fails,
 	// 	it will be converted to asynchronous, and the deletion will be successful after the database is restored.
-	if p.config.AsyncDelete {
+	if p.currentRuntimeConfig().AsyncDelete {
 		return p.DeleteV2(fileID, routingID)
 	}
 
@@ -1739,7 +1799,7 @@ func (p *BulkProcessor) DeleteByGroupV2(groupID, routingID string) error {
 	}
 	p.mutex.RUnlock()
 
-	if p.config.AsyncDelete {
+	if p.currentRuntimeConfig().AsyncDelete {
 		return p.DeleteAsyncGroupV2(groupID, routingID)
 	}
 
@@ -1879,14 +1939,15 @@ func (p *BulkProcessor) SaveBufferToFileAndGenerateTask(currentBuffer *Buffer, t
 	Debug("Buffer %s is full (records: %d), switching buffers",
 		currentBuffer.ID, currentBuffer.GetRecordCount())
 
-	// deduplicate records
-	deletedRecords, deletedGroupRecords, versionMap := currentBuffer.DeduplicateRecords(len(p.pkColumns) > 0, p.versionColIndex >= 0, p.config.DeleteBeforeInsert)
+	// Keep one coherent configuration snapshot while creating this task.
+	runtimeConfig := p.currentRuntimeConfig()
+	deletedRecords, deletedGroupRecords, versionMap := currentBuffer.DeduplicateRecords(len(p.pkColumns) > 0, p.versionColIndex >= 0, runtimeConfig.DeleteBeforeInsert)
 
 	columnNames := GetColumnNames(p.fields)
 
-	taskImportStrategy := p.config.ImportStrategy
+	taskImportStrategy := runtimeConfig.ImportStrategy
 
-	if err := currentBuffer.BufferWriteToFile(columnNames, p.s3Client, p.config.TuplesPrePartition, taskImportStrategy == CopyFromS3); err != nil {
+	if err := currentBuffer.BufferWriteToFile(columnNames, p.s3Client, runtimeConfig.TuplesPrePartition, taskImportStrategy == CopyFromS3); err != nil {
 		// if import strategy is CopyFromS3, and upload buffer to s3 failed, try to use InsertOnConflict
 		if strings.Contains(err.Error(), "Upload buffer to s3 failed") {
 			if taskImportStrategy == CopyFromS3 {
@@ -1977,8 +2038,9 @@ func (p *BulkProcessor) InsertThreadV2() {
 
 			currentBuffer := p.bufferManager.GetCurrentBuffer(bufKey)
 			if currentBuffer == nil || !p.bufferManager.IsActive(currentBuffer.ID) {
-				currentBuffer = p.bufferManager.NewBuffer(p.config.LocalFilePrefix, p.config.BufferMaxRecords, toAuxFile, record.InstanceID)
-				Debug("New buffer created: %s, max records: %d", currentBuffer.ID, p.config.BufferMaxRecords)
+				runtimeConfig := p.currentRuntimeConfig()
+				currentBuffer = p.bufferManager.NewBuffer(p.config.LocalFilePrefix, runtimeConfig.BufferMaxRecords, toAuxFile, record.InstanceID)
+				Debug("New buffer created: %s, max records: %d", currentBuffer.ID, runtimeConfig.BufferMaxRecords)
 				p.bufferManager.SetCurrentBuffer(currentBuffer, bufKey)
 
 				targetTable := p.config.PostgreSQL.Table
@@ -2067,14 +2129,15 @@ func (p *BulkProcessor) ImporterThreadV2() {
 			// buffer's keys, not whatever accumulated globally
 			feedbackKeysArray := task.FeedbackKeys
 
-			if p.config.MaxConcurrentWorkers > 1 {
+			runtimeConfig := p.currentRuntimeConfig()
+			if runtimeConfig.MaxConcurrentWorkers > 1 {
 				for {
 					currentActive := atomic.LoadInt32(&p.activeWorkers)
-					if currentActive < int32(p.config.MaxConcurrentWorkers) {
+					if currentActive < int32(runtimeConfig.MaxConcurrentWorkers) {
 						break
 					}
 					log.Printf("Waiting for available worker slot, current active: %d, max: %d, queue len: %d",
-						currentActive, p.config.MaxConcurrentWorkers, len(p.bufferTaskQueue))
+						currentActive, runtimeConfig.MaxConcurrentWorkers, len(p.bufferTaskQueue))
 					time.Sleep(500 * time.Millisecond)
 				}
 
@@ -2203,7 +2266,7 @@ func (p *BulkProcessor) instanceWorker(instanceID string, queue chan *BufferTask
 // so RecycleBuffers preserves its local file and checkpoint row for recovery.
 func (p *BulkProcessor) failBufferTaskOnShutdown(task *BufferTask, cause error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	if err := p.pgClient.UpdateDeltaCheckpointStatus(ctx, p.processId, []string{task.LocalFile}, CheckpointStatusFailed, -1, cause.Error()); err != nil {
+	if err := p.pgClient.FailDeltaCheckpoint(ctx, p.processId, p.bufferTaskTable(task), task.LocalFile, cause.Error(), -1); err != nil {
 		Debug("failed to update checkpoint for shutdown-abandoned file: %v\n", err)
 	}
 	cancel()
@@ -2219,7 +2282,7 @@ func (p *BulkProcessor) failBufferTaskOnShutdown(task *BufferTask, cause error) 
 // tasks: checkpoint failed, buffer marked ImportError, callback fired.
 func (p *BulkProcessor) failBufferTask(task *BufferTask, workerID int, cause error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	if err := p.pgClient.UpdateDeltaCheckpointStatus(ctx, p.processId, []string{task.LocalFile}, CheckpointStatusFailed, -1, cause.Error()); err != nil {
+	if err := p.pgClient.FailDeltaCheckpoint(ctx, p.processId, p.bufferTaskTable(task), task.LocalFile, cause.Error(), -1); err != nil {
 		Debug("Worker %d failed to update checkpoint for error file: %v\n", workerID, err)
 	}
 	cancel()
@@ -2237,17 +2300,18 @@ func (p *BulkProcessor) failBufferTask(task *BufferTask, workerID int, cause err
 // Terminal failure marks the buffer ImportError and fires the callback.
 func (p *BulkProcessor) processBufferTask(task *BufferTask, workerID int, feedbackKeysArray []string) {
 
+	runtimeConfig := p.currentRuntimeConfig()
 	isFailed := true
-	maxLoopNum := p.config.ImportTimeout / p.config.ImportErrorSleepTime
+	maxLoopNum := runtimeConfig.ImportTimeout / runtimeConfig.ImportErrorSleepTime
 	err := errors.New("Buffer Task timeout")
 
 	// assign the outer err so the exhausted-budget callback below reports the
 	// last real failure, not the placeholder timeout error
 	for range maxLoopNum {
-		if err = p.processBufferTaskWithTransaction(task, p.config.TaskTimeout); err != nil {
+		if err = p.processBufferTaskWithTransaction(task, runtimeConfig.TaskTimeout); err != nil {
 
 			Warning("Server is busy, will retry to process buffer task %s after %d seconds, error: %v",
-				task.TaskId, p.config.ImportErrorSleepTime, err)
+				task.TaskId, runtimeConfig.ImportErrorSleepTime, err)
 
 			// Update checkpoint with all error file
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -2259,7 +2323,7 @@ func (p *BulkProcessor) processBufferTask(task *BufferTask, workerID int, feedba
 			// all the errors without parsing error are not expected, we will retry, parsing error just call
 			// the callback and continue to next batch
 			shouldRetry := true
-			for _, skipError := range p.config.SkipServerErrorInfos {
+			for _, skipError := range runtimeConfig.SkipServerErrorInfos {
 				if strings.Contains(err.Error(), skipError) {
 					shouldRetry = false
 					break
@@ -2268,8 +2332,8 @@ func (p *BulkProcessor) processBufferTask(task *BufferTask, workerID int, feedba
 
 			if shouldRetry {
 				// RetrySleepMaxTime default is 10, so the random offset is -10 to 10
-				randomOffset := rand.Intn(p.config.RetrySleepMaxTime*2) - p.config.RetrySleepMaxTime
-				sleepTime := p.config.ImportErrorSleepTime + randomOffset
+				randomOffset := rand.Intn(runtimeConfig.RetrySleepMaxTime*2) - runtimeConfig.RetrySleepMaxTime
+				sleepTime := runtimeConfig.ImportErrorSleepTime + randomOffset
 				if sleepTime < 0 {
 					sleepTime = 1
 				}
@@ -2297,6 +2361,13 @@ func (p *BulkProcessor) processBufferTask(task *BufferTask, workerID int, feedba
 	}
 
 	if isFailed {
+		if task.LocalFile != "" {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if checkpointErr := p.pgClient.FailDeltaCheckpoint(ctx, p.processId, p.bufferTaskTable(task), task.LocalFile, err.Error(), -1); checkpointErr != nil {
+				Debug("Worker %d failed to persist terminal checkpoint state: %v", workerID, checkpointErr)
+			}
+			cancel()
+		}
 		p.bufferManager.SetBufferStatus(task.TaskId, BufferStatusImportError)
 		feedbackKeysString := fmt.Sprintf("failed %s is [%s].", p.config.FeedbackColumn, strings.Join(feedbackKeysArray, ","))
 		Error("Worker %d import task %s failed: %s after retry %d times", workerID, task.TaskId, feedbackKeysString, maxLoopNum)
@@ -2323,6 +2394,14 @@ func (p *BulkProcessor) processBufferTask(task *BufferTask, workerID int, feedba
 		defer p.metadataWg.Done()
 		p.completeBufferTaskMetadata(task, workerID)
 	}()
+}
+
+func (p *BulkProcessor) bufferTaskTable(task *BufferTask) string {
+	table := p.config.PostgreSQL.Table
+	if task.IsAux {
+		table += auxTableSuffix
+	}
+	return fmt.Sprintf("%s.%s", p.config.PostgreSQL.Schema, table)
 }
 
 func (p *BulkProcessor) insertDeltaCheckpointUntilDone(pgTable, localFilePath string) error {
@@ -2384,7 +2463,8 @@ func (p *BulkProcessor) completeBufferTaskMetadata(task *BufferTask, workerID in
 // processBufferTaskWithTransaction process buffer task with transaction, include delete and import
 func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask, timeout int) error {
 
-	deleteBeforeInsert := p.config.DeleteBeforeInsert
+	runtimeConfig := p.currentRuntimeConfig()
+	deleteBeforeInsert := runtimeConfig.DeleteBeforeInsert
 
 	if task.RecordCount <= 0 && len(task.DeletedRecords) == 0 && len(task.DeletedGroupRecords) == 0 {
 		Debug("task %s has no records, skip processing", task.TaskId)
@@ -2421,7 +2501,7 @@ func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask, timeo
 		targetTable += auxTableSuffix
 	}
 
-	updateOnConflict := p.config.UpdateOnConflict
+	updateOnConflict := runtimeConfig.UpdateOnConflict
 	if deleteBeforeInsert && len(task.FileVersionMap) > 0 {
 		updateOnConflict = false
 	}
@@ -2480,7 +2560,7 @@ func (p *BulkProcessor) processBufferTaskWithTransaction(task *BufferTask, timeo
 	if task.LocalFile != "" && task.RecordCount > 0 {
 		if task.ImportStrategy == InsertOnConflict {
 			if err := target.InsertIntoOnConflictFromLocal(ctx, tx, GetLocalFileFullPath(task.LocalFile), targetTable,
-				GetColumnNames(p.fields), updateOnConflict, p.config.InsertIntoBatchSize); err != nil {
+				GetColumnNames(p.fields), updateOnConflict, runtimeConfig.InsertIntoBatchSize); err != nil {
 				return fmt.Errorf("INSERT INTO failed: %w", err)
 			}
 		} else if task.ImportStrategy == CopyFromLocal {

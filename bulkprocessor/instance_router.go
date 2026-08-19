@@ -209,15 +209,7 @@ func (r *InstanceRouter) refreshRegistry(ctx context.Context, force bool) (bool,
 	}
 	r.clientsMutex.RUnlock()
 
-	newClients := make(map[string]*PostgreSQLClient, len(pending))
-	for _, row := range pending {
-		client, err := createVerifiedClient(ctx, row.instanceID, row.connstr, r.cfg)
-		if err != nil {
-			log.Printf("InstanceRouter: failed to connect instance %s: %v", row.instanceID, err)
-			continue
-		}
-		newClients[row.instanceID] = client
-	}
+	newClients := dialRegistryRows(ctx, pending, r.cfg, createVerifiedClient)
 
 	var stale []*PostgreSQLClient
 	seen := make(map[string]struct{}, len(regRows))
@@ -254,6 +246,40 @@ func (r *InstanceRouter) refreshRegistry(ctx context.Context, force bool) (bool,
 
 	r.lastRefresh = time.Now()
 	return true, nil
+}
+
+type registryClientFactory func(context.Context, string, string, PostgreSQLConfig) (*PostgreSQLClient, error)
+
+// dialRegistryRows dials independent rows concurrently so one dead row costs
+// one connection timeout, not one timeout multiplied by every pending row.
+func dialRegistryRows(ctx context.Context, pending []registryRow, cfg PostgreSQLConfig, factory registryClientFactory) map[string]*PostgreSQLClient {
+	type dialResult struct {
+		row    registryRow
+		client *PostgreSQLClient
+		err    error
+	}
+	results := make(chan dialResult, len(pending))
+	var dialWg sync.WaitGroup
+	for _, row := range pending {
+		dialWg.Add(1)
+		go func(row registryRow) {
+			defer dialWg.Done()
+			client, err := factory(ctx, row.instanceID, row.connstr, cfg)
+			results <- dialResult{row: row, client: client, err: err}
+		}(row)
+	}
+	dialWg.Wait()
+	close(results)
+
+	newClients := make(map[string]*PostgreSQLClient, len(pending))
+	for result := range results {
+		if result.err != nil {
+			log.Printf("InstanceRouter: failed to connect instance %s: %v", result.row.instanceID, result.err)
+			continue
+		}
+		newClients[result.row.instanceID] = result.client
+	}
+	return newClients
 }
 
 // GetDefaultInstanceID reads the sentinel row of the instance routing table.

@@ -66,6 +66,23 @@ func TestValidateShardedUpdatesRejectsRoutingID(t *testing.T) {
 	}
 }
 
+func TestSQLCodeOnlyMatchesPostgresEscapeAndDollarQuotedStrings(t *testing.T) {
+	for _, fragment := range []string{
+		`note = E'escaped \' ) SELECT text' AND (state = 'ready')`,
+		`note = $$) SELECT secret; -- still text$$ AND (state = 'ready')`,
+		`note = $tag$) WITH hidden AS (SELECT 1);$tag$ AND (state = 'ready')`,
+	} {
+		if err := validateShardedSQLFragment("condition", fragment, true); err != nil {
+			t.Errorf("valid PostgreSQL quoted fragment %q rejected: %v", fragment, err)
+		}
+	}
+	for _, fragment := range []string{`note = E'unterminated \'`, `note = $tag$unterminated`} {
+		if err := validateShardedSQLFragment("condition", fragment, true); !errors.Is(err, ErrUnsafeShardedSQL) {
+			t.Errorf("unterminated PostgreSQL string %q: expected ErrUnsafeShardedSQL, got %v", fragment, err)
+		}
+	}
+}
+
 func TestValidateShardedSQLRejectsScopeEscapes(t *testing.T) {
 	if err := validateShardedSQLFragment("condition", "TRUE) OR routing_id = 'other' OR (FALSE", false); !errors.Is(err, ErrUnsafeShardedSQL) {
 		t.Fatalf("unbalanced condition: expected ErrUnsafeShardedSQL, got %v", err)

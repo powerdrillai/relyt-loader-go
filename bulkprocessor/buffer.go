@@ -156,8 +156,15 @@ func (bm *BufferManager) RecycleBuffers() []string {
 	return filePaths
 }
 
-func (bm *BufferManager) RecycleLocalDir(localFilePrefix string, interval_days int) []string {
-	cutoffDate := time.Now().AddDate(0, 0, -interval_days)
+func (bm *BufferManager) RecycleLocalDir(localFilePrefix string, intervalDays int) []string {
+	return bm.RecycleLocalDirExcept(localFilePrefix, intervalDays, nil)
+}
+
+// RecycleLocalDirExcept bounds stale-disk growth while retaining files which
+// still have recoverable checkpoint metadata. Unknown old files (for example
+// remnants predating checkpoint insertion) follow the historical age policy.
+func (bm *BufferManager) RecycleLocalDirExcept(localFilePrefix string, intervalDays int, protected map[string]struct{}) []string {
+	cutoffDate := time.Now().AddDate(0, 0, -intervalDays)
 
 	var deletedPaths []string
 
@@ -180,16 +187,42 @@ func (bm *BufferManager) RecycleLocalDir(localFilePrefix string, interval_days i
 			return nil
 		}
 
-		if dirDate.Before(cutoffDate) {
+		if !dirDate.Before(cutoffDate) {
+			return filepath.SkipDir
+		}
+		if protected == nil {
 			log.Printf("Deleting old local directory: %s (date: %s)", path, dirName)
 			if err := os.RemoveAll(path); err != nil {
 				log.Printf("Failed to delete directory %s: %v", path, err)
-				return nil
+			} else {
+				deletedPaths = append(deletedPaths, path)
 			}
-			deletedPaths = append(deletedPaths, path)
+			return filepath.SkipDir
 		}
 
-		return nil
+		containsProtected := false
+		_ = filepath.Walk(path, func(candidate string, candidateInfo os.FileInfo, walkErr error) error {
+			if walkErr != nil || candidateInfo.IsDir() {
+				return nil
+			}
+			if _, keep := protected[candidate]; keep {
+				containsProtected = true
+				return nil
+			}
+			if err := os.Remove(candidate); err != nil {
+				log.Printf("Failed to delete old local file %s: %v", candidate, err)
+			} else {
+				deletedPaths = append(deletedPaths, candidate)
+			}
+			return nil
+		})
+		if !containsProtected {
+			log.Printf("Deleting old local directory: %s (date: %s)", path, dirName)
+			if err := os.RemoveAll(path); err != nil {
+				log.Printf("Failed to delete directory %s: %v", path, err)
+			}
+		}
+		return filepath.SkipDir
 	})
 
 	if err != nil {
@@ -663,7 +696,9 @@ func NewBufferTask(buffer *Buffer, deletedRecords []RecordIndex, deletedGroupRec
 	}
 	buffer.Records = nil
 	buffer.MaxVersionMap = nil
-	buffer.FeedbackKeys = nil
+	// Keep the small key set on the frozen buffer as well as the task. If
+	// shutdown wins the enqueue race, the caller still has the keys needed to
+	// report/requeue the failed records.
 	return &bufferTask
 }
 

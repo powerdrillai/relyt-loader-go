@@ -9,6 +9,41 @@ import (
 	"time"
 )
 
+func TestDialRegistryRowsDoesNotSerializeDeadInstances(t *testing.T) {
+	rows := []registryRow{{instanceID: "one"}, {instanceID: "two"}, {instanceID: "three"}}
+	started := make(chan struct{}, len(rows))
+	release := make(chan struct{})
+	factory := func(ctx context.Context, instanceID, _ string, _ PostgreSQLConfig) (*PostgreSQLClient, error) {
+		started <- struct{}{}
+		select {
+		case <-release:
+			return nil, errors.New("unreachable " + instanceID)
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	done := make(chan struct{})
+	go func() {
+		dialRegistryRows(context.Background(), rows, PostgreSQLConfig{}, factory)
+		close(done)
+	}()
+	for range rows {
+		select {
+		case <-started:
+		case <-time.After(250 * time.Millisecond):
+			close(release)
+			t.Fatal("registry dials were serialized")
+		}
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("concurrent registry dials did not finish")
+	}
+}
+
 // TestBufferKeyDistinct verifies main/aux/instance buffer keys never collide.
 func TestBufferKeyDistinct(t *testing.T) {
 	mainKey := bufferKey("", false)
