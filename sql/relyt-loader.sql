@@ -71,7 +71,7 @@ CREATE TABLE IF NOT EXISTS relyt_sys.relyt_loader_delta_checkpoint (
 	error_records INT DEFAULT 0,
     PRIMARY KEY (process_id, filepath)
 ) using heap;
-GRANT SELECT,INSERT ON relyt_sys.relyt_loader_delta_checkpoint TO public;
+GRANT SELECT,INSERT,UPDATE,DELETE ON relyt_sys.relyt_loader_delta_checkpoint TO public;
 
 -- buffer_max_records and insert_into_batch_size per table
 CREATE TABLE IF NOT EXISTS relyt_sys.relyt_loader_table_config (
@@ -85,6 +85,15 @@ CREATE TABLE IF NOT EXISTS relyt_sys.relyt_loader_table_config (
 ) using heap;
 GRANT SELECT,INSERT ON relyt_sys.relyt_loader_table_config TO public;
 
+-- instance registry for instance-level sharding, connstr has no password
+CREATE TABLE IF NOT EXISTS relyt_sys.relyt_instance_registry (
+    instance_id TEXT PRIMARY KEY,
+    connstr TEXT NOT NULL,
+    status TEXT DEFAULT 'active',
+    updated_at TIMESTAMPTZ DEFAULT now()
+) using heap;
+GRANT SELECT ON relyt_sys.relyt_instance_registry TO public;
+
 -- create a table to store the routing table
 --
 -- CREATE TABLE IF NOT EXISTS relyt_sys.XXXX_relyt_routing (
@@ -92,3 +101,20 @@ GRANT SELECT,INSERT ON relyt_sys.relyt_loader_table_config TO public;
 --     store_table_name TEXT NOT NULL
 -- ) USING heap DISTRIBUTED NONE;
 -- GRANT SELECT,INSERT ON relyt_sys.XXXX_relyt_routing TO public;
+
+-- create a table to store the instance routing table (instance-level sharding),
+-- mappings are immutable so UPDATE is revoked. note REVOKE does not bind the
+-- table owner: create the table under a separate owning role, or accept that
+-- immutability is enforced by the application only.
+-- the sentinel row routing_id = '-1' holds the default instance id for new
+-- tenants; the SDK rejects '-1' as a real routing_id. to change the default,
+-- DELETE + INSERT the sentinel row in one transaction; the role doing the flip
+-- needs DELETE (or ownership) on the table, which the grants below do not give.
+--
+-- CREATE TABLE IF NOT EXISTS relyt_sys.XXXX_relyt_instance_routing (
+--     routing_id TEXT PRIMARY KEY,
+--     instance_id TEXT NOT NULL
+-- ) USING heap DISTRIBUTED NONE;
+-- GRANT SELECT,INSERT ON relyt_sys.XXXX_relyt_instance_routing TO public;
+-- REVOKE UPDATE ON relyt_sys.XXXX_relyt_instance_routing FROM public;
+-- INSERT INTO relyt_sys.XXXX_relyt_instance_routing VALUES ('-1', 'the-default-instance-id');

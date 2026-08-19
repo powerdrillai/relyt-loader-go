@@ -18,7 +18,7 @@ type FieldInfo struct {
 
 // GetStructFields returns information about the fields in a struct type
 func GetStructFields(structType reflect.Type) ([]FieldInfo, error) {
-	if structType.Kind() == reflect.Ptr {
+	if structType.Kind() == reflect.Pointer {
 		structType = structType.Elem()
 	}
 
@@ -41,10 +41,11 @@ func GetStructFields(structType reflect.Type) ([]FieldInfo, error) {
 			continue
 		}
 
-		// Handle JSON tag options (e.g., "name,omitempty")
-		jsonName := jsonTag
-		if comma := reflect.StructTag(jsonTag).Get(","); comma != "" {
-			jsonName = jsonName[:len(jsonName)-len(comma)-1]
+		// Handle relyt tag options (e.g. "name,omitempty"). StructTag.Get
+		// cannot parse an already-extracted tag value.
+		jsonName, _, _ := strings.Cut(jsonTag, ",")
+		if jsonName == "" {
+			continue
 		}
 
 		// print Name and JSONName for debugging
@@ -62,9 +63,9 @@ func GetStructFields(structType reflect.Type) ([]FieldInfo, error) {
 }
 
 // GetFieldValues returns the values of the fields in a struct as strings
-func GetFieldValues(obj interface{}, fields []FieldInfo) ([]string, error) {
+func GetFieldValues(obj any, fields []FieldInfo) ([]string, error) {
 	val := reflect.ValueOf(obj)
-	if val.Kind() == reflect.Ptr {
+	if val.Kind() == reflect.Pointer {
 		val = val.Elem()
 	}
 
@@ -95,14 +96,14 @@ func formatValue(val reflect.Value) string {
 		return fmt.Sprintf("%f", val.Float())
 	case reflect.Bool:
 		return fmt.Sprintf("%t", val.Bool())
-	case reflect.Ptr:
+	case reflect.Pointer:
 		if val.IsNil() {
 			return ""
 		}
 		return formatValue(val.Elem())
 	case reflect.Struct:
 		// Handle special types like time.Time
-		if val.Type() == reflect.TypeOf(time.Time{}) {
+		if val.Type() == reflect.TypeFor[time.Time]() {
 			t := val.Interface().(time.Time)
 			return t.Format(time.RFC3339)
 		}
@@ -140,7 +141,7 @@ func GetColumnDefinitions(fields []FieldInfo) []string {
 
 // getSQLType returns the SQL type for a Go type
 func getSQLType(t reflect.Type) string {
-	if t.Kind() == reflect.Ptr {
+	if t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
 
@@ -157,7 +158,7 @@ func getSQLType(t reflect.Type) string {
 		return "BOOLEAN"
 	case reflect.Struct:
 		// Handle special types like time.Time
-		if t == reflect.TypeOf(time.Time{}) {
+		if t == reflect.TypeFor[time.Time]() {
 			return "TIMESTAMP WITH TIME ZONE"
 		}
 		return "TEXT"
@@ -166,7 +167,8 @@ func getSQLType(t reflect.Type) string {
 	}
 }
 
-// GetColumnIndex returns the index for a given field name
+// GetColumnIndex returns the original struct-field index for a given column.
+// Keep this exported behavior for compatibility with existing callers.
 func GetColumnIndex(fields []FieldInfo, fieldname string) int {
 	for _, field := range fields {
 		if field.JSONName == fieldname {
@@ -174,4 +176,14 @@ func GetColumnIndex(fields []FieldInfo, fieldname string) int {
 		}
 	}
 	return -1 // Not found
+}
+
+// getValueColumnIndex returns the coordinate in GetFieldValues' compact slice.
+func getValueColumnIndex(fields []FieldInfo, fieldname string) int {
+	for i, field := range fields {
+		if field.JSONName == fieldname {
+			return i
+		}
+	}
+	return -1
 }

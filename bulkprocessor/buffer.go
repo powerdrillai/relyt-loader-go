@@ -22,12 +22,13 @@ const (
 )
 
 const (
-	BufferStatusActive      BufferStatus = iota // buffer is active, records can be added
-	BufferStatusFrozen                          // buffer is full, no more records can be added, will be flushed to local csv file
-	BufferStatusFlushed                         // buffer is written to local csv file, but not import to database
-	BufferStatusImported                        // buffer is imported to database
-	BufferStatusFlushError                      // buffer flushed to local csv file error
-	BufferStatusImportError                     // buffer imported to database error
+	BufferStatusActive            BufferStatus = iota // buffer is active, records can be added
+	BufferStatusFrozen                                // buffer is full, no more records can be added, will be flushed to local csv file
+	BufferStatusFlushed                               // buffer is written to local csv file, but not import to database
+	BufferStatusImported                              // buffer is imported to database
+	BufferStatusFlushError                            // buffer flushed to local csv file error
+	BufferStatusImportError                           // buffer imported to database error
+	BufferStatusCheckpointPending                     // shard committed; main completion metadata pending
 )
 
 const (
@@ -37,28 +38,33 @@ const (
 
 // Record 表示一条记录
 type Record struct {
-	Tag       RecordTag
-	FileID    string
-	RoutingID string
-	GroupID   string
-	PKValues  []string
-	Version   string
-	Values    []string
-	Offset    int64 // Kafka offset for this record
+	Tag        RecordTag
+	FileID     string
+	RoutingID  string
+	GroupID    string
+	PKValues   []string
+	Version    string
+	Values     []string
+	Offset     int64  // Kafka offset for this record
+	InstanceID string // owning instance for sharded tables, "" otherwise
 }
 
 // Buffer 表示一个缓冲区
 type Buffer struct {
-	ID            string
-	Records       []*Record
-	MaxRecords    int
-	S3FilePath    string
-	LocalFilePath string
-	CreatedAt     time.Time
-	BufferMutex   sync.RWMutex
-	status        BufferStatus
-	MaxOffset     int64 // Maximum offset in this buffer
-	MaxVersionMap map[RecordIndex]string
+	ID              string
+	Records         []*Record
+	MaxRecords      int
+	S3FilePath      string
+	LocalFilePath   string
+	CreatedAt       time.Time
+	BufferMutex     sync.RWMutex
+	status          BufferStatus
+	MaxOffset       int64 // Maximum offset in this buffer
+	MaxVersionMap   map[RecordIndex]string
+	FeedbackKeys    map[string]bool // feedback column values in this buffer (V2 path)
+	InstanceID      string
+	IsAux           bool
+	CheckpointReady <-chan error // completion of the initial main checkpoint insert
 }
 
 type BufferManager struct {
@@ -67,19 +73,26 @@ type BufferManager struct {
 	processId             string
 	mutex                 sync.RWMutex
 	bufferOperationsMutex sync.Mutex
-	buffer                *Buffer
-	auxBuffer             *Buffer
+	currentBuffers        map[string]*Buffer // current buffer per key, see bufferKey
+}
+
+// bufferKey identifies a current buffer: "" main, "aux" aux table,
+// instanceID for sharded tables. Aux and sharded modes never combine.
+func bufferKey(instanceID string, isAux bool) string {
+	if isAux {
+		return "aux"
+	}
+	return instanceID
 }
 
 // NewBufferManager 创建新的缓冲区管理器
 func NewBufferManager(filePrefix string, processId string) *BufferManager {
 	// Create a unique batch directory identifier
 	return &BufferManager{
-		buffers:    make(map[string]*Buffer),
-		filePrefix: filePrefix,
-		processId:  processId,
-		buffer:     nil,
-		auxBuffer:  nil,
+		buffers:        make(map[string]*Buffer),
+		filePrefix:     filePrefix,
+		processId:      processId,
+		currentBuffers: make(map[string]*Buffer),
 	}
 }
 
@@ -90,13 +103,16 @@ func (bm *BufferManager) GetLocalCSVDir() string {
 }
 
 // NewBuffer 创建新的缓冲区
-func (bm *BufferManager) NewBuffer(localFilePrefix string, maxRecords int, isAux bool) *Buffer {
+func (bm *BufferManager) NewBuffer(localFilePrefix string, maxRecords int, isAux bool, instanceID string) *Buffer {
 	id := uuid.New().String()[:8]
 	timestamp := time.Now().Format("150405.000")
 
 	buffer_id := fmt.Sprintf("%s_%s_%s", BufferPrefixNormal, timestamp, id)
 	if isAux {
 		buffer_id = fmt.Sprintf("%s_%s_%s", BufferPrefixAux, timestamp, id)
+	} else if instanceID != "" {
+		// instance id in the name is for debuggability only, never parsed back
+		buffer_id = fmt.Sprintf("%s_%s_%s_%s", BufferPrefixNormal, instanceID, timestamp, id)
 	}
 
 	fileDir := bm.GetLocalCSVDir()
@@ -112,6 +128,9 @@ func (bm *BufferManager) NewBuffer(localFilePrefix string, maxRecords int, isAux
 		CreatedAt:     time.Now(),
 		status:        BufferStatusActive,
 		MaxVersionMap: make(map[RecordIndex]string),
+		FeedbackKeys:  make(map[string]bool),
+		InstanceID:    instanceID,
+		IsAux:         isAux,
 	}
 	bm.mutex.Lock()
 	defer bm.mutex.Unlock()
@@ -137,8 +156,15 @@ func (bm *BufferManager) RecycleBuffers() []string {
 	return filePaths
 }
 
-func (bm *BufferManager) RecycleLocalDir(localFilePrefix string, interval_days int) []string {
-	cutoffDate := time.Now().AddDate(0, 0, -interval_days)
+func (bm *BufferManager) RecycleLocalDir(localFilePrefix string, intervalDays int) []string {
+	return bm.RecycleLocalDirExcept(localFilePrefix, intervalDays, nil)
+}
+
+// RecycleLocalDirExcept bounds stale-disk growth while retaining files which
+// still have recoverable checkpoint metadata. Unknown old files (for example
+// remnants predating checkpoint insertion) follow the historical age policy.
+func (bm *BufferManager) RecycleLocalDirExcept(localFilePrefix string, intervalDays int, protected map[string]struct{}) []string {
+	cutoffDate := time.Now().AddDate(0, 0, -intervalDays)
 
 	var deletedPaths []string
 
@@ -161,16 +187,42 @@ func (bm *BufferManager) RecycleLocalDir(localFilePrefix string, interval_days i
 			return nil
 		}
 
-		if dirDate.Before(cutoffDate) {
+		if !dirDate.Before(cutoffDate) {
+			return filepath.SkipDir
+		}
+		if protected == nil {
 			log.Printf("Deleting old local directory: %s (date: %s)", path, dirName)
 			if err := os.RemoveAll(path); err != nil {
 				log.Printf("Failed to delete directory %s: %v", path, err)
-				return nil
+			} else {
+				deletedPaths = append(deletedPaths, path)
 			}
-			deletedPaths = append(deletedPaths, path)
+			return filepath.SkipDir
 		}
 
-		return nil
+		containsProtected := false
+		_ = filepath.Walk(path, func(candidate string, candidateInfo os.FileInfo, walkErr error) error {
+			if walkErr != nil || candidateInfo.IsDir() {
+				return nil
+			}
+			if _, keep := protected[candidate]; keep {
+				containsProtected = true
+				return nil
+			}
+			if err := os.Remove(candidate); err != nil {
+				log.Printf("Failed to delete old local file %s: %v", candidate, err)
+			} else {
+				deletedPaths = append(deletedPaths, candidate)
+			}
+			return nil
+		})
+		if !containsProtected {
+			log.Printf("Deleting old local directory: %s (date: %s)", path, dirName)
+			if err := os.RemoveAll(path); err != nil {
+				log.Printf("Failed to delete directory %s: %v", path, err)
+			}
+		}
+		return filepath.SkipDir
 	})
 
 	if err != nil {
@@ -180,25 +232,33 @@ func (bm *BufferManager) RecycleLocalDir(localFilePrefix string, interval_days i
 	return deletedPaths
 }
 
-func (bm *BufferManager) GetCurrentBuffer(isAux bool) *Buffer {
+func (bm *BufferManager) GetCurrentBuffer(key string) *Buffer {
 	bm.mutex.RLock()
 	defer bm.mutex.RUnlock()
-	if isAux {
-		return bm.auxBuffer
-	}
-	return bm.buffer
+	return bm.currentBuffers[key]
 }
 
-func (bm *BufferManager) SetCurrentBuffer(newBuffer *Buffer, isAux bool) *Buffer {
+func (bm *BufferManager) SetCurrentBuffer(newBuffer *Buffer, key string) *Buffer {
 	bm.mutex.Lock()
 	defer bm.mutex.Unlock()
 
-	if isAux {
-		bm.auxBuffer = newBuffer
+	if newBuffer == nil {
+		delete(bm.currentBuffers, key)
 	} else {
-		bm.buffer = newBuffer
+		bm.currentBuffers[key] = newBuffer
 	}
 	return newBuffer
+}
+
+// GetCurrentBufferKeys returns the keys of all current buffers.
+func (bm *BufferManager) GetCurrentBufferKeys() []string {
+	bm.mutex.RLock()
+	defer bm.mutex.RUnlock()
+	keys := make([]string, 0, len(bm.currentBuffers))
+	for key := range bm.currentBuffers {
+		keys = append(keys, key)
+	}
+	return keys
 }
 
 func (bm *BufferManager) SetBufferStatus(bufferID string, status BufferStatus) {
@@ -206,6 +266,11 @@ func (bm *BufferManager) SetBufferStatus(bufferID string, status BufferStatus) {
 	defer bm.mutex.Unlock()
 	buffer, exists := bm.buffers[bufferID]
 	if !exists {
+		return
+	}
+	// terminal statuses are final: a racing non-terminal write must not
+	// resurrect a buffer that was already imported or failed
+	if buffer.status == BufferStatusImported || buffer.status == BufferStatusImportError {
 		return
 	}
 	buffer.status = status
@@ -245,6 +310,16 @@ func (bm *BufferManager) GetBufferByID(bufferID string) *Buffer {
 		return buffer
 	}
 	return nil
+}
+
+func (bm *BufferManager) GetBufferStatus(bufferID string) (BufferStatus, bool) {
+	bm.mutex.RLock()
+	defer bm.mutex.RUnlock()
+	buffer, exists := bm.buffers[bufferID]
+	if !exists {
+		return 0, false
+	}
+	return buffer.status, true
 }
 
 func (bm *BufferManager) IsActive(bufferID string) bool {
@@ -315,6 +390,15 @@ func (b *Buffer) GetMaxOffset() int64 {
 	b.BufferMutex.RLock()
 	defer b.BufferMutex.RUnlock()
 	return b.MaxOffset
+}
+
+// GetFeedbackKeys returns the buffer's feedback keys as a slice.
+func (b *Buffer) GetFeedbackKeys() []string {
+	keys := make([]string, 0, len(b.FeedbackKeys))
+	for key := range b.FeedbackKeys {
+		keys = append(keys, key)
+	}
+	return keys
 }
 
 type RecordIndex struct {
@@ -530,12 +614,9 @@ func (b *Buffer) BufferWriteToFile(headers []string, s3Client *S3Client, tuplesP
 		totalRecords := len(validRecords)
 		numPartitions := (totalRecords + tuplesPrePartition - 1) / tuplesPrePartition // Ceiling division
 
-		for i := 0; i < numPartitions; i++ {
+		for i := range numPartitions {
 			start := i * tuplesPrePartition
-			end := start + tuplesPrePartition
-			if end > totalRecords {
-				end = totalRecords
-			}
+			end := min(start+tuplesPrePartition, totalRecords)
 
 			if start >= totalRecords {
 				break
@@ -587,8 +668,12 @@ type BufferTask struct {
 	DeletedRecords      []RecordIndex
 	DeletedGroupRecords []GroupIndex
 	FileVersionMap      map[RecordIndex]string
-	MaxOffset           int64 // Maximum offset in this buffer task
-	ImportStrategy      int   // Import strategy
+	MaxOffset           int64  // Maximum offset in this buffer task
+	ImportStrategy      int    // Import strategy
+	InstanceID          string // owning instance for sharded tables, "" otherwise
+	IsAux               bool
+	FeedbackKeys        []string // feedback column values of this buffer's records
+	CheckpointReady     <-chan error
 }
 
 // NewBufferTask create a new buffer task
@@ -604,17 +689,21 @@ func NewBufferTask(buffer *Buffer, deletedRecords []RecordIndex, deletedGroupRec
 		CreatedAt:           time.Now(),
 		MaxOffset:           buffer.GetMaxOffset(),
 		ImportStrategy:      importStrategy,
+		InstanceID:          buffer.InstanceID,
+		IsAux:               buffer.IsAux,
+		FeedbackKeys:        buffer.GetFeedbackKeys(),
+		CheckpointReady:     buffer.CheckpointReady,
 	}
 	buffer.Records = nil
 	buffer.MaxVersionMap = nil
+	// Keep the small key set on the frozen buffer as well as the task. If
+	// shutdown wins the enqueue race, the caller still has the keys needed to
+	// report/requeue the failed records.
 	return &bufferTask
 }
 
-func (bm *BufferManager) GetCurrentBufferInfo(isAux bool) *Buffer {
+func (bm *BufferManager) GetCurrentBufferInfo(key string) *Buffer {
 	bm.mutex.RLock()
 	defer bm.mutex.RUnlock()
-	if isAux {
-		return bm.auxBuffer
-	}
-	return bm.buffer
+	return bm.currentBuffers[key]
 }

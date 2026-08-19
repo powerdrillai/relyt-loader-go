@@ -263,10 +263,7 @@ func (c *S3Client) DeleteObjects(ctx context.Context, keys []string) error {
 	const maxKeysPerRequest = 1000
 
 	for i := 0; i < len(keys); i += maxKeysPerRequest {
-		end := i + maxKeysPerRequest
-		if end > len(keys) {
-			end = len(keys)
-		}
+		end := min(i+maxKeysPerRequest, len(keys))
 
 		// Create batch for deletion
 		batch := keys[i:end]

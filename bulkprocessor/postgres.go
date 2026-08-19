@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -145,7 +146,7 @@ func (c *PostgreSQLClient) UpdateCheckpointFile(ctx context.Context, processId s
 	}
 
 	// Parse existing file details
-	if err := json.Unmarshal(fileDetailsJSON, &fileDetails); err != nil {
+	if err = json.Unmarshal(fileDetailsJSON, &fileDetails); err != nil {
 		return errors.Wrap(err, "failed to parse file details")
 	}
 
@@ -644,13 +645,7 @@ func (c *PostgreSQLClient) ImportFromExternalTable(ctx context.Context, external
 			updateSetParts := make([]string, 0, len(columns))
 			for _, col := range columns {
 				// Skip primary key columns in the update part
-				isPK := false
-				for _, pk := range pkColumns {
-					if pk == col {
-						isPK = true
-						break
-					}
-				}
+				isPK := slices.Contains(pkColumns, col)
 				if !isPK {
 					updateSetParts = append(updateSetParts, fmt.Sprintf("%s = excluded.%s", col, col))
 				}
@@ -715,7 +710,7 @@ func (c *PostgreSQLClient) DropExternalTable(ctx context.Context, tableName stri
 }
 
 // ExecuteSQL executes a SQL statement
-func (c *PostgreSQLClient) ExecuteSQL(ctx context.Context, sql string, args ...interface{}) (pgx.Rows, error) {
+func (c *PostgreSQLClient) ExecuteSQL(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
 	return c.pool.Query(ctx, sql, args...)
 }
 
@@ -823,19 +818,43 @@ func (c *PostgreSQLClient) GetTableSchema(ctx context.Context) ([]TableColumn, e
 	return columns, nil
 }
 
-// Insert a delta checkpoint record
-func (c *PostgreSQLClient) InsertDeltaCheckpoint(ctx context.Context, processId string, pgTable string, filePath string) error {
-	sqlStatement := `
+const insertDeltaCheckpointSQL = `
 	INSERT INTO relyt_sys.relyt_loader_delta_checkpoint
 	(process_id, pg_table, status, start_time, finish_time, filepath)
 	VALUES ($1, $2, $3, $4, $5, $6)
-	`
+	ON CONFLICT (process_id, filepath) DO NOTHING
+`
 
-	_, err := c.pool.Exec(ctx, sqlStatement, processId, pgTable, string(CheckpointStatusRunning), time.Now(), nil, filePath)
+// Insert a delta checkpoint record. The insert is idempotent because a timeout
+// can be returned after PostgreSQL has already committed the first attempt.
+func (c *PostgreSQLClient) InsertDeltaCheckpoint(ctx context.Context, processId string, pgTable string, filePath string) error {
+	_, err := c.pool.Exec(ctx, insertDeltaCheckpointSQL, processId, pgTable, string(CheckpointStatusRunning), time.Now(), nil, filePath)
 	if err != nil {
 		return errors.Wrap(err, "failed to insert delta checkpoint")
 	}
 
+	return nil
+}
+
+const failDeltaCheckpointSQL = `
+	INSERT INTO relyt_sys.relyt_loader_delta_checkpoint
+	(process_id, pg_table, status, start_time, finish_time, filepath, error_message, error_records)
+	VALUES ($1, $2, $3, $4, $4, $5, $6, $7)
+	ON CONFLICT (process_id, filepath) DO UPDATE SET
+		finish_time = EXCLUDED.finish_time,
+		status = EXCLUDED.status,
+		error_message = EXCLUDED.error_message,
+		error_records = EXCLUDED.error_records
+`
+
+// FailDeltaCheckpoint atomically creates or fails a row. This closes the race
+// with an asynchronous initial INSERT: whichever statement wins, the final
+// durable state is FAILED.
+func (c *PostgreSQLClient) FailDeltaCheckpoint(ctx context.Context, processID, pgTable, filepath, errorMessage string, errorRecords int) error {
+	_, err := c.pool.Exec(ctx, failDeltaCheckpointSQL, processID, pgTable, string(CheckpointStatusFailed), time.Now(), filepath, errorMessage, errorRecords)
+	if err != nil {
+		return errors.Wrap(err, "failed to upsert failed delta checkpoint")
+	}
 	return nil
 }
 
@@ -852,7 +871,7 @@ func (c *PostgreSQLClient) UpdateDeltaCheckpointStatus(ctx context.Context, proc
 	WHERE process_id = $5 and filepath in (%s)
 	`, strings.Join(placeholders, ", "))
 
-	args := make([]interface{}, len(filePaths)+5)
+	args := make([]any, len(filePaths)+5)
 	args[0] = time.Now()
 	args[1] = string(status)
 	args[2] = errorMessage
@@ -863,12 +882,49 @@ func (c *PostgreSQLClient) UpdateDeltaCheckpointStatus(ctx context.Context, proc
 		args[i+5] = filePath
 	}
 
-	_, err := c.pool.Exec(ctx, sqlStatement, args...)
-	if err != nil {
+	if _, err := c.pool.Exec(ctx, sqlStatement, args...); err != nil {
 		return errors.Wrap(err, "failed to update delta checkpoint")
+	}
+	// Some supported servers do not report a reliable UPDATE row count. Verify
+	// the durable state explicitly so UPDATE-before-INSERT cannot look successful.
+	for _, filePath := range filePaths {
+		var persisted string
+		if err := c.pool.QueryRow(ctx, `
+			SELECT status FROM relyt_sys.relyt_loader_delta_checkpoint
+			WHERE process_id = $1 AND filepath = $2`, processId, filePath).Scan(&persisted); err != nil {
+			return errors.Wrap(err, "failed to verify delta checkpoint update")
+		}
+		if persisted != string(status) {
+			return errors.Errorf("failed to verify delta checkpoint update: status is %q, want %q", persisted, status)
+		}
 	}
 
 	return nil
+}
+
+// GetIncompleteDeltaCheckpointFilepaths returns local artifacts that still
+// represent recoverable work, across current and previous process IDs.
+func (c *PostgreSQLClient) GetIncompleteDeltaCheckpointFilepaths(ctx context.Context) (map[string]struct{}, error) {
+	rows, err := c.pool.Query(ctx, `
+		SELECT filepath FROM relyt_sys.relyt_loader_delta_checkpoint
+		WHERE status <> $1 AND filepath IS NOT NULL AND filepath <> ''`, string(CheckpointStatusCompleted))
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to list incomplete delta checkpoints")
+	}
+	defer rows.Close()
+
+	filepaths := make(map[string]struct{})
+	for rows.Next() {
+		var filepath string
+		if err := rows.Scan(&filepath); err != nil {
+			return nil, errors.Wrap(err, "failed to scan incomplete delta checkpoint")
+		}
+		filepaths[filepath] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, errors.Wrap(err, "failed to iterate incomplete delta checkpoints")
+	}
+	return filepaths, nil
 }
 
 // Delete delta checkpoint record
@@ -888,7 +944,7 @@ func (c *PostgreSQLClient) DeleteDeltaCheckpointByProcessIdAndFilepaths(ctx cont
 	WHERE process_id = $1 and filepath in (%s)
 	`, strings.Join(placeholders, ", "))
 
-	args := make([]interface{}, len(filePaths)+1)
+	args := make([]any, len(filePaths)+1)
 	args[0] = processId
 	for i, filePath := range filePaths {
 		args[i+1] = filePath
@@ -965,6 +1021,36 @@ func (c *PostgreSQLClient) CreateRoutingTableTrigger(ctx context.Context, routin
 	return nil
 }
 
+// CreateRegistryTrigger creates a trigger to notify changes in
+// relyt_sys.relyt_instance_registry, mirroring CreateRoutingTableTrigger.
+func (c *PostgreSQLClient) CreateRegistryTrigger(ctx context.Context, channelName string) error {
+	createTriggerFunc := fmt.Sprintf(
+		`CREATE OR REPLACE FUNCTION relyt_sys.notify_instance_registry_change()
+		 RETURNS trigger AS $$
+		 BEGIN
+		   PERFORM pg_notify('%s', 'instance registry changed');
+		   RETURN NEW;
+		 END;
+		 $$ LANGUAGE plpgsql;`, channelName)
+
+	createTrigger := `
+	DROP TRIGGER IF EXISTS instance_registry_change_trigger ON relyt_sys.relyt_instance_registry;
+	CREATE TRIGGER instance_registry_change_trigger
+	AFTER INSERT OR UPDATE OR DELETE ON relyt_sys.relyt_instance_registry
+	FOR EACH ROW EXECUTE FUNCTION relyt_sys.notify_instance_registry_change();
+	`
+
+	if _, err := c.pool.Exec(ctx, createTriggerFunc); err != nil {
+		return errors.Wrap(err, "failed to create registry trigger function")
+	}
+
+	if _, err := c.pool.Exec(ctx, createTrigger); err != nil {
+		return errors.Wrap(err, "failed to create registry trigger")
+	}
+
+	return nil
+}
+
 func (c *PostgreSQLClient) DeleteTablesWithCondition(ctx context.Context, schema, table, fileID, routingID string, haveAuxTable bool) (int, error) {
 	sqlStatement := `
 	SELECT relyt_sys.delete_tables_with_condition(
@@ -1003,7 +1089,7 @@ func (c *PostgreSQLClient) DeleteTablesWithGroup(ctx context.Context, schema, ta
 	return result, nil
 }
 
-func (c *PostgreSQLClient) GetColumnsWithCondition(ctx context.Context, args ...interface{}) (pgx.Rows, string, error) {
+func (c *PostgreSQLClient) GetColumnsWithCondition(ctx context.Context, args ...any) (pgx.Rows, string, error) {
 	getSQLStatement := `
 		SELECT * FROM relyt_sys.get_columns_sql_with_condition(
 			$1,  -- schema_name
@@ -1094,13 +1180,7 @@ func (c *PostgreSQLClient) InsertIntoOnConflictFromLocal(ctx context.Context, tx
 		updateSetParts := make([]string, 0, len(columnNames))
 		for _, col := range columnNames {
 			// Skip primary key columns in the update part
-			isPK := false
-			for _, pk := range pkColumns {
-				if pk == col {
-					isPK = true
-					break
-				}
-			}
+			isPK := slices.Contains(pkColumns, col)
 			if !isPK {
 				updateSetParts = append(updateSetParts, fmt.Sprintf("%s = excluded.%s", col, col))
 			}
@@ -1137,7 +1217,7 @@ func (c *PostgreSQLClient) InsertIntoOnConflictFromLocal(ctx context.Context, tx
 		if err == io.EOF {
 			// Process remaining batch
 			if len(batch) > 0 {
-				if err := c.executeBatchInsert(ctx, tx, sqlStatement, batch, lineNum-len(batch)); err != nil {
+				if err = c.executeBatchInsert(ctx, tx, sqlStatement, batch, lineNum-len(batch)); err != nil {
 					return err
 				}
 			}
@@ -1169,7 +1249,7 @@ func (c *PostgreSQLClient) executeBatchInsert(ctx context.Context, tx pgx.Tx, sq
 
 	// Build VALUES clause for the batch
 	valuesParts := make([]string, len(batch))
-	allArgs := make([]interface{}, 0, len(batch)*len(batch[0]))
+	allArgs := make([]any, 0, len(batch)*len(batch[0]))
 	argIndex := 1
 
 	for i, record := range batch {
@@ -1320,13 +1400,7 @@ func (c *PostgreSQLClient) InsertIntoFromExternalTable(ctx context.Context, tx p
 			updateSetParts := make([]string, 0, len(columnNames))
 			for _, col := range columnNames {
 				// Skip primary key columns in the update part
-				isPK := false
-				for _, pk := range pkColumns {
-					if pk == col {
-						isPK = true
-						break
-					}
-				}
+				isPK := slices.Contains(pkColumns, col)
 				if !isPK {
 					updateSetParts = append(updateSetParts, fmt.Sprintf("%s = excluded.%s", col, col))
 				}
@@ -1394,7 +1468,7 @@ func (c *PostgreSQLClient) DeleteOutdatedFiles(ctx context.Context, tx pgx.Tx, t
 	// 构建批量删除的 SQL 语句
 	// 遍历 fileVersionMap 构建 AND/OR 条件
 	var conditions []string
-	var args []interface{}
+	var args []any
 	argIndex := 1
 
 	for recordIndex, version := range fileVersionMap {
@@ -1421,7 +1495,7 @@ func (c *PostgreSQLClient) DeleteOutdatedFiles(ctx context.Context, tx pgx.Tx, t
 }
 
 func (c *PostgreSQLClient) UpdateByQueryV2(ctx context.Context, schemaName, tableName, condition string,
-	updateFields map[string]interface{}, haveAuxTable bool) (int64, string, error) {
+	updateFields map[string]any, haveAuxTable bool) (int64, string, error) {
 
 	// 将updateFields转换为JSONB
 	updateFieldsJSON, err := json.Marshal(updateFields)

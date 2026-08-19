@@ -14,14 +14,14 @@ import (
 )
 
 type TestDataV2 struct {
-	ID        int                    `json:"id"`
-	Name      string                 `json:"name"`
-	Age       int                    `json:"age"`
-	Email     string                 `json:"email"`
-	Tags      []string               `json:"tags"`
-	Metadata  map[string]interface{} `json:"metadata"`
-	IsActive  bool                   `json:"is_active"`
-	CreatedAt int64                  `json:"created_at"`
+	ID        int            `json:"id"`
+	Name      string         `json:"name"`
+	Age       int            `json:"age"`
+	Email     string         `json:"email"`
+	Tags      []string       `json:"tags"`
+	Metadata  map[string]any `json:"metadata"`
+	IsActive  bool           `json:"is_active"`
+	CreatedAt int64          `json:"created_at"`
 }
 
 func CreateTestUsersV2WithAux(db *sql.DB) error {
@@ -148,7 +148,7 @@ func TestUpdateByQueryV2(t *testing.T) {
 		options := &UpdateByQueryOptions{
 			Table:     "test_users_v1",
 			Condition: "id = $1",
-			Updates: map[string]interface{}{
+			Updates: map[string]any{
 				"ext":     "updated_ext",
 				"version": 2,
 			},
@@ -190,7 +190,7 @@ func TestUpdateByQueryV2(t *testing.T) {
 		options := &UpdateByQueryOptions{
 			Table:     "test_users_v2",
 			Condition: "id = $1",
-			Updates: map[string]interface{}{
+			Updates: map[string]any{
 				"ext":     "updated_ext",
 				"version": 2,
 			},
@@ -233,7 +233,7 @@ func TestUpdateByQueryV2(t *testing.T) {
 		options := &UpdateByQueryOptions{
 			Table:     "test_users_v2",
 			Condition: "id = $1",
-			Updates: map[string]interface{}{
+			Updates: map[string]any{
 				"tags": "{updated_tag1, updated_tag2, updated_tag3}",
 			},
 		}
@@ -272,7 +272,7 @@ func TestUpdateByQueryV2(t *testing.T) {
 		defer cancel()
 
 		// 准备新的JSON数据
-		newMetadata := map[string]interface{}{
+		newMetadata := map[string]any{
 			"status":      "updated",
 			"permissions": []string{"read", "write", "delete"},
 			"updated_at":  time.Now().Unix(),
@@ -282,7 +282,7 @@ func TestUpdateByQueryV2(t *testing.T) {
 		options := &UpdateByQueryOptions{
 			Table:     "test_users_v2",
 			Condition: "id = $1",
-			Updates: map[string]interface{}{
+			Updates: map[string]any{
 				"metadata": string(metadataJSON),
 			},
 		}
@@ -306,7 +306,7 @@ func TestUpdateByQueryV2(t *testing.T) {
 			t.Fatalf("Failed to verify JSON update: %v", err)
 		}
 
-		var actualMetadata map[string]interface{}
+		var actualMetadata map[string]any
 		err = json.Unmarshal([]byte(metadataStr), &actualMetadata)
 		if err != nil {
 			t.Fatalf("Failed to unmarshal JSON: %v", err)
@@ -316,7 +316,7 @@ func TestUpdateByQueryV2(t *testing.T) {
 			t.Errorf("Expected status to be 'updated', got '%v'", actualMetadata["status"])
 		}
 
-		permissions, ok := actualMetadata["permissions"].([]interface{})
+		permissions, ok := actualMetadata["permissions"].([]any)
 		if !ok || len(permissions) != 3 {
 			t.Errorf("Expected 3 permissions, got %v", permissions)
 		}
@@ -328,7 +328,7 @@ func TestUpdateByQueryV2(t *testing.T) {
 		defer cancel()
 
 		// 准备新的JSON数据
-		newMetadata := map[string]interface{}{
+		newMetadata := map[string]any{
 			"status":      "vip",
 			"permissions": []string{"read", "write", "delete", "admin"},
 			"upgraded_at": time.Now().Unix(),
@@ -338,7 +338,7 @@ func TestUpdateByQueryV2(t *testing.T) {
 		options := &UpdateByQueryOptions{
 			Table:     "test_users_v2",
 			Condition: "id > $1",
-			Updates: map[string]interface{}{
+			Updates: map[string]any{
 				"ext":      "vip_ext",
 				"version":  3,
 				"tags":     "ARRAY['vip', 'premium', 'admin']",
@@ -389,7 +389,7 @@ func TestUpdateByQueryV2(t *testing.T) {
 				t.Errorf("Expected %d tags, got %d", len(expectedTags), len(tags))
 			}
 
-			var metadata map[string]interface{}
+			var metadata map[string]any
 			err = json.Unmarshal([]byte(metadataStr), &metadata)
 			if err != nil {
 				t.Fatalf("Failed to unmarshal metadata: %v", err)
@@ -416,7 +416,7 @@ func TestUpdateByQueryV2(t *testing.T) {
 		options := &UpdateByQueryOptions{
 			Table:     "test_users_v2",
 			Condition: "id = $1",
-			Updates: map[string]interface{}{
+			Updates: map[string]any{
 				"tags": "array_replace(tags, $2, $3)",
 			},
 		}
@@ -451,7 +451,7 @@ func TestUpdateByQueryV2(t *testing.T) {
 		options := &UpdateByQueryOptions{
 			Table:     "test_users_v2",
 			Condition: "id = $1",
-			Updates:   map[string]interface{}{},
+			Updates:   map[string]any{},
 		}
 
 		_, err := processor.UpdateByQueryWithContextV2(ctx, options, 1)
@@ -464,7 +464,7 @@ func TestUpdateByQueryV2(t *testing.T) {
 		options2 := &UpdateByQueryOptions{
 			Table:     "non_existent_table",
 			Condition: "id = $1",
-			Updates: map[string]interface{}{
+			Updates: map[string]any{
 				"field": "value",
 			},
 		}
@@ -490,7 +490,7 @@ func TestUpdateByQueryV2(t *testing.T) {
 		// empty table
 		options4 := &UpdateByQueryOptions{
 			Condition: "id = $1",
-			Updates: map[string]interface{}{
+			Updates: map[string]any{
 				"tags": "array_append(tags, $2)",
 			},
 		}
@@ -510,7 +510,7 @@ func TestUpdateByQueryV2(t *testing.T) {
 		options := &UpdateByQueryOptions{
 			Table:     "test_users_v2",
 			Condition: "id = $1",
-			Updates: map[string]interface{}{
+			Updates: map[string]any{
 				"tags": "array_append(tags, $2)",
 			},
 		}
@@ -544,7 +544,7 @@ func TestUpdateByQueryV2(t *testing.T) {
 		options := &UpdateByQueryOptions{
 			Table:     "test_users_v2",
 			Condition: "id = $1",
-			Updates: map[string]interface{}{
+			Updates: map[string]any{
 				"tags": "array_remove(tags, $2)",
 			},
 		}
@@ -578,7 +578,7 @@ func TestUpdateByQueryV2(t *testing.T) {
 		options := &UpdateByQueryOptions{
 			Table:     "test_users_v2",
 			Condition: "$1 = ANY(tags) AND id > $2",
-			Updates: map[string]interface{}{
+			Updates: map[string]any{
 				"version": 5,
 			},
 		}
@@ -611,7 +611,7 @@ func TestUpdateByQueryV2(t *testing.T) {
 		options := &UpdateByQueryOptions{
 			Table:     "test_users_v2",
 			Condition: "array_length(tags, 1) > $1",
-			Updates: map[string]interface{}{
+			Updates: map[string]any{
 				"tags": "array_append(tags, 'popular')",
 			},
 		}
@@ -645,7 +645,7 @@ func TestUpdateByQueryV2(t *testing.T) {
 		options := &UpdateByQueryOptions{
 			Table:     "test_users_v2",
 			Condition: "id = $1 or id = $2",
-			Updates: map[string]interface{}{
+			Updates: map[string]any{
 				"metadata": "jsonb_set(metadata, $3, $4)",
 			},
 		}
@@ -666,7 +666,7 @@ func TestUpdateByQueryV2(t *testing.T) {
 			t.Fatalf("Failed to verify jsonb_set function: %v", err)
 		}
 
-		var metadata map[string]interface{}
+		var metadata map[string]any
 		err = json.Unmarshal([]byte(metadataStr), &metadata)
 		if err != nil {
 			t.Fatalf("Failed to unmarshal JSON: %v", err)
@@ -685,7 +685,7 @@ func TestUpdateByQueryV2(t *testing.T) {
 		options := &UpdateByQueryOptions{
 			Table:     "test_users_v2",
 			Condition: "id = $1",
-			Updates: map[string]interface{}{
+			Updates: map[string]any{
 				"tags": "array_prepend($2, tags)",
 			},
 		}
@@ -719,7 +719,7 @@ func TestUpdateByQueryV2(t *testing.T) {
 		options := &UpdateByQueryOptions{
 			Table:     "test_users_v2",
 			Condition: "id = $1",
-			Updates: map[string]interface{}{
+			Updates: map[string]any{
 				"metadata": "jsonb_insert(metadata, $2, $3)",
 			},
 		}
@@ -739,7 +739,7 @@ func TestUpdateByQueryV2(t *testing.T) {
 			t.Fatalf("Failed to verify jsonb_insert: %v", err)
 		}
 
-		var metadata map[string]interface{}
+		var metadata map[string]any
 		err = json.Unmarshal([]byte(metadataStr), &metadata)
 		if err != nil {
 			t.Fatalf("Failed to unmarshal JSON: %v", err)
@@ -758,7 +758,7 @@ func TestUpdateByQueryV2(t *testing.T) {
 		options := &UpdateByQueryOptions{
 			Table:     "test_users_v2",
 			Condition: "id IN ($1, $2, $3)",
-			Updates: map[string]interface{}{
+			Updates: map[string]any{
 				"version": 10,
 			},
 		}
@@ -794,7 +794,7 @@ func TestUpdateByQueryV2(t *testing.T) {
 		options := &UpdateByQueryOptions{
 			Table:     "test_users_v2",
 			Condition: "id = $1",
-			Updates: map[string]interface{}{
+			Updates: map[string]any{
 				"tags": "array_remove(tags, tags[array_position(tags, $2)])",
 			},
 		}
