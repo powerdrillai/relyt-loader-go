@@ -1,4 +1,5 @@
 import psycopg2
+from psycopg2 import sql
 import time
 import argparse
 
@@ -67,19 +68,28 @@ def commit_transaction(conn):
     print("Transaction committed.")
     conn.close()
 
+def table_identifier(table, suffix=""):
+    """Return a safely quoted, optionally schema-qualified table identifier."""
+    parts = table.split('.')
+    if len(parts) not in (1, 2) or any(not part for part in parts):
+        raise ValueError(f"Invalid table name: {table!r}")
+    parts[-1] += suffix
+    return sql.Identifier(*parts)
+
+
 # 获取表的主键
 def get_primary_key(cursor, table):
     # get table name and schema name
     table_name = table.split('.')[1]
     schema_name = table.split('.')[0]
     print(f"get_primary_key: table name is {table_name}, schema name is {schema_name}")
-    cursor.execute(f"""SELECT a.attname
+    cursor.execute("""SELECT a.attname
 	FROM pg_index i
 	JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-	WHERE i.indrelid = (SELECT oid FROM pg_class WHERE relname = '{table_name}' 
-					   AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = '{schema_name}'))
+	WHERE i.indrelid = (SELECT oid FROM pg_class WHERE relname = %s
+					   AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = %s))
 	  AND i.indisprimary
-	ORDER BY a.attnum;""")
+	ORDER BY a.attnum;""", (table_name, schema_name))
     primary_key_column = cursor.fetchall()
     primary_key_column_flat = tuple(item[0] for item in primary_key_column)
     return primary_key_column_flat
@@ -90,22 +100,22 @@ def get_non_primary_key(cursor, table):
     table_name = table.split('.')[1]
     schema_name = table.split('.')[0]
     print(f"get_non_primary_key: table name is {table_name}, schema name is {schema_name}")
-    cursor.execute(f"""WITH primary_keys AS (
+    cursor.execute("""WITH primary_keys AS (
     SELECT a.attname
     FROM pg_index i
     JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-    WHERE i.indrelid = (SELECT oid FROM pg_class WHERE relname = '{table_name}'
-                        AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = '{schema_name}'))
+    WHERE i.indrelid = (SELECT oid FROM pg_class WHERE relname = %s
+                        AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = %s))
       AND i.indisprimary
 )
 SELECT a.attname
 FROM pg_attribute a
-WHERE a.attrelid = (SELECT oid FROM pg_class WHERE relname = '{table_name}'
-                    AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = '{schema_name}'))
+WHERE a.attrelid = (SELECT oid FROM pg_class WHERE relname = %s
+                    AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = %s))
   AND a.attnum > 0
   AND NOT a.attisdropped
   AND a.attname NOT IN (SELECT attname FROM primary_keys)
-ORDER BY a.attnum;""")
+ORDER BY a.attnum;""", (table_name, schema_name, table_name, schema_name))
     non_primary_key_column = cursor.fetchall()
     non_primary_key_column_flat = tuple(item[0] for item in non_primary_key_column)
     return non_primary_key_column_flat
@@ -113,45 +123,53 @@ ORDER BY a.attnum;""")
 # 从主表读取数据并写入附表,这里需要处理一下主键冲突的场景
 def migrate_data(cursor, table, routing_id):
     primary_key_columns = get_primary_key(cursor, table)
-    conflict_columns = ",".join(map(str, primary_key_columns))
-    print(f"migrate_data: conflict_columns is {conflict_columns}")
+    print(f"migrate_data: conflict_columns is {primary_key_columns}")
     non_primary_key_columns = get_non_primary_key(cursor, table)
     print(f"migrate_data: non_primary_key_columns is {non_primary_key_columns}")
-    updateSetParts = []
-    for non_primary_key_column in non_primary_key_columns:
-        updateSetParts.append(f"{non_primary_key_column} = excluded.{non_primary_key_column}")
 
-    updateSet = ",".join(updateSetParts)
-    aux_table = table + "_relyt_massive_group"
-    sql = ""
-    if len(conflict_columns) == 0:
-        sql = f"INSERT INTO {aux_table} SELECT * FROM {table} WHERE routing_id = %s;"
-        cursor.execute(sql, (routing_id,))
-    elif ON_CONFLICT_MODE == 'update':
-        sql = f"INSERT INTO {aux_table} SELECT * FROM {table} WHERE routing_id = %s on conflict ({conflict_columns}) do update set {updateSet};"
-        cursor.execute(sql, (routing_id,))
-    else:
-        sql = f"INSERT INTO {aux_table} SELECT * FROM {table} WHERE routing_id = %s on conflict ({conflict_columns}) do nothing;"
-        cursor.execute(sql, (routing_id,))
-    print(f"migrate sql is {sql}")
-    print(f"Data migrated from {table} to {aux_table} for group id {routing_id}.")
+    source_table = table_identifier(table)
+    aux_table = table_identifier(table, "_relyt_massive_group")
+    statement = sql.SQL("INSERT INTO {} SELECT * FROM {} WHERE routing_id = %s").format(
+        aux_table, source_table
+    )
+    if primary_key_columns:
+        conflict_columns = sql.SQL(', ').join(map(sql.Identifier, primary_key_columns))
+        if ON_CONFLICT_MODE == 'update' and non_primary_key_columns:
+            update_set = sql.SQL(', ').join(
+                sql.SQL("{} = excluded.{}").format(
+                    sql.Identifier(column), sql.Identifier(column)
+                )
+                for column in non_primary_key_columns
+            )
+            statement += sql.SQL(" ON CONFLICT ({}) DO UPDATE SET {}").format(
+                conflict_columns, update_set
+            )
+        else:
+            statement += sql.SQL(" ON CONFLICT ({}) DO NOTHING").format(conflict_columns)
+    cursor.execute(statement, (routing_id,))
+    print(f"migrate sql is {statement}")
+    print(f"Data migrated from {table} to its auxiliary table for group id {routing_id}.")
 
 # 从主表删除指定 routing_id 的数据
 def delete_data(cursor, table, routing_id):
-    cursor.execute(f"DELETE FROM {table} WHERE routing_id = %s;", (routing_id,))
+    statement = sql.SQL("DELETE FROM {} WHERE routing_id = %s").format(
+        table_identifier(table)
+    )
+    cursor.execute(statement, (routing_id,))
     print(f"Data with routing_id {routing_id} deleted from {table}.")
 
 # 修改 routing 表
 def update_routing_table(table, routing_id):
     conn = connect_db()
     cursor = conn.cursor()
-    if '.' in table:
-        table_name = table.split('.')[1]
-        routing_table = "relyt_sys."+ table_name + "_relyt_routing"
-    else:
-        routing_table = "relyt_sys."+ table + "_relyt_routing"
+    table_name = table.split('.')[-1]
+    routing_table = sql.Identifier("relyt_sys", table_name + "_relyt_routing")
     aux_table = table + "_relyt_massive_group"
-    cursor.execute(f"INSERT INTO {routing_table} (routing_id, store_table_name) VALUES (%s, %s) on conflict (routing_id) do nothing;", (routing_id, aux_table))
+    statement = sql.SQL(
+        "INSERT INTO {} (routing_id, store_table_name) VALUES (%s, %s) "
+        "ON CONFLICT (routing_id) DO NOTHING"
+    ).format(routing_table)
+    cursor.execute(statement, (routing_id, aux_table))
     conn.commit()
     cursor.close()
     conn.close()
@@ -178,7 +196,10 @@ def start_autovacuum():
 def get_migrate_routing_id(table, group_num_threshold):
     conn = connect_db()
     cursor = conn.cursor()
-    cursor.execute(f"SELECT routing_id FROM {table} GROUP BY routing_id HAVING COUNT(*) >= {group_num_threshold}")
+    statement = sql.SQL(
+        "SELECT routing_id FROM {} GROUP BY routing_id HAVING COUNT(*) >= %s"
+    ).format(table_identifier(table))
+    cursor.execute(statement, (group_num_threshold,))
     routing_ids = cursor.fetchall()
     cursor.close()
     conn.close()
